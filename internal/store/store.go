@@ -21,6 +21,13 @@ var ErrValidation = errors.New("invalid input")
 const chapterLimit = 50
 const wordLimit = 5000
 
+// KEEP IN SYNC with firestore.rules MAX_STORIES_PER_USER and
+// mcp_server/writes.py MAX_STORIES_PER_USER in taleTribe-agents. The rules
+// enforced this against a denormalized counter for Firestore-backed stories;
+// stories created here bypass the rules entirely, so the ceiling has to be
+// re-declared rather than inherited.
+const storyLimit = 100
+
 type Story struct {
 	ID             string    `json:"id"`
 	OwnerID        string    `json:"ownerId"`
@@ -88,6 +95,15 @@ func (s *Store) CreateStory(ctx context.Context, owner string, in StoryInput) (S
 		return Story{}, err
 	}
 	defer tx.Rollback(ctx)
+	// Counted inside the transaction rather than before it, so a caller cannot
+	// widen the ceiling by firing creates concurrently.
+	var owned int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM stories WHERE owner_id=$1`, owner).Scan(&owned); err != nil {
+		return Story{}, err
+	}
+	if owned >= storyLimit {
+		return Story{}, ErrLimit
+	}
 	row := tx.QueryRow(ctx, `INSERT INTO stories (id, owner_id, title, description, author_name, is_published, category, target_audience, language, copyright, cover_image_url, thumbnail_url)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), revision, created_at, updated_at`, id, owner, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL))
 	story, err := scanStory(row)
