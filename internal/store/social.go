@@ -29,6 +29,8 @@ type Comment struct {
 	Message   string    `json:"message"`
 	UserID    string    `json:"userId"`
 	ParentID  *string   `json:"parentId,omitempty"`
+	LikeCount int64     `json:"likeCount"`
+	LikedByMe bool      `json:"likedByMe"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
@@ -98,11 +100,21 @@ func (s *Store) CreateStoryRating(ctx context.Context, storyID, userID string, r
 	return s.storySocialSummary(ctx, storyID)
 }
 
-func (s *Store) ListPublicComments(ctx context.Context, storyID, chapterID string) ([]Comment, error) {
+// viewer may be empty for an anonymous reader, in which case likedByMe is
+// false for every row. One join and aggregate rather than a count per comment:
+// a chapter thread is the highest fan-out read in the app.
+func (s *Store) ListPublicComments(ctx context.Context, storyID, chapterID, viewer string) ([]Comment, error) {
 	if err := s.publicChapterExists(ctx, storyID, chapterID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, chapter_id, message, user_id, parent_id, created_at, updated_at FROM chapter_comments WHERE chapter_id=$1 ORDER BY created_at, id`, chapterID)
+	rows, err := s.db.Query(ctx, `
+		SELECT c.id, c.chapter_id, c.message, c.user_id, c.parent_id, c.created_at, c.updated_at,
+		       count(l.user_id), COALESCE(bool_or(l.user_id = $2), false)
+		FROM chapter_comments c
+		LEFT JOIN chapter_comment_likes l ON l.comment_id = c.id
+		WHERE c.chapter_id = $1
+		GROUP BY c.id
+		ORDER BY c.created_at, c.id`, chapterID, viewer)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +128,40 @@ func (s *Store) ListPublicComments(ctx context.Context, storyID, chapterID strin
 		comments = append(comments, comment)
 	}
 	return comments, rows.Err()
+}
+
+// SetCommentLike is idempotent in both directions so a double-tap cannot 409.
+func (s *Store) SetCommentLike(ctx context.Context, storyID, chapterID, commentID, userID string, liked bool) (Comment, error) {
+	if err := s.publicChapterExists(ctx, storyID, chapterID); err != nil {
+		return Comment{}, err
+	}
+	id, err := uuid.Parse(commentID)
+	if err != nil {
+		return Comment{}, ErrNotFound
+	}
+	var exists bool
+	if err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM chapter_comments WHERE id=$1 AND chapter_id=$2)`, id, chapterID).Scan(&exists); err != nil {
+		return Comment{}, err
+	}
+	if !exists {
+		return Comment{}, ErrNotFound
+	}
+	if liked {
+		_, err = s.db.Exec(ctx, `INSERT INTO chapter_comment_likes (comment_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, userID)
+	} else {
+		_, err = s.db.Exec(ctx, `DELETE FROM chapter_comment_likes WHERE comment_id=$1 AND user_id=$2`, id, userID)
+	}
+	if err != nil {
+		return Comment{}, err
+	}
+	row := s.db.QueryRow(ctx, `
+		SELECT c.id, c.chapter_id, c.message, c.user_id, c.parent_id, c.created_at, c.updated_at,
+		       count(l.user_id), COALESCE(bool_or(l.user_id = $2), false)
+		FROM chapter_comments c
+		LEFT JOIN chapter_comment_likes l ON l.comment_id = c.id
+		WHERE c.id = $1
+		GROUP BY c.id`, id, userID)
+	return scanComment(row, storyID)
 }
 
 func (s *Store) CreateComment(ctx context.Context, storyID, chapterID, userID string, input CommentInput) (Comment, error) {
@@ -141,7 +187,7 @@ func (s *Store) CreateComment(ctx context.Context, storyID, chapterID, userID st
 		}
 		parent = parentID
 	}
-	row := s.db.QueryRow(ctx, `INSERT INTO chapter_comments (id, chapter_id, user_id, parent_id, message) VALUES ($1,$2,$3,$4,$5) RETURNING id, chapter_id, message, user_id, parent_id, created_at, updated_at`, uuid.New(), chapterID, userID, parent, input.Message)
+	row := s.db.QueryRow(ctx, `INSERT INTO chapter_comments (id, chapter_id, user_id, parent_id, message) VALUES ($1,$2,$3,$4,$5) RETURNING id, chapter_id, message, user_id, parent_id, created_at, updated_at, 0::bigint, false`, uuid.New(), chapterID, userID, parent, input.Message)
 	return scanComment(row, storyID)
 }
 
@@ -153,7 +199,12 @@ func (s *Store) UpdateComment(ctx context.Context, storyID, chapterID, commentID
 	if err := s.publicChapterExists(ctx, storyID, chapterID); err != nil {
 		return Comment{}, err
 	}
-	row := s.db.QueryRow(ctx, `UPDATE chapter_comments SET message=$1, updated_at=now() WHERE id=$2 AND chapter_id=$3 AND user_id=$4 RETURNING id, chapter_id, message, user_id, parent_id, created_at, updated_at`, message, commentID, chapterID, userID)
+	row := s.db.QueryRow(ctx, `
+		UPDATE chapter_comments SET message=$1, updated_at=now()
+		WHERE id=$2 AND chapter_id=$3 AND user_id=$4
+		RETURNING id, chapter_id, message, user_id, parent_id, created_at, updated_at,
+		          (SELECT count(*) FROM chapter_comment_likes l WHERE l.comment_id = chapter_comments.id),
+		          EXISTS(SELECT 1 FROM chapter_comment_likes l WHERE l.comment_id = chapter_comments.id AND l.user_id = $4)`, message, commentID, chapterID, userID)
 	comment, err := scanComment(row, storyID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Comment{}, s.classifyCommentWrite(ctx, chapterID, commentID, userID)
@@ -212,7 +263,7 @@ func scanComment(row pgx.Row, storyID string) (Comment, error) {
 	var out Comment
 	var id, chapterID uuid.UUID
 	var parentID *uuid.UUID
-	err := row.Scan(&id, &chapterID, &out.Message, &out.UserID, &parentID, &out.CreatedAt, &out.UpdatedAt)
+	err := row.Scan(&id, &chapterID, &out.Message, &out.UserID, &parentID, &out.CreatedAt, &out.UpdatedAt, &out.LikeCount, &out.LikedByMe)
 	out.ID, out.StoryID, out.ChapterID = id.String(), storyID, chapterID.String()
 	if parentID != nil {
 		value := parentID.String()

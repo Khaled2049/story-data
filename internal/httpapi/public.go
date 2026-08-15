@@ -51,7 +51,7 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			notFound(w)
 			return
 		}
-		x, err := s.store.ListPublicComments(r.Context(), storyID, p[3])
+		x, err := s.store.ListPublicComments(r.Context(), storyID, p[3], s.optionalUser(r))
 		respond(w, x, err)
 		return
 	}

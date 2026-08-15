@@ -181,6 +181,15 @@ func (s *Server) comments(w http.ResponseWriter, r *http.Request, uid, storyID s
 		}
 		return
 	}
+	if len(p) == 6 && p[5] == "likes" {
+		if r.Method != http.MethodPut && r.Method != http.MethodDelete {
+			method(w)
+			return
+		}
+		x, e := s.store.SetCommentLike(r.Context(), storyID, chapterID, p[4], uid, r.Method == http.MethodPut)
+		respond(w, x, e)
+		return
+	}
 	if len(p) != 5 {
 		notFound(w)
 		return
