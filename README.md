@@ -6,6 +6,10 @@ this API and never receive a Neon connection string. Firestore remains in use
 for legacy jobs, Brain memory, MCP OAuth state, and encrypted BYOK settings.
 PostgreSQL stories use pgvector embeddings through the agents outbox worker.
 
+For architecture, data ownership, authentication, migrations, pgvector
+indexing, local setup, and production notes, read the
+[service guide](docs/service-guide.md).
+
 ## Local development
 
 Create a local `story_data` database in Postgres (the existing creditProxy
