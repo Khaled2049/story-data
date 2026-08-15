@@ -1,0 +1,7 @@
+.env
+.env.local
+bin/
+coverage.out
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*

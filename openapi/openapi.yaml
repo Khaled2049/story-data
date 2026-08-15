@@ -1,0 +1,189 @@
+openapi: 3.1.0
+info:
+  title: NovelSync Story Data API
+  version: 0.1.0
+  description: PostgreSQL system-of-record API. Browser requests use Firebase ID tokens.
+servers:
+  - url: https://story-data.example.invalid
+paths:
+  /health:
+    get:
+      responses: { '200': { description: Healthy } }
+  /v1/stories:
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Owner stories } }
+    post:
+      security: [{ firebaseBearer: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/StoryInput' } } } }
+      responses: { '201': { description: Created } }
+  /v1/public/stories:
+    get:
+      summary: List published stories
+      parameters:
+        - { name: category, in: query, schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 24 } }
+      responses: { '200': { description: Cursor-paginated public story summaries } }
+  /v1/public/profiles:
+    get:
+      summary: Search, list recent, or batch-read public member profiles
+      parameters:
+        - { name: query, in: query, schema: { type: string } }
+        - { name: ids, in: query, schema: { type: string, description: Comma-separated user IDs; maximum 50 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses: { '200': { description: Public profiles } }
+  /v1/public/profiles/{userId}:
+    get:
+      summary: Read an anonymous public profile
+      parameters: [{ name: userId, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: Public profile }, '404': { description: Profile unavailable } }
+  /v1/profiles/me:
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Current user's public profile } }
+    put:
+      security: [{ firebaseBearer: [] }]
+      responses: { '201': { description: Created or replaced profile }, '409': { description: Username is taken } }
+    patch:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Updated profile }, '409': { description: Username is taken } }
+  /v1/me/reading-history:
+    get:
+      security: [{ firebaseBearer: [] }]
+      parameters: [{ name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 5 } }]
+      responses: { '200': { description: Recent private reading history } }
+    delete:
+      security: [{ firebaseBearer: [] }]
+      responses: { '204': { description: Cleared } }
+  /v1/me/reading-progress/{storyId}:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Saved chapter and scroll position, or start position } }
+    put:
+      security: [{ firebaseBearer: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [chapterId, scrollPercent] } } } }
+      responses: { '200': { description: Saved progress } }
+  /v1/public/stories/{storyId}:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      summary: Read a published story and its chapter manifest
+      responses: { '200': { description: Public story and ordered chapter metadata }, '404': { description: Story is unavailable } }
+  /v1/public/stories/{storyId}/chapters/{chapterId}:
+    parameters:
+      - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: chapterId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      summary: Read a chapter from a published story
+      responses: { '200': { description: Public chapter text }, '404': { description: Story or chapter is unavailable } }
+  /v1/public/stories/{storyId}/views:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      summary: Record a public story view
+      responses: { '204': { description: Recorded }, '404': { description: Story is unavailable } }
+  /v1/public/stories/{storyId}/chapters/{chapterId}/comments:
+    parameters:
+      - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: chapterId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      summary: List public chapter comments in chronological order
+      responses: { '200': { description: Flattened public comment thread }, '404': { description: Story or chapter is unavailable } }
+  /v1/stories/{storyId}:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Story }, '403': { description: Private story } }
+    patch:
+      security: [{ firebaseBearer: [] }]
+      parameters: [{ name: If-Match, in: header, required: true, schema: { type: integer, minimum: 1 } }]
+      responses: { '200': { description: Updated }, '409': { description: Stale revision } }
+    delete:
+      security: [{ firebaseBearer: [] }]
+      parameters: [{ name: If-Match, in: header, required: true, schema: { type: integer, minimum: 1 } }]
+      responses: { '204': { description: Deleted }, '409': { description: Stale revision } }
+  /v1/stories/{storyId}/chapters:
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Ordered chapters } }
+    post:
+      security: [{ firebaseBearer: [] }]
+      responses: { '201': { description: Created } }
+  /v1/stories/{storyId}/social/me:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Current reader social state } }
+  /v1/stories/{storyId}/likes/me:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    put:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Story liked } }
+    delete:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Story unliked } }
+  /v1/stories/{storyId}/ratings:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      security: [{ firebaseBearer: [] }]
+      responses: { '201': { description: Rating created }, '409': { description: User already rated } }
+  /v1/stories/{storyId}/chapters/{chapterId}/comments:
+    parameters:
+      - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: chapterId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      security: [{ firebaseBearer: [] }]
+      responses: { '201': { description: Comment created } }
+  /v1/stories/{storyId}/chapters/{chapterId}/comments/{commentId}:
+    parameters:
+      - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: chapterId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: commentId, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Comment updated }, '403': { description: Not comment author } }
+    delete:
+      security: [{ firebaseBearer: [] }]
+      responses: { '204': { description: Comment deleted }, '403': { description: Not comment author } }
+  /v1/stories/{storyId}/context:
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Current story and chapters for AI context } }
+  /v1/stories/{storyId}/characters:
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Story characters } }
+    post:
+      security: [{ firebaseBearer: [] }]
+      responses: { '201': { description: Created character } }
+  /v1/stories/{storyId}/places:
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Story places } }
+    post:
+      security: [{ firebaseBearer: [] }]
+      responses: { '201': { description: Created place } }
+  /v1/stories/{storyId}/plots:
+    get:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Plot lines with ordered events } }
+    post:
+      security: [{ firebaseBearer: [] }]
+      responses: { '201': { description: Created plot line } }
+  /v1/stories/{storyId}/plots/{plotId}/events/reorder:
+    post:
+      security: [{ firebaseBearer: [] }]
+      parameters: [{ name: If-Match, in: header, required: true, schema: { type: integer, minimum: 1 } }]
+      responses: { '200': { description: Canonical ordered events }, '409': { description: Stale plot revision } }
+components:
+  securitySchemes:
+    firebaseBearer: { type: http, scheme: bearer, bearerFormat: Firebase-ID-token }
+  schemas:
+    StoryInput:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, maxLength: 500 }
+        description: { type: string }
+        authorName: { type: string }
+        published: { type: boolean }

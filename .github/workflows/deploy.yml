@@ -1,0 +1,37 @@
+name: Deploy story-data
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+env:
+  PROJECT_ID: story-6f89f
+  REGION: us-central1
+  SERVICE: novelsync-story-data
+  REPOSITORY: novelsync-story-data
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: go test ./...
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+      - run: |
+          gcloud artifacts repositories describe $REPOSITORY --location=$REGION --project=$PROJECT_ID || \
+            gcloud artifacts repositories create $REPOSITORY --repository-format=docker --location=$REGION --project=$PROJECT_ID
+          IMAGE=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:${{ github.sha }}
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.5.0, terraform_wrapper: false }
+      - working-directory: terraform
+        run: |
+          terraform init
+          terraform apply -auto-approve -var="image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:${{ github.sha }}"
