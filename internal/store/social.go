@@ -23,16 +23,19 @@ type StorySocialMe struct {
 }
 
 type Comment struct {
-	ID        string    `json:"id"`
-	StoryID   string    `json:"storyId"`
-	ChapterID string    `json:"chapterId"`
-	Message   string    `json:"message"`
-	UserID    string    `json:"userId"`
-	ParentID  *string   `json:"parentId,omitempty"`
-	LikeCount int64     `json:"likeCount"`
-	LikedByMe bool      `json:"likedByMe"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID        string  `json:"id"`
+	StoryID   string  `json:"storyId"`
+	ChapterID string  `json:"chapterId"`
+	Message   string  `json:"message"`
+	UserID    string  `json:"userId"`
+	ParentID  *string `json:"parentId,omitempty"`
+	// Joined from public_profiles rather than stored, so a rename shows up on
+	// every past comment at once. Empty when the author has no profile yet.
+	AuthorUsername string    `json:"authorUsername"`
+	LikeCount      int64     `json:"likeCount"`
+	LikedByMe      bool      `json:"likedByMe"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 type CommentInput struct {
@@ -109,11 +112,12 @@ func (s *Store) ListPublicComments(ctx context.Context, storyID, chapterID, view
 	}
 	rows, err := s.db.Query(ctx, `
 		SELECT c.id, c.chapter_id, c.message, c.user_id, c.parent_id, c.created_at, c.updated_at,
-		       count(l.user_id), COALESCE(bool_or(l.user_id = $2), false)
+		       COALESCE(p.username, ''), count(l.user_id), COALESCE(bool_or(l.user_id = $2), false)
 		FROM chapter_comments c
 		LEFT JOIN chapter_comment_likes l ON l.comment_id = c.id
+		LEFT JOIN public_profiles p ON p.user_id = c.user_id
 		WHERE c.chapter_id = $1
-		GROUP BY c.id
+		GROUP BY c.id, p.username
 		ORDER BY c.created_at, c.id`, chapterID, viewer)
 	if err != nil {
 		return nil, err
@@ -156,11 +160,12 @@ func (s *Store) SetCommentLike(ctx context.Context, storyID, chapterID, commentI
 	}
 	row := s.db.QueryRow(ctx, `
 		SELECT c.id, c.chapter_id, c.message, c.user_id, c.parent_id, c.created_at, c.updated_at,
-		       count(l.user_id), COALESCE(bool_or(l.user_id = $2), false)
+		       COALESCE(p.username, ''), count(l.user_id), COALESCE(bool_or(l.user_id = $2), false)
 		FROM chapter_comments c
 		LEFT JOIN chapter_comment_likes l ON l.comment_id = c.id
+		LEFT JOIN public_profiles p ON p.user_id = c.user_id
 		WHERE c.id = $1
-		GROUP BY c.id`, id, userID)
+		GROUP BY c.id, p.username`, id, userID)
 	return scanComment(row, storyID)
 }
 
@@ -187,7 +192,16 @@ func (s *Store) CreateComment(ctx context.Context, storyID, chapterID, userID st
 		}
 		parent = parentID
 	}
-	row := s.db.QueryRow(ctx, `INSERT INTO chapter_comments (id, chapter_id, user_id, parent_id, message) VALUES ($1,$2,$3,$4,$5) RETURNING id, chapter_id, message, user_id, parent_id, created_at, updated_at, 0::bigint, false`, uuid.New(), chapterID, userID, parent, input.Message)
+	row := s.db.QueryRow(ctx, `
+		WITH inserted AS (
+			INSERT INTO chapter_comments (id, chapter_id, user_id, parent_id, message)
+			VALUES ($1,$2,$3,$4,$5)
+			RETURNING id, chapter_id, message, user_id, parent_id, created_at, updated_at
+		)
+		SELECT i.id, i.chapter_id, i.message, i.user_id, i.parent_id, i.created_at, i.updated_at,
+		       COALESCE(p.username, ''), 0::bigint, false
+		FROM inserted i LEFT JOIN public_profiles p ON p.user_id = i.user_id`,
+		uuid.New(), chapterID, userID, parent, input.Message)
 	return scanComment(row, storyID)
 }
 
@@ -200,13 +214,20 @@ func (s *Store) UpdateComment(ctx context.Context, storyID, chapterID, commentID
 		return Comment{}, err
 	}
 	row := s.db.QueryRow(ctx, `
-		UPDATE chapter_comments SET message=$1, updated_at=now()
-		WHERE id=$2 AND chapter_id=$3 AND user_id=$4
-		RETURNING id, chapter_id, message, user_id, parent_id, created_at, updated_at,
-		          (SELECT count(*) FROM chapter_comment_likes l WHERE l.comment_id = chapter_comments.id),
-		          EXISTS(SELECT 1 FROM chapter_comment_likes l WHERE l.comment_id = chapter_comments.id AND l.user_id = $4)`, message, commentID, chapterID, userID)
+		WITH updated AS (
+			UPDATE chapter_comments SET message=$1, updated_at=now()
+			WHERE id=$2 AND chapter_id=$3 AND user_id=$4
+			RETURNING id, chapter_id, message, user_id, parent_id, created_at, updated_at
+		)
+		SELECT u.id, u.chapter_id, u.message, u.user_id, u.parent_id, u.created_at, u.updated_at,
+		       COALESCE(p.username, ''),
+		       (SELECT count(*) FROM chapter_comment_likes l WHERE l.comment_id = u.id),
+		       EXISTS(SELECT 1 FROM chapter_comment_likes l WHERE l.comment_id = u.id AND l.user_id = $4)
+		FROM updated u LEFT JOIN public_profiles p ON p.user_id = u.user_id`, message, commentID, chapterID, userID)
 	comment, err := scanComment(row, storyID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, ErrNotFound) {
+		// No row matched, which conflates "no such comment" with "not yours".
+		// classifyCommentWrite is what turns the second into a 403.
 		return Comment{}, s.classifyCommentWrite(ctx, chapterID, commentID, userID)
 	}
 	return comment, err
@@ -263,7 +284,12 @@ func scanComment(row pgx.Row, storyID string) (Comment, error) {
 	var out Comment
 	var id, chapterID uuid.UUID
 	var parentID *uuid.UUID
-	err := row.Scan(&id, &chapterID, &out.Message, &out.UserID, &parentID, &out.CreatedAt, &out.UpdatedAt, &out.LikeCount, &out.LikedByMe)
+	err := row.Scan(&id, &chapterID, &out.Message, &out.UserID, &parentID, &out.CreatedAt, &out.UpdatedAt, &out.AuthorUsername, &out.LikeCount, &out.LikedByMe)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Surfaced by SetCommentLike's re-read when the comment is deleted
+		// mid-call. Left raw it becomes a 500 for what is really a 404.
+		return Comment{}, ErrNotFound
+	}
 	out.ID, out.StoryID, out.ChapterID = id.String(), storyID, chapterID.String()
 	if parentID != nil {
 		value := parentID.String()

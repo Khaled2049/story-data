@@ -39,7 +39,7 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
 		return
 	}
-	h := httpapi.New(store.New(db), auth.New(cfg.AuthMode, cfg.FirebaseProjectID))
+	h := httpapi.New(store.New(db), auth.New(cfg.AuthMode, cfg.FirebaseProjectID, cfg.ServiceToken))
 	log.Printf("story-data listening on %s", cfg.Addr)
 	log.Fatal(http.ListenAndServe(cfg.Addr, h))
 }

@@ -18,8 +18,22 @@ data "google_secret_manager_secret" "database_url" {
   project   = var.project_id
 }
 
+# Shared secret that lets a trusted backend (the MCP server) assert X-User-ID.
+# Same value as STORY_DATA_SERVICE_TOKEN in taleTribe-agents. Must be
+# pre-created in Secret Manager; see setup.md.
+data "google_secret_manager_secret" "service_token" {
+  secret_id = "story-data-service-token"
+  project   = var.project_id
+}
+
 resource "google_secret_manager_secret_iam_member" "database_url" {
   secret_id = data.google_secret_manager_secret.database_url.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${data.google_service_account.runtime.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "service_token" {
+  secret_id = data.google_secret_manager_secret.service_token.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${data.google_service_account.runtime.email}"
 }
@@ -60,12 +74,24 @@ resource "google_cloud_run_v2_service" "api" {
           }
         }
       }
+      # Empty would disable the service-auth path entirely, which is the
+      # fail-safe default in code but would break MCP reads here.
+      env {
+        name = "SERVICE_TOKEN"
+        value_source {
+          secret_key_ref {
+            secret  = data.google_secret_manager_secret.service_token.secret_id
+            version = "latest"
+          }
+        }
+      }
     }
   }
 
   depends_on = [
     google_project_service.run,
     google_secret_manager_secret_iam_member.database_url,
+    google_secret_manager_secret_iam_member.service_token,
   ]
 }
 

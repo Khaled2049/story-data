@@ -124,8 +124,50 @@ func (s *Store) ClaimFaucet(ctx context.Context, user string) (TokenBalance, err
 	}
 	return s.balance(ctx, account(user))
 }
+
+// GrantTokens mints TALE to a user. Besides the automatic opening balance and
+// the daily faucet, this is the platform's only mint, so it is admin-only and
+// keyed by a caller-supplied idempotency key: a retried support request, or a
+// re-run of the seed script, must not pay twice.
+func (s *Store) GrantTokens(ctx context.Context, user, raw, key string) (TokenBalance, error) {
+	if strings.TrimSpace(user) == "" || strings.TrimSpace(key) == "" {
+		return TokenBalance{}, ErrValidation
+	}
+	value, e := amount(raw)
+	if e != nil {
+		return TokenBalance{}, e
+	}
+	if value == "0" {
+		return TokenBalance{}, ErrValidation
+	}
+	// Materialized first so the recipient's opening balance is not lost behind
+	// the grant — the same lazy grant every other balance path performs.
+	if e = s.initialGrant(ctx, user); e != nil {
+		return TokenBalance{}, e
+	}
+	if e = s.transfer(ctx, "grant:admin:"+key, "grant:admin", "", []posting{{"system:mint", "-" + value}, {account(user), value}}); e != nil {
+		return TokenBalance{}, e
+	}
+	return s.balance(ctx, account(user))
+}
 func (s *Store) initialGrant(ctx context.Context, user string) error {
-	return s.transfer(ctx, "grant:initial:"+user, "grant:initial", "", []posting{{"system:mint", "-1000000000000000000000"}, {account(user), "1000000000000000000000"}})
+	return s.transfer(ctx, "grant:initial:"+user, "grant:initial", "", initialGrantPostings(user))
+}
+func (s *Store) initialGrantTx(ctx context.Context, tx pgx.Tx, user string) error {
+	return s.transferTx(ctx, tx, "grant:initial:"+user, "grant:initial", "", initialGrantPostings(user))
+}
+func initialGrantPostings(user string) []posting {
+	return []posting{{"system:mint", "-1000000000000000000000"}, {account(user), "1000000000000000000000"}}
+}
+
+// Entry fees are keyed per attempt, because a withdrawal refunds one charge
+// and re-entering makes another. Reusing a key would make the ledger treat the
+// second charge as a duplicate and silently skip it.
+func entryKey(id, user string, attempt int) string {
+	return fmt.Sprintf("escrow:entry:%s:%s:%d", id, user, attempt)
+}
+func refundKey(id, user string, attempt int) string {
+	return fmt.Sprintf("escrow:entry-refund:%s:%s:%d", id, user, attempt)
 }
 
 type posting struct{ account, delta string }
@@ -145,13 +187,23 @@ func (s *Store) transfer(ctx context.Context, key, reason, competition string, p
 		return e
 	}
 	defer tx.Rollback(ctx)
+	if e = s.transferTx(ctx, tx, key, reason, competition, ps); e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
+}
+
+// transferTx posts a transfer inside a caller-supplied transaction, so that
+// moving money and recording why it moved commit together. transfer is the
+// standalone wrapper for callers that have nothing else to do.
+func (s *Store) transferTx(ctx context.Context, tx pgx.Tx, key, reason, competition string, ps []posting) error {
 	var exists bool
-	e = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM ledger_transfers WHERE idempotency_key=$1)`, key).Scan(&exists)
+	e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM ledger_transfers WHERE idempotency_key=$1)`, key).Scan(&exists)
 	if e != nil {
 		return e
 	}
 	if exists {
-		return tx.Commit(ctx)
+		return nil
 	}
 	sum := big.NewInt(0)
 	for _, p := range ps {
@@ -214,7 +266,7 @@ func (s *Store) transfer(ctx context.Context, key, reason, competition string, p
 			}
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (s *Store) ListCompetitions(ctx context.Context, viewer string) ([]Competition, error) {
@@ -391,7 +443,14 @@ func (s *Store) JoinCompetition(ctx context.Context, id, user string) error {
 	if phase != "open" && phase != "scheduled" {
 		return ErrValidation
 	}
-	if max != nil && n >= *max {
+	// Joining is idempotent, so the capacity check must not reject someone who
+	// already holds a seat — otherwise a participant re-opening a full
+	// competition is told it is full.
+	var already bool
+	if e = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM competition_participants WHERE competition_id=$1 AND user_id=$2)`, id, user).Scan(&already); e != nil {
+		return e
+	}
+	if !already && max != nil && n >= *max {
 		return ErrLimit
 	}
 	cmd, e := tx.Exec(ctx, `INSERT INTO competition_participants(competition_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, id, user)
@@ -414,7 +473,15 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 	defer tx.Rollback(ctx)
 	var phase, owner, title, author, cover string
 	var fee string
-	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text FROM competitions c JOIN stories s ON s.id=$3 WHERE c.id=$1 AND s.id=$3`, id, user, storyID).Scan(&phase, &owner, &title, &author, &cover, &fee)
+	// A malformed story id would otherwise reach the uuid cast and surface as
+	// a 500 rather than a 404.
+	if _, z := uuid.Parse(storyID); z != nil {
+		return ErrNotFound
+	}
+	// $2 is the story, referenced once: an earlier version bound the caller's
+	// id as an extra parameter the SQL never used, which PostgreSQL cannot
+	// type-infer — it made every submission fail with a 500.
+	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1`, id, storyID).Scan(&phase, &owner, &title, &author, &cover, &fee)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -430,25 +497,30 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 		return ErrForbidden
 	}
 	var submitted bool
-	_ = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM competition_submissions WHERE competition_id=$1 AND user_id=$2 AND status='submitted')`, id, user).Scan(&submitted)
+	if e = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM competition_submissions WHERE competition_id=$1 AND user_id=$2 AND status='submitted')`, id, user).Scan(&submitted); e != nil {
+		return e
+	}
 	if submitted {
 		return ErrConflict
 	}
+	// The fee move and the submission row commit together. They used to be two
+	// transactions with a commit between them, so a crash in the gap left the
+	// entry fee sitting in escrow with nothing entered against it.
+	attempt := 1
 	if fee != "0" {
-		if e := s.initialGrant(ctx, user); e != nil {
+		// A withdrawal refunds the previous charge, so re-entering is a new
+		// one and needs an idempotency key the ledger has not seen.
+		var prior int
+		if e = tx.QueryRow(ctx, `SELECT COALESCE(max(attempt),0) FROM competition_contributions WHERE competition_id=$1 AND user_id=$2`, id, user).Scan(&prior); e != nil {
 			return e
 		}
-		if e := tx.Commit(ctx); e != nil {
+		attempt = prior + 1
+		if e = s.initialGrantTx(ctx, tx, user); e != nil {
 			return e
 		}
-		if e := s.transfer(ctx, "escrow:entry:"+id+":"+user, "escrow:entry", id, []posting{{account(user), "-" + fee}, {escrow(id), fee}}); e != nil {
+		if e = s.transferTx(ctx, tx, entryKey(id, user, attempt), "escrow:entry", id, []posting{{account(user), "-" + fee}, {escrow(id), fee}}); e != nil {
 			return e
 		}
-		tx, e = s.db.Begin(ctx)
-		if e != nil {
-			return e
-		}
-		defer tx.Rollback(ctx)
 	}
 	_, e = tx.Exec(ctx, `INSERT INTO competition_submissions(competition_id,user_id,story_id,story_title,story_author_name,cover_image_url) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(competition_id,user_id) DO UPDATE SET story_id=EXCLUDED.story_id,story_title=EXCLUDED.story_title,story_author_name=EXCLUDED.story_author_name,cover_image_url=EXCLUDED.cover_image_url,status='submitted',updated_at=now()`, id, user, storyID, title, author, cover)
 	if e != nil {
@@ -459,25 +531,40 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 		return e
 	}
 	if fee != "0" {
-		_, e = tx.Exec(ctx, `INSERT INTO competition_contributions(competition_id,user_id,amount) VALUES($1,$2,$3) ON CONFLICT(competition_id,user_id) DO UPDATE SET amount=EXCLUDED.amount,state='held',updated_at=now()`, id, user, fee)
-	}
-	if e != nil {
-		return e
+		_, e = tx.Exec(ctx, `INSERT INTO competition_contributions(competition_id,user_id,amount,attempt) VALUES($1,$2,$3,$4) ON CONFLICT(competition_id,user_id) DO UPDATE SET amount=EXCLUDED.amount,attempt=EXCLUDED.attempt,state='held',updated_at=now()`, id, user, fee, attempt)
+		if e != nil {
+			return e
+		}
 	}
 	return tx.Commit(ctx)
 }
 
+// WithdrawCompetitionSubmission refunds the entry fee and retracts the entry.
+// The whole thing runs in one transaction behind a lock on the competition
+// row: an earlier version read with a plain SELECT and then issued three
+// unguarded UPDATEs, so a concurrent withdrawal could refund twice or leave
+// the counters disagreeing with the ledger.
 func (s *Store) WithdrawCompetitionSubmission(ctx context.Context, id, user string) error {
-	c, e := s.competition(ctx, id, user)
+	tx, e := s.db.Begin(ctx)
 	if e != nil {
 		return e
 	}
-	if c.Phase != "open" {
+	defer tx.Rollback(ctx)
+	var phase string
+	e = tx.QueryRow(ctx, `SELECT phase FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase)
+	if errors.Is(e, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if e != nil {
+		return e
+	}
+	if phase != "open" {
 		return ErrValidation
 	}
 	var fee string
 	var held bool
-	e = s.db.QueryRow(ctx, `SELECT COALESCE(c.amount::text,'0'),COALESCE(c.state='held',false) FROM competition_submissions s LEFT JOIN competition_contributions c ON c.competition_id=s.competition_id AND c.user_id=s.user_id WHERE s.competition_id=$1 AND s.user_id=$2 AND s.status='submitted'`, id, user).Scan(&fee, &held)
+	var attempt int
+	e = tx.QueryRow(ctx, `SELECT COALESCE(c.amount::text,'0'),COALESCE(c.state='held',false),COALESCE(c.attempt,0) FROM competition_submissions s LEFT JOIN competition_contributions c ON c.competition_id=s.competition_id AND c.user_id=s.user_id WHERE s.competition_id=$1 AND s.user_id=$2 AND s.status='submitted'`, id, user).Scan(&fee, &held, &attempt)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -485,24 +572,27 @@ func (s *Store) WithdrawCompetitionSubmission(ctx context.Context, id, user stri
 		return e
 	}
 	if held && fee != "0" {
-		if e = s.transfer(ctx, "escrow:entry-refund:"+id+":"+user, "escrow:entry-refund", id, []posting{{escrow(id), "-" + fee}, {account(user), fee}}); e != nil {
+		if e = s.transferTx(ctx, tx, refundKey(id, user, attempt), "escrow:entry-refund", id, []posting{{escrow(id), "-" + fee}, {account(user), fee}}); e != nil {
 			return e
 		}
 	}
-	_, e = s.db.Exec(ctx, `UPDATE competition_submissions SET status='withdrawn',updated_at=now() WHERE competition_id=$1 AND user_id=$2`, id, user)
+	_, e = tx.Exec(ctx, `UPDATE competition_submissions SET status='withdrawn',updated_at=now() WHERE competition_id=$1 AND user_id=$2`, id, user)
 	if e != nil {
 		return e
 	}
 	if held {
-		_, e = s.db.Exec(ctx, `UPDATE competition_contributions SET state='refunded',updated_at=now() WHERE competition_id=$1 AND user_id=$2`, id, user)
+		_, e = tx.Exec(ctx, `UPDATE competition_contributions SET state='refunded',updated_at=now() WHERE competition_id=$1 AND user_id=$2`, id, user)
 		if e != nil {
 			return e
 		}
-		_, e = s.db.Exec(ctx, `UPDATE competitions SET submission_count=GREATEST(0,submission_count-1),entry_fees_held=GREATEST(0,entry_fees_held-$2::numeric),updated_at=now() WHERE id=$1`, id, fee)
+		_, e = tx.Exec(ctx, `UPDATE competitions SET submission_count=GREATEST(0,submission_count-1),entry_fees_held=GREATEST(0,entry_fees_held-$2::numeric),updated_at=now() WHERE id=$1`, id, fee)
 	} else {
-		_, e = s.db.Exec(ctx, `UPDATE competitions SET submission_count=GREATEST(0,submission_count-1),updated_at=now() WHERE id=$1`, id)
+		_, e = tx.Exec(ctx, `UPDATE competitions SET submission_count=GREATEST(0,submission_count-1),updated_at=now() WHERE id=$1`, id)
 	}
-	return e
+	if e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
 }
 func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bool, reason string) (Competition, error) {
 	c, e := s.competition(ctx, id, user)
@@ -789,6 +879,13 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 	d := sha256.Sum256([]byte(strings.Join(digestData, "|")))
 	_, e = tx.Exec(ctx, `UPDATE competitions SET phase='settled',entry_fees_held=0,results_digest=$1,settled_at=now(),updated_at=now() WHERE id=$2`, hex.EncodeToString(d[:]), id)
 	if e != nil {
+		return c, e
+	}
+	// Without this commit the deferred rollback discarded the results rows and
+	// the settled phase — after the payout transfer had already committed on
+	// its own connection. Every settlement paid out and then stranded the
+	// competition in 'settling'.
+	if e = tx.Commit(ctx); e != nil {
 		return c, e
 	}
 	return s.competition(ctx, id, user)

@@ -82,7 +82,11 @@ func (s *Store) ListPublicProfiles(ctx context.Context, prefix string, ids []str
 	prefix = strings.ToLower(strings.TrimSpace(prefix))
 	query, args := profileSelect+` ORDER BY created_at DESC, user_id DESC LIMIT $1`, []any{limit}
 	if prefix != "" {
-		query, args = profileSelect+` WHERE username_lower >= $1 AND username_lower < $2 ORDER BY username_lower, user_id LIMIT $3`, []any{prefix, prefix + "\U0010ffff", limit}
+		// LIKE rather than a >= / < range: the range's upper bound was
+		// prefix + U+10FFFF, and this database's collation sorts that
+		// noncharacter as if it were absent, so the bound collapsed onto the
+		// prefix itself and the range matched nothing at all.
+		query, args = profileSelect+` WHERE username_lower LIKE $1 ESCAPE '\' ORDER BY username_lower, user_id LIMIT $2`, []any{likePrefix(prefix), limit}
 	}
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
@@ -175,6 +179,14 @@ func value(v *string) string {
 	return strings.TrimSpace(*v)
 }
 func validProfileText(v string, max int) bool { return len(v) <= max }
+
+// likePrefix turns a search term into a LIKE pattern matching it as a literal
+// prefix. Underscore is both a legal username character and a LIKE wildcard, so
+// without escaping a search for "ada_b" would also match "adaXb".
+func likePrefix(v string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(v) + "%"
+}
 func validGuestbookPolicy(v string) bool {
 	return v == "everyone" || v == "followers" || v == "following" || v == "mutuals" || v == "nobody"
 }

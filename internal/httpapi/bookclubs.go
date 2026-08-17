@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -14,7 +15,12 @@ func (s *Server) bookClubs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet {
-		x, e := s.store.ListBookClubs(r.Context(), s.optionalUser(r))
+		limit, err := clubLimit(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 100")
+			return
+		}
+		x, e := s.store.ListBookClubs(r.Context(), limit)
 		respond(w, x, e)
 		return
 	}
@@ -36,6 +42,20 @@ func (s *Server) bookClubs(w http.ResponseWriter, r *http.Request) {
 	} else {
 		respond(w, nil, e)
 	}
+}
+
+// clubLimit mirrors profileLimit and guestbookLimit: absent means the store's
+// default, out of range is a bad request rather than a silent clamp.
+func clubLimit(r *http.Request) (int, error) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > 100 {
+		return 0, strconv.ErrSyntax
+	}
+	return n, nil
 }
 
 func (s *Server) bookClub(w http.ResponseWriter, r *http.Request) {

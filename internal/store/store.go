@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -222,6 +223,20 @@ func (s *Store) ListChapters(ctx context.Context, storyID, caller string) ([]Cha
 	defer rows.Close()
 	return collectChapters(rows)
 }
+// ListChapterIndex is ListChapters without chapter bodies, for callers that
+// only need the running order. Listing a 50-chapter book to read its titles
+// otherwise transfers every word of it.
+func (s *Store) ListChapterIndex(ctx context.Context, storyID, caller string) ([]Chapter, error) {
+	if _, err := s.GetStory(ctx, storyID, caller); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT id, story_id, title, '' AS content, position, word_count, revision, created_at, updated_at FROM chapters WHERE story_id=$1 ORDER BY position`, storyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return collectChapters(rows)
+}
 func (s *Store) GetChapter(ctx context.Context, storyID, id, caller string) (Chapter, error) {
 	if _, err := s.GetStory(ctx, storyID, caller); err != nil {
 		return Chapter{}, err
@@ -288,6 +303,12 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 	row := tx.QueryRow(ctx, `INSERT INTO chapters (id, story_id, title, content, position, word_count) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, story_id, title, content, position, word_count, revision, created_at, updated_at`, id, storyID, in.Title, in.Content, in.Position, words)
 	chapter, err := scanChapter(row)
 	if err != nil {
+		// chapters is UNIQUE (story_id, position), so reusing a position is a
+		// caller mistake rather than a server fault.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return Chapter{}, ErrConflict
+		}
 		return Chapter{}, err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO indexing_outbox (id, aggregate_type, aggregate_id, story_id, operation, revision) VALUES ($1,'chapter',$2,$3,'upsert',$4)`, uuid.New(), id, storyID, chapter.Revision)
@@ -428,7 +449,9 @@ func scanChapterWithSummary(row pgx.Row) (Chapter, error) {
 	return x, err
 }
 func collectStories(rows pgx.Rows) ([]Story, error) {
-	var out []Story
+	// Non-nil so an empty result serializes as [] rather than null; clients
+	// map over these directly.
+	out := []Story{}
 	for rows.Next() {
 		x, err := scanStory(rows)
 		if err != nil {
@@ -439,7 +462,7 @@ func collectStories(rows pgx.Rows) ([]Story, error) {
 	return out, rows.Err()
 }
 func collectChapters(rows pgx.Rows) ([]Chapter, error) {
-	var out []Chapter
+	out := []Chapter{}
 	for rows.Next() {
 		x, err := scanChapter(rows)
 		if err != nil {

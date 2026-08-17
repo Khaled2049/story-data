@@ -1,15 +1,80 @@
 name: PR validation
+
 on:
   pull_request:
     branches: [main]
+
+# A new push to the same PR makes the in-flight run obsolete.
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   test:
+    name: Test & validate
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      # The e2e suite is the bulk of this repo's coverage and it refuses to run
+      # without a database (harness_test.go exits 1 rather than skipping, so a
+      # missing server is a red build, not a quiet gap). pgvector, not plain
+      # postgres: migration 000003 does CREATE EXTENSION vector.
+      # Keep this image aligned with docker-compose.yml.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # The harness creates and drops a throwaway database per run, so this
+      # points at the admin database rather than a fixture one.
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod, cache: true }
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - run: go mod download
-      - run: test -z "$(gofmt -l cmd internal)"
-      - run: go vet ./...
-      - run: go test ./...
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -race -count=1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.4
+          terraform_wrapper: false
+
+      # -backend=false keeps PR validation credential-free: it needs no GCP
+      # access, so it runs identically on a fork PR. The apply happens in deploy.
+      - name: Terraform format & validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate

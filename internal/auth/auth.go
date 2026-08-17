@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,14 +13,17 @@ import (
 )
 
 type Verifier struct {
-	mode      string
-	projectID string
-	once      sync.Once
-	client    *firebaseauth.Client
-	initErr   error
+	mode         string
+	projectID    string
+	serviceToken string
+	once         sync.Once
+	client       *firebaseauth.Client
+	initErr      error
 }
 
-func New(mode, projectID string) *Verifier { return &Verifier{mode: mode, projectID: projectID} }
+func New(mode, projectID, serviceToken string) *Verifier {
+	return &Verifier{mode: mode, projectID: projectID, serviceToken: serviceToken}
+}
 
 func (v *Verifier) UserID(ctx context.Context, r *http.Request) (string, error) {
 	uid, _, err := v.identity(ctx, r)
@@ -36,6 +40,26 @@ func (v *Verifier) IsAdmin(ctx context.Context, r *http.Request) (bool, error) {
 }
 
 func (v *Verifier) identity(ctx context.Context, r *http.Request) (string, map[string]any, error) {
+	// A trusted backend (the MCP server) holds the caller's uid but not their
+	// Firebase token, so it presents a shared secret and asserts the uid. Checked
+	// before the mode split so it works identically in dev and production.
+	//
+	// Deliberately never grants admin: a service that can name any user must not
+	// also be able to claim privilege for them, so X-Admin is ignored here.
+	if presented := strings.TrimSpace(r.Header.Get("X-Service-Token")); presented != "" {
+		if v.serviceToken == "" ||
+			subtle.ConstantTimeCompare([]byte(presented), []byte(v.serviceToken)) != 1 {
+			// Fails closed rather than falling through to the Firebase path: a
+			// wrong secret is a misconfigured caller, and reporting it as a
+			// missing bearer token would send them chasing the wrong bug.
+			return "", nil, fmt.Errorf("invalid service token")
+		}
+		uid := strings.TrimSpace(r.Header.Get("X-User-ID"))
+		if uid == "" {
+			return "", nil, fmt.Errorf("missing X-User-ID")
+		}
+		return uid, map[string]any{"admin": false}, nil
+	}
 	if v.mode == "dev" {
 		uid := strings.TrimSpace(r.Header.Get("X-User-ID"))
 		if uid == "" {
