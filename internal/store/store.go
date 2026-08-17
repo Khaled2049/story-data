@@ -223,6 +223,7 @@ func (s *Store) ListChapters(ctx context.Context, storyID, caller string) ([]Cha
 	defer rows.Close()
 	return collectChapters(rows)
 }
+
 // ListChapterIndex is ListChapters without chapter bodies, for callers that
 // only need the running order. Listing a 50-chapter book to read its titles
 // otherwise transfers every word of it.
