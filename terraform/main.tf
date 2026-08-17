@@ -66,6 +66,10 @@ resource "google_cloud_run_v2_service" "api" {
         value = var.firebase_project_id
       }
       env {
+        name  = "CORS_ORIGINS"
+        value = join(",", var.cors_origins)
+      }
+      env {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {

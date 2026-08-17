@@ -14,12 +14,16 @@ import (
 )
 
 type Server struct {
-	store *store.Store
-	auth  *auth.Verifier
+	store   *store.Store
+	auth    *auth.Verifier
+	origins map[string]bool
 }
 
-func New(s *store.Store, a *auth.Verifier) http.Handler {
-	x := &Server{store: s, auth: a}
+func New(s *store.Store, a *auth.Verifier, origins []string) http.Handler {
+	x := &Server{store: s, auth: a, origins: make(map[string]bool, len(origins))}
+	for _, o := range origins {
+		x.origins[o] = true
+	}
 	m := http.NewServeMux()
 	m.HandleFunc("/health", x.health)
 	m.HandleFunc("/v1/public/", x.public)
@@ -44,7 +48,26 @@ func New(s *store.Store, a *auth.Verifier) http.Handler {
 	m.HandleFunc("/v1/profiles/", x.profileAction)
 	m.HandleFunc("/v1/stories", x.stories)
 	m.HandleFunc("/v1/stories/", x.story)
-	return x.withJSON(m)
+	return x.withCORS(x.withJSON(m))
+}
+
+func (s *Server) withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		o := r.Header.Get("Origin")
+		allowed := o != "" && s.origins[o]
+		if allowed {
+			w.Header().Set("Access-Control-Allow-Origin", o)
+			w.Header().Add("Vary", "Origin")
+		}
+		if allowed && r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
+			w.Header().Set("Access-Control-Max-Age", "3600")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	write(w, http.StatusOK, map[string]string{"status": "ok"})

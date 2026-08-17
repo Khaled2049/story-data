@@ -118,7 +118,7 @@ func run(adminURL string, m *testing.M) (int, error) {
 
 	// AUTH_MODE=dev so tests can act as a user with X-User-ID rather than
 	// minting Firebase tokens. Everything below the auth layer is the real path.
-	testServer = httptest.NewServer(httpapi.New(store.New(testPool), auth.New("dev", "", testServiceToken)))
+	testServer = httptest.NewServer(httpapi.New(store.New(testPool), auth.New("dev", "", testServiceToken), nil))
 	defer testServer.Close()
 
 	return m.Run(), nil

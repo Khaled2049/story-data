@@ -11,3 +11,12 @@ variable "firebase_project_id" {
   type    = string
   default = "story-6f89f"
 }
+
+variable "cors_origins" {
+  type = list(string)
+  default = [
+    "https://story-6f89f.web.app",
+    "https://thetaletribe.com",
+    "https://www.thetaletribe.com",
+  ]
+}

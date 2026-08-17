@@ -18,28 +18,42 @@ import (
 	"github.com/kh1011/novelsync-story-data/internal/store"
 )
 
+const (
+	connectTimeout = 60 * time.Second
+	migrateTimeout = 5 * time.Minute
+	maxConns       = 10
+	migrateLockID  = 82104231
+)
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	db, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancelConnect()
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	poolCfg.MaxConns = maxConns
+	db, err := pgxpool.NewWithConfig(connectCtx, poolCfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	if err = waitForDatabase(ctx, db); err != nil {
+	if err = waitForDatabase(connectCtx, db); err != nil {
 		log.Fatal(err)
 	}
-	if err = migrate(ctx, cfg.DatabaseURL); err != nil {
+	migrateCtx, cancelMigrate := context.WithTimeout(context.Background(), migrateTimeout)
+	defer cancelMigrate()
+	if err = migrate(migrateCtx, cfg.DatabaseURL); err != nil {
 		log.Fatal(err)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
 		return
 	}
-	h := httpapi.New(store.New(db), auth.New(cfg.AuthMode, cfg.FirebaseProjectID, cfg.ServiceToken))
+	h := httpapi.New(store.New(db), auth.New(cfg.AuthMode, cfg.FirebaseProjectID, cfg.ServiceToken), cfg.CORSOrigins)
 	log.Printf("story-data listening on %s", cfg.Addr)
 	log.Fatal(http.ListenAndServe(cfg.Addr, h))
 }
@@ -64,9 +78,21 @@ func migrate(ctx context.Context, dsn string) error {
 		return err
 	}
 	defer db.Close()
-	if _, err = db.ExecContext(ctx, "SELECT pg_advisory_lock(82104231)"); err != nil {
+	conn, err := db.Conn(ctx)
+	if err != nil {
 		return err
 	}
-	defer db.ExecContext(ctx, "SELECT pg_advisory_unlock(82104231)")
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", migrateLockID); err != nil {
+		return err
+	}
+	defer func() {
+		var released bool
+		if err := conn.QueryRowContext(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", migrateLockID).Scan(&released); err != nil {
+			log.Printf("releasing migration lock: %v", err)
+		} else if !released {
+			log.Printf("migration lock %d was not held by this session", migrateLockID)
+		}
+	}()
 	return goose.UpContext(ctx, db, "migrations")
 }
