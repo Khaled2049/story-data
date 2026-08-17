@@ -1,9 +1,9 @@
 package httpapi
 
 import (
-	"github.com/kh1011/novelsync-story-data/internal/store"
 	"net/http"
-	"strings"
+
+	"github.com/kh1011/novelsync-story-data/internal/store"
 )
 
 func (s *Server) worldbuilding(w http.ResponseWriter, r *http.Request, uid, storyID string, p []string) {
@@ -30,7 +30,7 @@ func (s *Server) characters(w http.ResponseWriter, r *http.Request, uid, sid str
 			respond(w, x, e)
 		case http.MethodPost:
 			var in store.CharacterInput
-			if !decode(w, r, &in) || strings.TrimSpace(in.Name) == "" {
+			if !decode(w, r, &in) || !required(w, "name", in.Name) {
 				return
 			}
 			x, e := s.store.CreateCharacter(r.Context(), sid, uid, in)
@@ -48,6 +48,15 @@ func (s *Server) characters(w http.ResponseWriter, r *http.Request, uid, sid str
 		notFound(w)
 		return
 	}
+	if !uuidPath(w, p[0]) {
+		return
+	}
+	// Ahead of revision(): a read has no If-Match to supply.
+	if r.Method == http.MethodGet {
+		x, e := s.store.Character(r.Context(), sid, p[0], uid)
+		respond(w, x, e)
+		return
+	}
 	rev, ok := revision(w, r)
 	if !ok {
 		return
@@ -56,7 +65,7 @@ func (s *Server) characters(w http.ResponseWriter, r *http.Request, uid, sid str
 	switch r.Method {
 	case http.MethodPatch:
 		var in store.CharacterInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Name) == "" {
+		if !decode(w, r, &in) || !required(w, "name", in.Name) {
 			return
 		}
 		x, e := s.store.UpdateCharacter(r.Context(), sid, p[0], uid, rev, in)
@@ -76,7 +85,7 @@ func (s *Server) places(w http.ResponseWriter, r *http.Request, uid, sid string,
 			respond(w, x, e)
 		case http.MethodPost:
 			var in store.PlaceInput
-			if !decode(w, r, &in) || strings.TrimSpace(in.Name) == "" {
+			if !decode(w, r, &in) || !required(w, "name", in.Name) {
 				return
 			}
 			x, e := s.store.CreatePlace(r.Context(), sid, uid, in)
@@ -94,6 +103,15 @@ func (s *Server) places(w http.ResponseWriter, r *http.Request, uid, sid string,
 		notFound(w)
 		return
 	}
+	if !uuidPath(w, p[0]) {
+		return
+	}
+	// Ahead of revision(): a read has no If-Match to supply.
+	if r.Method == http.MethodGet {
+		x, e := s.store.Place(r.Context(), sid, p[0], uid)
+		respond(w, x, e)
+		return
+	}
 	rev, ok := revision(w, r)
 	if !ok {
 		return
@@ -101,7 +119,7 @@ func (s *Server) places(w http.ResponseWriter, r *http.Request, uid, sid string,
 	switch r.Method {
 	case http.MethodPatch:
 		var in store.PlaceInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Name) == "" {
+		if !decode(w, r, &in) || !required(w, "name", in.Name) {
 			return
 		}
 		x, e := s.store.UpdatePlace(r.Context(), sid, p[0], uid, rev, in)
@@ -120,7 +138,7 @@ func (s *Server) plots(w http.ResponseWriter, r *http.Request, uid, sid string, 
 			respond(w, x, e)
 		case http.MethodPost:
 			var in store.PlotLineInput
-			if !decode(w, r, &in) || strings.TrimSpace(in.Name) == "" {
+			if !decode(w, r, &in) || !required(w, "name", in.Name) {
 				return
 			}
 			x, e := s.store.CreatePlot(r.Context(), sid, uid, in)
@@ -135,7 +153,16 @@ func (s *Server) plots(w http.ResponseWriter, r *http.Request, uid, sid string, 
 		return
 	}
 	line := p[0]
+	if !uuidPath(w, line) {
+		return
+	}
 	if len(p) == 1 {
+		// Ahead of revision(): a read has no If-Match to supply.
+		if r.Method == http.MethodGet {
+			x, e := s.store.Plot(r.Context(), sid, line, uid)
+			respond(w, x, e)
+			return
+		}
 		rev, ok := revision(w, r)
 		if !ok {
 			return
@@ -143,7 +170,7 @@ func (s *Server) plots(w http.ResponseWriter, r *http.Request, uid, sid string, 
 		switch r.Method {
 		case http.MethodPatch:
 			var in store.PlotLineInput
-			if !decode(w, r, &in) || strings.TrimSpace(in.Name) == "" {
+			if !decode(w, r, &in) || !required(w, "name", in.Name) {
 				return
 			}
 			x, e := s.store.UpdatePlot(r.Context(), sid, line, uid, rev, in)
@@ -179,7 +206,7 @@ func (s *Server) plotEvents(w http.ResponseWriter, r *http.Request, uid, sid, li
 	}
 	if len(p) == 0 && r.Method == http.MethodPost {
 		var in store.PlotEventInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Name) == "" {
+		if !decode(w, r, &in) || !required(w, "name", in.Name) {
 			return
 		}
 		x, e := s.store.CreateEvent(r.Context(), sid, line, uid, in)
@@ -194,6 +221,9 @@ func (s *Server) plotEvents(w http.ResponseWriter, r *http.Request, uid, sid, li
 		notFound(w)
 		return
 	}
+	if !uuidPath(w, p[0]) {
+		return
+	}
 	rev, ok := revision(w, r)
 	if !ok {
 		return
@@ -201,7 +231,7 @@ func (s *Server) plotEvents(w http.ResponseWriter, r *http.Request, uid, sid, li
 	switch r.Method {
 	case http.MethodPatch:
 		var in store.PlotEventInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Name) == "" {
+		if !decode(w, r, &in) || !required(w, "name", in.Name) {
 			return
 		}
 		x, e := s.store.UpdateEvent(r.Context(), sid, line, p[0], uid, rev, in)

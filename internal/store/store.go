@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,6 +21,13 @@ var ErrValidation = errors.New("invalid input")
 
 const chapterLimit = 50
 const wordLimit = 5000
+
+// KEEP IN SYNC with firestore.rules MAX_STORIES_PER_USER and
+// mcp_server/writes.py MAX_STORIES_PER_USER in taleTribe-agents. The rules
+// enforced this against a denormalized counter for Firestore-backed stories;
+// stories created here bypass the rules entirely, so the ceiling has to be
+// re-declared rather than inherited.
+const storyLimit = 100
 
 type Story struct {
 	ID             string    `json:"id"`
@@ -88,6 +96,15 @@ func (s *Store) CreateStory(ctx context.Context, owner string, in StoryInput) (S
 		return Story{}, err
 	}
 	defer tx.Rollback(ctx)
+	// Counted inside the transaction rather than before it, so a caller cannot
+	// widen the ceiling by firing creates concurrently.
+	var owned int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM stories WHERE owner_id=$1`, owner).Scan(&owned); err != nil {
+		return Story{}, err
+	}
+	if owned >= storyLimit {
+		return Story{}, ErrLimit
+	}
 	row := tx.QueryRow(ctx, `INSERT INTO stories (id, owner_id, title, description, author_name, is_published, category, target_audience, language, copyright, cover_image_url, thumbnail_url)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), revision, created_at, updated_at`, id, owner, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL))
 	story, err := scanStory(row)
@@ -206,6 +223,21 @@ func (s *Store) ListChapters(ctx context.Context, storyID, caller string) ([]Cha
 	defer rows.Close()
 	return collectChapters(rows)
 }
+
+// ListChapterIndex is ListChapters without chapter bodies, for callers that
+// only need the running order. Listing a 50-chapter book to read its titles
+// otherwise transfers every word of it.
+func (s *Store) ListChapterIndex(ctx context.Context, storyID, caller string) ([]Chapter, error) {
+	if _, err := s.GetStory(ctx, storyID, caller); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT id, story_id, title, '' AS content, position, word_count, revision, created_at, updated_at FROM chapters WHERE story_id=$1 ORDER BY position`, storyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return collectChapters(rows)
+}
 func (s *Store) GetChapter(ctx context.Context, storyID, id, caller string) (Chapter, error) {
 	if _, err := s.GetStory(ctx, storyID, caller); err != nil {
 		return Chapter{}, err
@@ -272,6 +304,12 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 	row := tx.QueryRow(ctx, `INSERT INTO chapters (id, story_id, title, content, position, word_count) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, story_id, title, content, position, word_count, revision, created_at, updated_at`, id, storyID, in.Title, in.Content, in.Position, words)
 	chapter, err := scanChapter(row)
 	if err != nil {
+		// chapters is UNIQUE (story_id, position), so reusing a position is a
+		// caller mistake rather than a server fault.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return Chapter{}, ErrConflict
+		}
 		return Chapter{}, err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO indexing_outbox (id, aggregate_type, aggregate_id, story_id, operation, revision) VALUES ($1,'chapter',$2,$3,'upsert',$4)`, uuid.New(), id, storyID, chapter.Revision)
@@ -412,7 +450,9 @@ func scanChapterWithSummary(row pgx.Row) (Chapter, error) {
 	return x, err
 }
 func collectStories(rows pgx.Rows) ([]Story, error) {
-	var out []Story
+	// Non-nil so an empty result serializes as [] rather than null; clients
+	// map over these directly.
+	out := []Story{}
 	for rows.Next() {
 		x, err := scanStory(rows)
 		if err != nil {
@@ -423,7 +463,7 @@ func collectStories(rows pgx.Rows) ([]Story, error) {
 	return out, rows.Err()
 }
 func collectChapters(rows pgx.Rows) ([]Chapter, error) {
-	var out []Chapter
+	out := []Chapter{}
 	for rows.Next() {
 		x, err := scanChapter(rows)
 		if err != nil {

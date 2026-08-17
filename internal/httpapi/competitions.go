@@ -141,6 +141,29 @@ func (s *Server) myCompetitions(w http.ResponseWriter, r *http.Request) {
 	}
 	notFound(w)
 }
+func (s *Server) adminTokenGrants(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.user(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		method(w)
+		return
+	}
+	if !s.isAdmin(r) {
+		writeError(w, http.StatusForbidden, "admin only")
+		return
+	}
+	var in struct {
+		UserID         string `json:"userId"`
+		Amount         string `json:"amount"`
+		IdempotencyKey string `json:"idempotencyKey"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	x, e := s.store.GrantTokens(r.Context(), in.UserID, in.Amount, in.IdempotencyKey)
+	respond(w, x, e)
+}
 func (s *Server) competitionDrafts(w http.ResponseWriter, r *http.Request) {
 	uid, ok := s.user(w, r)
 	if !ok {

@@ -1,37 +1,125 @@
 name: Deploy story-data
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
+# One deploy at a time. Terraform's GCS backend locks state, so a second apply
+# would block rather than corrupt — but queueing here keeps the image tag that
+# gets applied matched to the commit that built it, and makes a failed run
+# obvious instead of interleaved. Never cancel in progress: killing a run
+# mid-apply leaves the lock held.
+concurrency:
+  group: deploy-story-data
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # Workload Identity Federation; no long-lived service account key
+
 env:
   PROJECT_ID: story-6f89f
   REGION: us-central1
   SERVICE: novelsync-story-data
   REPOSITORY: novelsync-story-data
+
 jobs:
-  deploy:
+  test:
+    name: Test
     runs-on: ubuntu-latest
-    permissions: { contents: read, id-token: write }
+    timeout-minutes: 15
+
+    # Same database the PR check uses: the e2e suite refuses to run without one,
+    # so deploying without it would mean deploying untested.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod, cache: true }
-      - run: go test ./...
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./... -count=1
+
+  deploy:
+    name: Build & deploy
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
       - uses: google-github-actions/setup-gcloud@v2
-      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
-      - run: |
-          gcloud artifacts repositories describe $REPOSITORY --location=$REGION --project=$PROJECT_ID || \
-            gcloud artifacts repositories create $REPOSITORY --repository-format=docker --location=$REGION --project=$PROJECT_ID
-          IMAGE=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:${{ github.sha }}
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Ensure the Artifact Registry repository exists
+        run: |
+          gcloud artifacts repositories describe "$REPOSITORY" \
+            --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1 ||
+          gcloud artifacts repositories create "$REPOSITORY" \
+            --repository-format=docker --location="$REGION" --project="$PROJECT_ID"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # Tagged by commit SHA, never :latest — the Cloud Run revision then
+          # names the exact commit it runs, and a rollback is re-applying an
+          # older tag rather than hoping a mutable tag still points somewhere.
+          tags: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - uses: hashicorp/setup-terraform@v3
-        with: { terraform_version: 1.5.0, terraform_wrapper: false }
-      - working-directory: terraform
+        with:
+          terraform_version: 1.14.4
+          terraform_wrapper: false
+
+      - name: Terraform apply
+        working-directory: terraform
         run: |
           terraform init
-          terraform apply -auto-approve -var="image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:${{ github.sha }}"
+          terraform apply -auto-approve -input=false \
+            -var="image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:${{ github.sha }}"
+
+      - name: Verify the new revision serves traffic
+        run: |
+          url="$(gcloud run services describe "$SERVICE" --region="$REGION" \
+                   --project="$PROJECT_ID" --format='value(status.url)')"
+          echo "Service URL: $url"
+          for attempt in $(seq 1 10); do
+            if curl -fsS --max-time 10 "$url/health" >/dev/null; then
+              echo "Health check passed"; exit 0
+            fi
+            echo "Attempt $attempt failed; retrying in 6s"; sleep 6
+          done
+          echo "Health check never passed — the deploy applied but the service is not serving." >&2
+          exit 1

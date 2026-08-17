@@ -7,17 +7,23 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/kh1011/novelsync-story-data/internal/auth"
 	"github.com/kh1011/novelsync-story-data/internal/store"
 )
 
 type Server struct {
-	store *store.Store
-	auth  *auth.Verifier
+	store   *store.Store
+	auth    *auth.Verifier
+	origins map[string]bool
 }
 
-func New(s *store.Store, a *auth.Verifier) http.Handler {
-	x := &Server{store: s, auth: a}
+func New(s *store.Store, a *auth.Verifier, origins []string) http.Handler {
+	x := &Server{store: s, auth: a, origins: make(map[string]bool, len(origins))}
+	for _, o := range origins {
+		x.origins[o] = true
+	}
 	m := http.NewServeMux()
 	m.HandleFunc("/health", x.health)
 	m.HandleFunc("/v1/public/", x.public)
@@ -35,13 +41,33 @@ func New(s *store.Store, a *auth.Verifier) http.Handler {
 	m.HandleFunc("/v1/me/competitions/drafts", x.myCompetitions)
 	m.HandleFunc("/v1/me/token-balance", x.myCompetitions)
 	m.HandleFunc("/v1/me/token-faucet", x.myCompetitions)
+	m.HandleFunc("/v1/admin/token-grants", x.adminTokenGrants)
 	m.HandleFunc("/v1/competition-drafts", x.competitionDrafts)
 	m.HandleFunc("/v1/competition-publish", x.competitionPublish)
 	m.HandleFunc("/v1/me/follows", x.myFollows)
 	m.HandleFunc("/v1/profiles/", x.profileAction)
 	m.HandleFunc("/v1/stories", x.stories)
 	m.HandleFunc("/v1/stories/", x.story)
-	return x.withJSON(m)
+	return x.withCORS(x.withJSON(m))
+}
+
+func (s *Server) withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		o := r.Header.Get("Origin")
+		allowed := o != "" && s.origins[o]
+		if allowed {
+			w.Header().Set("Access-Control-Allow-Origin", o)
+			w.Header().Add("Vary", "Origin")
+		}
+		if allowed && r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
+			w.Header().Set("Access-Control-Max-Age", "3600")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	write(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -57,7 +83,7 @@ func (s *Server) stories(w http.ResponseWriter, r *http.Request) {
 		respond(w, x, e)
 	case http.MethodPost:
 		var in store.StoryInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Title) == "" {
+		if !decode(w, r, &in) || !required(w, "title", in.Title) {
 			return
 		}
 		x, e := s.store.CreateStory(r.Context(), uid, in)
@@ -78,6 +104,10 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 	p := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/stories/"), "/"), "/")
 	if len(p) == 0 || p[0] == "" {
 		notFound(w)
+		return
+	}
+	// Guards the whole /v1/stories/{id}/... subtree in one place.
+	if !uuidPath(w, p[0]) {
 		return
 	}
 	if len(p) == 1 {
@@ -118,6 +148,15 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p[1] == "chapters" && len(p) >= 4 && p[3] == "comments" {
+		// Guarded here rather than inside `comments`: this branch returns
+		// before the uuidPath checks further down, and every route below puts
+		// these segments straight into a query against a uuid column.
+		if !uuidPath(w, p[2]) {
+			return
+		}
+		if len(p) >= 5 && !uuidPath(w, p[4]) {
+			return
+		}
 		s.comments(w, r, uid, p[0], p)
 		return
 	}
@@ -130,16 +169,22 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(p) == 3 {
+		if !uuidPath(w, p[2]) {
+			return
+		}
 		s.chapter(w, r, uid, p[0], p[2])
 		return
 	}
 	if len(p) == 4 && p[1] == "chapters" && p[3] == "summary" && r.Method == http.MethodPut {
+		if !uuidPath(w, p[2]) {
+			return
+		}
 		rev, ok := revision(w, r)
 		if !ok {
 			return
 		}
 		var in store.ChapterSummaryInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Summary) == "" {
+		if !decode(w, r, &in) || !required(w, "summary", in.Summary) {
 			return
 		}
 		x, e := s.store.PutChapterSummary(r.Context(), p[0], p[2], uid, rev, in)
@@ -181,6 +226,15 @@ func (s *Server) comments(w http.ResponseWriter, r *http.Request, uid, storyID s
 		}
 		return
 	}
+	if len(p) == 6 && p[5] == "likes" {
+		if r.Method != http.MethodPut && r.Method != http.MethodDelete {
+			method(w)
+			return
+		}
+		x, e := s.store.SetCommentLike(r.Context(), storyID, chapterID, p[4], uid, r.Method == http.MethodPut)
+		respond(w, x, e)
+		return
+	}
 	if len(p) != 5 {
 		notFound(w)
 		return
@@ -213,7 +267,7 @@ func (s *Server) storyResource(w http.ResponseWriter, r *http.Request, uid, id s
 			return
 		}
 		var in store.StoryInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Title) == "" {
+		if !decode(w, r, &in) || !required(w, "title", in.Title) {
 			return
 		}
 		x, e := s.store.UpdateStory(r.Context(), id, uid, rev, in)
@@ -231,11 +285,17 @@ func (s *Server) storyResource(w http.ResponseWriter, r *http.Request, uid, id s
 func (s *Server) chapters(w http.ResponseWriter, r *http.Request, uid, storyID string) {
 	switch r.Method {
 	case http.MethodGet:
+		// ?content=false returns the running order without chapter bodies.
+		if r.URL.Query().Get("content") == "false" {
+			x, e := s.store.ListChapterIndex(r.Context(), storyID, uid)
+			respond(w, x, e)
+			return
+		}
 		x, e := s.store.ListChapters(r.Context(), storyID, uid)
 		respond(w, x, e)
 	case http.MethodPost:
 		var in store.ChapterInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Title) == "" {
+		if !decode(w, r, &in) || !required(w, "title", in.Title) {
 			return
 		}
 		x, e := s.store.CreateChapter(r.Context(), storyID, uid, in)
@@ -259,7 +319,7 @@ func (s *Server) chapter(w http.ResponseWriter, r *http.Request, uid, storyID, i
 			return
 		}
 		var in store.ChapterInput
-		if !decode(w, r, &in) || strings.TrimSpace(in.Title) == "" {
+		if !decode(w, r, &in) || !required(w, "title", in.Title) {
 			return
 		}
 		x, e := s.store.UpdateChapter(r.Context(), storyID, id, uid, rev, in)
@@ -335,6 +395,29 @@ func write(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// required rejects a blank mandatory field. It writes the 400 itself, because
+// the callers that guard on it return immediately — an earlier version of this
+// check just returned, which let the handler answer 200 with an empty body.
+func required(w http.ResponseWriter, field, value string) bool {
+	if strings.TrimSpace(value) == "" {
+		writeError(w, http.StatusBadRequest, field+" is required")
+		return false
+	}
+	return true
+}
+
+// uuidPath reports whether a path segment is a well-formed UUID. Passing a
+// malformed one straight into a query against a uuid column makes PostgreSQL
+// raise, which surfaced as a 500 for what is really a bad URL.
+func uuidPath(w http.ResponseWriter, id string) bool {
+	if _, err := uuid.Parse(id); err != nil {
+		notFound(w)
+		return false
+	}
+	return true
+}
+
 func writeError(w http.ResponseWriter, status int, msg string) {
 	write(w, status, map[string]string{"error": msg})
 }

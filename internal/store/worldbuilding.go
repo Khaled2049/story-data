@@ -174,7 +174,7 @@ func (s *Store) hydrateRelationships(ctx context.Context, x *Character) error {
 	}
 	return rows.Err()
 }
-func (s *Store) character(ctx context.Context, storyID, id, uid string) (Character, error) {
+func (s *Store) Character(ctx context.Context, storyID, id, uid string) (Character, error) {
 	if e := s.owner(ctx, storyID, uid); e != nil {
 		return Character{}, e
 	}
@@ -194,13 +194,13 @@ func (s *Store) replaceRelationships(ctx context.Context, tx pgx.Tx, storyID, id
 	seen := map[string]bool{}
 	for _, r := range rs {
 		if r.CharacterID == id || seen[r.CharacterID] {
-			return fmt.Errorf("invalid character relationship")
+			return fmt.Errorf("%w: a character cannot be related to itself, or listed twice", ErrValidation)
 		}
 		seen[r.CharacterID] = true
 		var ok bool
 		e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM characters WHERE id=$1 AND story_id=$2)`, r.CharacterID, storyID).Scan(&ok)
 		if e != nil || !ok {
-			return fmt.Errorf("relationship character is not in this story")
+			return fmt.Errorf("%w: relationship character is not in this story", ErrValidation)
 		}
 		if _, e = tx.Exec(ctx, `INSERT INTO character_relationships(character_id,related_character_id,relationship_type,description) VALUES($1,$2,$3,$4)`, id, r.CharacterID, r.Type, emptyToNull(r.Description)); e != nil {
 			return e
@@ -231,7 +231,7 @@ func (s *Store) CreateCharacter(ctx context.Context, storyID, uid string, in Cha
 	if e = tx.Commit(ctx); e != nil {
 		return Character{}, e
 	}
-	return s.character(ctx, storyID, x.ID, uid)
+	return s.Character(ctx, storyID, x.ID, uid)
 }
 func (s *Store) UpdateCharacter(ctx context.Context, storyID, id, uid string, rev int64, in CharacterInput) (Character, error) {
 	if e := s.owner(ctx, storyID, uid); e != nil {
@@ -258,7 +258,7 @@ func (s *Store) UpdateCharacter(ctx context.Context, storyID, id, uid string, re
 	if e = tx.Commit(ctx); e != nil {
 		return Character{}, e
 	}
-	return s.character(ctx, storyID, id, uid)
+	return s.Character(ctx, storyID, id, uid)
 }
 func (s *Store) DeleteCharacter(ctx context.Context, storyID, id, uid string, rev int64) error {
 	return s.deleteWorld(ctx, "characters", storyID, id, uid, rev, "character")
@@ -282,6 +282,16 @@ func (s *Store) ListPlaces(ctx context.Context, storyID, uid string) ([]Place, e
 		out = append(out, x)
 	}
 	return out, rows.Err()
+}
+func (s *Store) Place(ctx context.Context, storyID, id, uid string) (Place, error) {
+	if e := s.owner(ctx, storyID, uid); e != nil {
+		return Place{}, e
+	}
+	x, e := scanPlace(s.db.QueryRow(ctx, `SELECT id,story_id,name,COALESCE(image_url,''),COALESCE(description,''),COALESCE(atmosphere,''),COALESCE(geography,''),COALESCE(history,''),COALESCE(significance,''),COALESCE(notes,''),revision FROM places WHERE id=$1 AND story_id=$2`, id, storyID))
+	if errors.Is(e, pgx.ErrNoRows) {
+		return Place{}, ErrNotFound
+	}
+	return x, e
 }
 func scanPlace(row pgx.Row) (Place, error) {
 	var x Place
@@ -371,6 +381,24 @@ func (s *Store) deleteWorld(ctx context.Context, table, storyID, id, uid string,
 }
 
 // Plot storage is deliberately normalized, while reads return the existing nested UI shape.
+// Plot returns one plot line with its events. Events are nested rather than
+// separately addressable, matching ListPlots.
+func (s *Store) Plot(ctx context.Context, storyID, id, uid string) (PlotLine, error) {
+	if e := s.owner(ctx, storyID, uid); e != nil {
+		return PlotLine{}, e
+	}
+	var x PlotLine
+	e := s.db.QueryRow(ctx, `SELECT id,name,description,revision FROM plot_lines WHERE id=$1 AND story_id=$2`, id, storyID).
+		Scan(&x.ID, &x.Name, &x.Description, &x.Revision)
+	if errors.Is(e, pgx.ErrNoRows) {
+		return PlotLine{}, ErrNotFound
+	}
+	if e != nil {
+		return PlotLine{}, e
+	}
+	x.Events, e = s.events(ctx, storyID, x.ID)
+	return x, e
+}
 func (s *Store) ListPlots(ctx context.Context, storyID, uid string) ([]PlotLine, error) {
 	if e := s.owner(ctx, storyID, uid); e != nil {
 		return nil, e
@@ -518,7 +546,7 @@ func validEvent(in *PlotEventInput) error {
 		in.TensionLevel = 5
 	}
 	if in.TensionLevel < 1 || in.TensionLevel > 10 {
-		return fmt.Errorf("tensionLevel must be between 1 and 10")
+		return fmt.Errorf("%w: tensionLevel must be between 1 and 10", ErrValidation)
 	}
 	if in.Pacing == "" {
 		in.Pacing = "moderate"
@@ -549,7 +577,7 @@ func (s *Store) writeEventRefs(ctx context.Context, tx pgx.Tx, storyID, eventID 
 	for _, id := range in.CharacterIDs {
 		var ok bool
 		if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM characters WHERE id=$1 AND story_id=$2)`, id, storyID).Scan(&ok); e != nil || !ok {
-			return fmt.Errorf("event character is not in this story")
+			return fmt.Errorf("%w: event character is not in this story", ErrValidation)
 		}
 		if _, e := tx.Exec(ctx, `INSERT INTO plot_event_characters(plot_event_id,character_id) VALUES($1,$2)`, eventID, id); e != nil {
 			return e
@@ -560,11 +588,11 @@ func (s *Store) writeEventRefs(ctx context.Context, tx pgx.Tx, storyID, eventID 
 	}
 	for _, d := range in.Dependencies {
 		if d.EventID == eventID {
-			return fmt.Errorf("event cannot depend on itself")
+			return fmt.Errorf("%w: event cannot depend on itself", ErrValidation)
 		}
 		var ok bool
 		if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.id=$1 AND l.story_id=$2)`, d.EventID, storyID).Scan(&ok); e != nil || !ok {
-			return fmt.Errorf("dependency event is not in this story")
+			return fmt.Errorf("%w: dependency event is not in this story", ErrValidation)
 		}
 		if _, e := tx.Exec(ctx, `INSERT INTO plot_event_dependencies(plot_event_id,depends_on_event_id,relationship_type,description) VALUES($1,$2,$3,$4)`, eventID, d.EventID, d.RelationshipType, emptyToNull(d.Description)); e != nil {
 			return e

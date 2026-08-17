@@ -19,6 +19,10 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/story_data?sslmode=disable
       AUTH_MODE: dev
+      # Lets the MCP server assert X-User-ID. Redundant under AUTH_MODE=dev,
+      # which trusts that header anyway, but it means local runs exercise the
+      # same code path production uses. Keep in sync with dev-new.sh.
+      SERVICE_TOKEN: dev-service-token
     ports:
       - "8084:8080"
     depends_on:

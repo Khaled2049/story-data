@@ -76,7 +76,7 @@ func (s *Store) ListPublicStories(ctx context.Context, category, cursor string, 
 	if cursor != "" {
 		parsed, err := decodePublicStoryCursor(cursor)
 		if err != nil {
-			return PublicStoryPage{}, fmt.Errorf("invalid cursor")
+			return PublicStoryPage{}, ErrValidation
 		}
 		after = &parsed
 	}
@@ -254,7 +254,7 @@ func decodePublicStoryCursor(value string) (publicStoryCursor, error) {
 	}
 	var cursor publicStoryCursor
 	if err := json.Unmarshal(bytes, &cursor); err != nil || cursor.UpdatedAt.IsZero() {
-		return publicStoryCursor{}, errors.New("invalid cursor")
+		return publicStoryCursor{}, ErrValidation
 	}
 	if _, err := uuid.Parse(cursor.ID); err != nil {
 		return publicStoryCursor{}, err

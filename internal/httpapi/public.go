@@ -21,10 +21,6 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		x, err := s.store.ListPublicStories(r.Context(), r.URL.Query().Get("category"), r.URL.Query().Get("cursor"), limit)
-		if err != nil && err.Error() == "invalid cursor" {
-			writeError(w, http.StatusBadRequest, "invalid cursor")
-			return
-		}
 		respond(w, x, err)
 		return
 	}
@@ -51,7 +47,7 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			notFound(w)
 			return
 		}
-		x, err := s.store.ListPublicComments(r.Context(), storyID, p[3])
+		x, err := s.store.ListPublicComments(r.Context(), storyID, p[3], s.optionalUser(r))
 		respond(w, x, err)
 		return
 	}

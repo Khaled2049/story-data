@@ -11,6 +11,11 @@ type Config struct {
 	DatabaseURL       string
 	AuthMode          string
 	FirebaseProjectID string
+	// ServiceToken lets a trusted backend assert a caller identity via
+	// X-User-ID without holding that user's Firebase token. Empty disables the
+	// path entirely: an unconfigured deployment must never trust a header.
+	ServiceToken string
+	CORSOrigins  []string
 }
 
 func Load() (Config, error) {
@@ -19,6 +24,8 @@ func Load() (Config, error) {
 		DatabaseURL:       strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		AuthMode:          value("AUTH_MODE", "dev"),
 		FirebaseProjectID: strings.TrimSpace(os.Getenv("FIREBASE_PROJECT_ID")),
+		ServiceToken:      strings.TrimSpace(os.Getenv("SERVICE_TOKEN")),
+		CORSOrigins:       splitList(os.Getenv("CORS_ORIGINS")),
 	}
 	if c.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL is required")
@@ -30,6 +37,16 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("FIREBASE_PROJECT_ID is required in production")
 	}
 	return c, nil
+}
+
+func splitList(v string) []string {
+	out := []string{}
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func value(key, fallback string) string {

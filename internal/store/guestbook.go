@@ -103,8 +103,8 @@ func (s *Store) ListGuestbookReplies(ctx context.Context, ownerID, entryID, view
 	rows, err := s.db.Query(ctx, `SELECT r.id,r.entry_id,r.parent_id,r.author_id,COALESCE(p.username,'unknown'),r.content,r.created_at,r.updated_at,
  (SELECT count(*) FROM guestbook_reply_votes v WHERE v.reply_id=r.id AND v.vote='up'),
  (SELECT count(*) FROM guestbook_reply_votes v WHERE v.reply_id=r.id AND v.vote='down'),
- COALESCE((SELECT v.vote FROM guestbook_reply_votes v WHERE v.reply_id=r.id AND v.user_id=$3),'')
- FROM guestbook_replies r LEFT JOIN public_profiles p ON p.user_id=r.author_id WHERE r.entry_id=$1 ORDER BY r.created_at DESC,r.id DESC`, entryID, ownerID, viewerID)
+ COALESCE((SELECT v.vote FROM guestbook_reply_votes v WHERE v.reply_id=r.id AND v.user_id=$2),'')
+ FROM guestbook_replies r LEFT JOIN public_profiles p ON p.user_id=r.author_id WHERE r.entry_id=$1 ORDER BY r.created_at DESC,r.id DESC`, entryID, viewerID)
 	if err != nil {
 		return nil, err
 	}
