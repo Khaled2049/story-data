@@ -520,7 +520,8 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 	// $2 is the story, referenced once: an earlier version bound the caller's
 	// id as an extra parameter the SQL never used, which PostgreSQL cannot
 	// type-infer — it made every submission fail with a 500.
-	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1`, id, storyID).Scan(&phase, &owner, &title, &author, &cover, &fee)
+	var prize, escrowed string
+	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text,c.prize_amount::text,COALESCE((SELECT a.balance::text FROM token_accounts a WHERE a.account_id=$3),'0') FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1`, id, storyID, escrow(id)).Scan(&phase, &owner, &title, &author, &cover, &fee, &prize, &escrowed)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -529,6 +530,15 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 	}
 	if phase != "open" || owner != user {
 		return ErrForbidden
+	}
+	// Defence in depth against an unfunded competition taking money. Publish
+	// is the only path that opens one and it escrows the prize first, so the
+	// escrow always covers the advertised prize on top of the fees held in it.
+	// If it does not, the competition cannot pay out and must not collect.
+	held, ok := new(big.Int).SetString(escrowed, 10)
+	want, ok2 := new(big.Int).SetString(prize, 10)
+	if !ok || !ok2 || held.Cmp(want) < 0 {
+		return ErrValidation
 	}
 	var joined bool
 	_ = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM competition_participants WHERE competition_id=$1 AND user_id=$2)`, id, user).Scan(&joined)
@@ -812,24 +822,34 @@ func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string,
 	if !admin && c.CreatorID != user {
 		return c, ErrForbidden
 	}
-	next := target
-	if next == "" {
-		now := time.Now()
-		if c.Phase == "scheduled" && c.StartDate != nil && !now.Before(*c.StartDate) {
-			next = "open"
-		}
-		if c.Phase == "open" && c.Deadline != nil && now.After(*c.Deadline) {
-			next = "voting"
-		}
+	// Advance is the scheduler, not a general phase setter: the only
+	// transitions it performs are the ones the clock already implies. Every
+	// phase change that moves money has its own endpoint that moves it —
+	// draft->open escrows the prize in PublishCompetition, and ->cancelled
+	// refunds the prize and every held entry fee in CancelCompetition.
+	// Honouring a caller-supplied target let a creator open a competition
+	// whose prize was never escrowed, collect entry fees against the
+	// advertised prize, and then "cancel" it without refunding a thing.
+	next := ""
+	now := time.Now()
+	switch {
+	case c.Phase == "scheduled" && c.StartDate != nil && !now.Before(*c.StartDate):
+		next = "open"
+	case c.Phase == "open" && c.Deadline != nil && now.After(*c.Deadline):
+		next = "voting"
+	}
+	// A target is accepted only as an assertion about the transition that is
+	// already due. Asking for anything else is a request for a door this
+	// endpoint does not have.
+	if target != "" && target != next {
+		return c, ErrValidation
 	}
 	if next == "" {
 		return c, nil
 	}
-	allowed := map[string]map[string]bool{"scheduled": {"open": true, "cancelled": true}, "open": {"voting": true, "cancelled": true}, "voting": {"cancelled": true}, "draft": {"scheduled": true, "open": true, "cancelled": true}}
-	if !allowed[c.Phase][next] {
-		return c, ErrValidation
-	}
-	_, e = s.db.Exec(ctx, `UPDATE competitions SET phase=$1,updated_at=now() WHERE id=$2`, next, id)
+	// Guarded on the phase it was read at, so two concurrent calls cannot both
+	// apply the transition.
+	_, e = s.db.Exec(ctx, `UPDATE competitions SET phase=$1,updated_at=now() WHERE id=$2 AND phase=$3`, next, id, c.Phase)
 	if e != nil {
 		return c, e
 	}

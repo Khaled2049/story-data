@@ -97,8 +97,17 @@ func enter(t *testing.T, uid, competitionID string) string {
 	return story["id"].(string)
 }
 
+// advance drives a competition to the phase the clock has made due. The
+// endpoint performs only time-implied transitions — the ones that move money
+// have their own endpoints — so a test that wants entries closed before the
+// deadline moves the deadline first, exactly as a host does through PATCH.
 func advance(t *testing.T, uid, competitionID, phase string) {
 	t.Helper()
+	if phase == "voting" {
+		call(t, "PATCH", "/v1/competitions/"+competitionID, uid, map[string]any{
+			"deadline": time.Now().UTC().Add(-time.Minute).Format(time.RFC3339),
+		}).expect(http.StatusOK)
+	}
 	got := call(t, "POST", "/v1/competitions/"+competitionID+"/advance", uid,
 		map[string]any{"targetPhase": phase}).expect(http.StatusOK).json()
 	if got["phase"] != phase {
@@ -942,6 +951,138 @@ func TestCompetitionAdvanceRejectsIllegalTransitions(t *testing.T) {
 
 	call(t, "POST", "/v1/competitions/"+id+"/advance", bob,
 		map[string]any{"targetPhase": "cancelled"}).expect(http.StatusForbidden)
+}
+
+// /advance used to apply any phase the caller named, which gave every
+// money-moving transition a second door with no money logic behind it. A
+// draft could be opened without escrowing the prize and an open competition
+// "cancelled" without refunding the entry fees it had collected.
+func TestAdvanceCannotOpenAnUnfundedDraft(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	draft := newDraft(t, alice, "Never funded", tale(500), tale(10))
+	id := draft["id"].(string)
+
+	call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{"targetPhase": "open"}).expect(http.StatusUnprocessableEntity)
+
+	still := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if still["phase"] != "draft" {
+		t.Fatalf("phase = %v, want draft", still["phase"])
+	}
+	// The prize was never escrowed, which is precisely why the competition
+	// must not be reachable by entrants.
+	assertBalance(t, userAccount(alice), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), "0")
+
+	// Publishing is the door that funds it.
+	call(t, "POST", "/v1/competition-publish", alice,
+		map[string]any{"competitionId": id}).expect(http.StatusOK)
+	assertBalance(t, escrowAccount(id), tale(500))
+	assertLedgerIntact(t)
+}
+
+func TestAdvanceCannotCancel(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "No silent cancel", tale(100), tale(10))
+	grantInitial(t, bob)
+	enter(t, bob, id)
+
+	call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{"targetPhase": "cancelled"}).expect(http.StatusUnprocessableEntity)
+
+	open := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if open["phase"] != "open" {
+		t.Fatalf("phase = %v, want open", open["phase"])
+	}
+	assertBalance(t, escrowAccount(id), tale(110))
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
+
+	// The real cancel endpoint refunds, which is the whole reason /advance
+	// must not be able to reach the phase.
+	call(t, "POST", "/v1/competitions/"+id+"/cancel", alice,
+		map[string]any{"reason": "changed my mind"}).expect(http.StatusOK)
+	assertBalance(t, userAccount(bob), tale(initialGrantTale))
+	assertBalance(t, userAccount(alice), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+}
+
+// Only the clock decides. A target is accepted as an assertion about the
+// transition already due, and rejected otherwise.
+func TestAdvanceOnlyFollowsTheClock(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	now := time.Now().UTC()
+	draft := call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
+		"title": "Opens later", "description": "d", "category": "flash-fiction",
+		"tags":        []string{"x"},
+		"startDate":   now.Add(time.Hour).Format(time.RFC3339),
+		"deadline":    now.Add(2 * time.Hour).Format(time.RFC3339),
+		"prizeAmount": tale(10), "creatorName": "Alice",
+		"votingDeadline": now.Add(3 * time.Hour).Format(time.RFC3339),
+	}).expect(http.StatusCreated).json()
+	id := draft["id"].(string)
+	published := call(t, "POST", "/v1/competition-publish", alice,
+		map[string]any{"competitionId": id}).expect(http.StatusOK).json()
+	if published["phase"] != "scheduled" {
+		t.Fatalf("a future start should publish as scheduled, got %v", published["phase"])
+	}
+
+	// Nothing is due yet: an empty target is a no-op, a named one is refused.
+	idle := call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{}).expect(http.StatusOK).json()
+	if idle["phase"] != "scheduled" {
+		t.Errorf("advance moved a competition whose start has not arrived: %v", idle["phase"])
+	}
+	call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{"targetPhase": "open"}).expect(http.StatusUnprocessableEntity)
+
+	// Bringing the start forward is a host action with its own endpoint; once
+	// it is in the past the same advance call performs the transition.
+	call(t, "PATCH", "/v1/competitions/"+id, alice, map[string]any{
+		"startDate": now.Add(-time.Minute).Format(time.RFC3339),
+	}).expect(http.StatusOK)
+	opened := call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{"targetPhase": "open"}).expect(http.StatusOK).json()
+	if opened["phase"] != "open" {
+		t.Fatalf("phase = %v, want open", opened["phase"])
+	}
+}
+
+// Defence in depth: even if a competition were opened without its prize in
+// escrow, it must not be able to take an entry fee it could never pay out
+// against.
+func TestSubmitRejectsUnfundedCompetition(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Escrow drained", tale(100), tale(10))
+	grantInitial(t, bob)
+	// Empty the escrow behind the API's back to stand in for a competition
+	// that reached "open" without being funded.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE token_accounts SET balance=0 WHERE account_id=$1`, escrowAccount(id)); err != nil {
+		t.Fatal(err)
+	}
+
+	story := newStory(t, bob, "bob's entry")
+	call(t, "PUT", "/v1/competitions/"+id+"/join", bob, nil).expect(http.StatusNoContent)
+	call(t, "POST", "/v1/competitions/"+id+"/submissions/me", bob,
+		map[string]any{"storyId": story["id"]}).expect(http.StatusUnprocessableEntity)
+
+	// The rejection must be complete: no fee taken, no submission recorded.
+	assertBalance(t, userAccount(bob), tale(initialGrantTale))
+	if subs := get(t, "/v1/competitions/"+id+"/submissions", bob).
+		expect(http.StatusOK).list(); len(subs) != 0 {
+		t.Errorf("a rejected submission was recorded: %d entries", len(subs))
+	}
+	// Undo the injected corruption before the invariant check, which would
+	// otherwise flag the escrow this test emptied by hand.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE token_accounts SET balance=$2::numeric WHERE account_id=$1`,
+		escrowAccount(id), tale(100)); err != nil {
+		t.Fatal(err)
+	}
+	assertLedgerIntact(t)
 }
 
 func TestCompetitionDiscardDraft(t *testing.T) {
