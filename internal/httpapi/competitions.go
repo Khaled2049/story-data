@@ -89,16 +89,18 @@ func (s *Server) competition(w http.ResponseWriter, r *http.Request) {
 		method(w)
 		return
 	}
-	if len(p) == 2 && p[1] == "submissions" && r.Method == http.MethodGet {
-		x, e := s.store.ListSubmissions(r.Context(), id)
-		respond(w, x, e)
-		return
-	}
 	uid, ok := s.user(w, r)
 	if !ok {
 		return
 	}
 	switch {
+	case len(p) == 2 && p[1] == "submissions" && r.Method == http.MethodGet:
+		// Moved inside the authentication gate: this used to be the one route
+		// in the subtree an anonymous caller could reach, and it answers with
+		// the uid of every entrant. The frontend already requires a signed-in
+		// user to call it.
+		x, e := s.store.ListSubmissions(r.Context(), id, uid)
+		respond(w, x, e)
 	case len(p) == 2 && p[1] == "join" && r.Method == http.MethodPut:
 		respond(w, nil, s.store.JoinCompetition(r.Context(), id, uid))
 	case len(p) == 3 && p[1] == "submissions" && p[2] == "me" && r.Method == http.MethodPost:

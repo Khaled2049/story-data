@@ -104,6 +104,19 @@ permissions. Never trust client-supplied owner IDs.
 `X-Admin: true` so scripts can exercise protected routes without external
 token verification.
 
+### Competition read visibility
+
+A published competition is readable by anyone, including anonymous callers —
+that is the public contest page. A **draft** is its author's private working
+copy and answers only to them; every other caller, admin included, gets `404`
+rather than `403`, because confirming that a draft id exists is itself the
+disclosure. `GET /v1/competitions/{id}/submissions` **requires
+authentication** and is gated on the same rule: the list carries the Firebase
+uid of every entrant, which joins directly against the public profile
+directory. The guard lives in `GetCompetition`/`ListSubmissions`, not in the
+internal `competition()` helper, which every store method uses with the acting
+user and must keep working for an admin operating on someone else's record.
+
 ### Competition voter eligibility
 
 Casting a competition ballot needs more than a valid token, because a ballot

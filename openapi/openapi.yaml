@@ -106,6 +106,30 @@ paths:
               description: Present only when a further page exists.
         '400': { description: limit is not a positive integer }
         '422': { description: cursor is malformed }
+  /v1/competitions/{competitionId}:
+    parameters: [{ name: competitionId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      summary: Read one competition
+      description: >-
+        Published competitions are readable by anyone. A draft is visible only
+        to its author; every other caller gets 404, since confirming the id
+        exists would itself disclose the unannounced competition.
+      responses:
+        '200': { description: Competition }
+        '404': { description: Competition is unavailable }
+  /v1/competitions/{competitionId}/submissions:
+    parameters: [{ name: competitionId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      summary: List the entries of a competition
+      description: >-
+        Requires authentication — the list carries the user id of every
+        entrant. Gated on the caller being able to read the competition, so a
+        draft answers only to its author.
+      security: [{ firebaseBearer: [] }]
+      responses:
+        '200': { description: Submissions }
+        '401': { description: Unauthenticated }
+        '404': { description: Competition is unavailable }
   /v1/public/stories/{storyId}/chapters/{chapterId}/comments:
     parameters:
       - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }

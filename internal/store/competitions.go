@@ -459,8 +459,25 @@ func decodeCompetitionCursor(v string) (competitionCursor, error) {
 	}
 	return out, nil
 }
+
+// GetCompetition is the external read. A draft is its author's private
+// working copy — an unannounced prize pool, entry fee and schedule — so it is
+// visible only to them. Everyone else gets 404 rather than 403: confirming
+// that an id exists is itself the leak, since draft ids travel through URLs,
+// screenshots and support tickets.
+//
+// The guard lives here rather than in competition(), which every internal
+// caller uses with the acting user and which must keep working for an admin
+// operating on someone else's record.
 func (s *Store) GetCompetition(ctx context.Context, id, viewer string) (Competition, error) {
-	return s.competition(ctx, id, viewer)
+	x, e := s.competition(ctx, id, viewer)
+	if e != nil {
+		return x, e
+	}
+	if x.Phase == "draft" && (viewer == "" || x.CreatorID != viewer) {
+		return Competition{}, ErrNotFound
+	}
+	return x, nil
 }
 func (s *Store) ListDrafts(ctx context.Context, user string) ([]Competition, error) {
 	rows, e := s.db.Query(ctx, `SELECT id FROM competitions WHERE creator_id=$1 AND phase='draft' ORDER BY updated_at DESC`, user)
@@ -850,7 +867,17 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 	return s.competition(ctx, id, user)
 }
 
-func (s *Store) ListSubmissions(ctx context.Context, id string) ([]CompetitionSubmission, error) {
+// ListSubmissions is the external read, and a submission list is a membership
+// list: it maps Firebase uids to competition participation, which joins
+// straight against the public profile directory. It is therefore gated on the
+// caller being able to see the competition at all, which also means an unknown
+// id returns 404 instead of an empty array.
+//
+// Settlement uses listSubmissions with its own transaction rather than this.
+func (s *Store) ListSubmissions(ctx context.Context, id, viewer string) ([]CompetitionSubmission, error) {
+	if _, e := s.GetCompetition(ctx, id, viewer); e != nil {
+		return nil, e
+	}
 	return listSubmissions(ctx, s.db, id)
 }
 

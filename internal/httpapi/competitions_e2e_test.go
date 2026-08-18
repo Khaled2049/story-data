@@ -357,6 +357,78 @@ func TestCompetitionDraftIsPrivateUntilPublished(t *testing.T) {
 	}
 }
 
+// A draft is the host's private working copy — an unannounced prize pool,
+// entry fee and schedule. It used to be world-readable by id, and draft ids
+// travel through URLs, screenshots and support tickets.
+func TestDraftIsNotReadableByStrangers(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	draft := newDraft(t, alice, "Secret Draft", tale(500), tale(10))
+	id := draft["id"].(string)
+
+	// 404 rather than 403: confirming the id exists is itself the leak.
+	get(t, "/v1/competitions/"+id, bob).expect(http.StatusNotFound)
+	get(t, "/v1/competitions/"+id, "").expect(http.StatusNotFound)
+	// An admin has no business reading an unannounced prize either.
+	get(t, "/v1/competitions/"+id, bob, map[string]string{"X-Admin": "true"}).
+		expect(http.StatusNotFound)
+
+	// The author still sees their own work.
+	mine := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if mine["phase"] != "draft" || mine["prizePool"].(map[string]any)["amount"] != tale(500) {
+		t.Errorf("owner read = %v", mine)
+	}
+}
+
+// The submission list maps Firebase uids to competition participation, which
+// joins straight against the public profile directory. It was the one route in
+// the subtree reachable with no credential at all.
+func TestDraftSubmissionsAreNotAnonymous(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	draftID := newDraft(t, alice, "Unlaunched", tale(10), "0")["id"].(string)
+	published := openCompetition(t, alice, "Launched", tale(10), "0")
+	grantInitial(t, bob)
+	enter(t, bob, published)
+
+	// Anonymous callers are turned away before the handler reads anything.
+	get(t, "/v1/competitions/"+draftID+"/submissions", "").expect(http.StatusUnauthorized)
+	get(t, "/v1/competitions/"+published+"/submissions", "").expect(http.StatusUnauthorized)
+
+	// Signed in is not enough for a draft nobody has announced.
+	get(t, "/v1/competitions/"+draftID+"/submissions", carol).expect(http.StatusNotFound)
+	// The host sees their own.
+	get(t, "/v1/competitions/"+draftID+"/submissions", alice).expect(http.StatusOK).list()
+
+	// A published competition's entrants stay visible to any signed-in reader,
+	// which is what the gallery needs.
+	subs := get(t, "/v1/competitions/"+published+"/submissions", carol).
+		expect(http.StatusOK).list()
+	if len(subs) != 1 || subs[0]["userId"] != bob {
+		t.Errorf("published submissions = %v", subs)
+	}
+}
+
+// Regression guard: the fix must not narrow the public reader.
+func TestPublishedCompetitionStaysPubliclyReadable(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Open to all", tale(100), "0")
+
+	anon := get(t, "/v1/competitions/"+id, "").expect(http.StatusOK).json()
+	if anon["id"] != id || anon["phase"] != "open" {
+		t.Errorf("anonymous read = %v", anon)
+	}
+	get(t, "/v1/competitions/"+id, bob).expect(http.StatusOK)
+
+	// And the listing keeps excluding drafts while including this one.
+	grantInitial(t, alice)
+	newDraft(t, alice, "Still hidden", tale(1), "0")
+	listed := get(t, "/v1/competitions", "").expect(http.StatusOK).list()
+	if len(listed) != 1 || listed[0]["id"] != id {
+		t.Errorf("public listing = %v", listed)
+	}
+}
+
 func TestCompetitionDraftValidation(t *testing.T) {
 	reset(t)
 
@@ -513,7 +585,7 @@ func TestCompetitionSubmitRequiresJoinAndStoryOwnership(t *testing.T) {
 	call(t, "POST", submit, bob, map[string]any{"storyId": bobStory["id"]}).
 		expect(http.StatusConflict)
 
-	subs := get(t, "/v1/competitions/"+id+"/submissions", "").expect(http.StatusOK).list()
+	subs := get(t, "/v1/competitions/"+id+"/submissions", alice).expect(http.StatusOK).list()
 	if len(subs) != 1 {
 		t.Fatalf("expected 1 submission, got %d", len(subs))
 	}
@@ -564,7 +636,7 @@ func TestCompetitionEntryFeeIsEscrowedAndRefundedOnWithdraw(t *testing.T) {
 	if after["submissionCount"].(float64) != 0 {
 		t.Errorf("submissionCount after withdraw = %v, want 0", after["submissionCount"])
 	}
-	if subs := get(t, "/v1/competitions/"+id+"/submissions", "").expect(http.StatusOK).list(); len(subs) != 0 {
+	if subs := get(t, "/v1/competitions/"+id+"/submissions", alice).expect(http.StatusOK).list(); len(subs) != 0 {
 		t.Errorf("withdrawn submission still listed: %v", subs)
 	}
 	assertLedgerIntact(t)
@@ -1357,6 +1429,9 @@ func TestCompetitionUnknownAndMalformedIDs(t *testing.T) {
 	// Empty collections serialize as [], never null.
 	get(t, "/v1/competitions", alice).expect(http.StatusOK).list()
 	get(t, "/v1/me/competitions/drafts", alice).expect(http.StatusOK).list()
+	// A submission list for an id that does not exist is a 404, not an empty
+	// array: the list is gated on being able to read the competition, so it
+	// cannot answer for one that is not there.
 	get(t, "/v1/competitions/11111111-1111-1111-1111-111111111111/submissions", alice).
-		expect(http.StatusOK).list()
+		expect(http.StatusNotFound)
 }
