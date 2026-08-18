@@ -115,6 +115,38 @@ freshly seeded account can vote; a malformed value fails startup rather than
 silently reverting to the default. Ballot size is capped per competition by
 `competitions.max_votes_per_user`.
 
+## Abuse controls
+
+The service is invokable by anyone — Cloud Run grants `roles/run.invoker` to
+`allUsers` and `/v1/public/*` needs no credential — so throttling is part of
+the contract, at two layers.
+
+**Per-caller request budget** (`internal/httpapi/ratelimit.go`). Middleware
+keyed on the authenticated caller where there is one and the client address
+otherwise, defaulting to 300 reads and 60 writes per minute. Override with
+`RATE_LIMIT_READS_PER_MINUTE` / `RATE_LIMIT_WRITES_PER_MINUTE`; `0` disables
+that half, which is what the local stack does. Over budget is `429` with
+`Retry-After`. `GET /health` is exempt so a flood cannot fail the liveness
+probe. Buckets are per instance and in memory: this bounds a burst, it is not
+a platform-wide quota. `clientIP` reads the **last** `X-Forwarded-For` entry,
+the one Google's front end appends — putting a load balancer in front of the
+service invalidates that assumption.
+
+**Durable daily budgets** (`internal/store/quota.go`, table
+`user_daily_usage`). Per user, per action, in UTC days, spent in the same
+transaction as the write they meter: comments (100), ratings (50), competition
+drafts (10) and book clubs (5). The guestbook and book-club discussion domains
+predate this and keep their own tables. Over budget is `429`.
+
+Two related bounds: `POST /v1/public/stories/{id}/views` counts one reader per
+story per day (`public_story_view_hits`, keyed on uid or a salted hash of the
+address — never a raw IP), and `GET /v1/competitions` is paged with a constant
+query count rather than selecting the whole table and hydrating row by row.
+
+Not covered here: there is no edge rate limiting. Attaching Cloud Armor needs
+an external load balancer in front of Cloud Run, which the service does not
+have today.
+
 ## API conventions
 
 - `GET /health` is the service health check.
@@ -122,6 +154,10 @@ silently reverting to the default. Ballot size is capped per competition by
   [`openapi/openapi.yaml`](../openapi/openapi.yaml).
 - Collection endpoints return JSON arrays, including `[]` when no records
   exist; they should never return `null` for an empty collection.
+- Public listings are paged. `GET /v1/public/stories` carries its cursor in the
+  body (`nextCursor`). `GET /v1/competitions` keeps a bare array — clients map
+  over it directly — and returns its continuation token in the `X-Next-Cursor`
+  response header. Both accept `?limit=` and `?cursor=`.
 - Story, chapter, and worldbuilding mutations use optimistic concurrency.
   Clients send `If-Match: <revision>` for writes that update/delete an existing
   record. A stale revision returns `409 Conflict`.

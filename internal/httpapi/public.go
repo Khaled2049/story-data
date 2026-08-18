@@ -1,12 +1,30 @@
 package httpapi
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 )
+
+// viewerKey identifies who is counting a view, without storing who they are.
+// A signed-in reader is their uid. Everyone else is a keyed hash of the client
+// address: the same reader collides with themselves for the day, and the table
+// never holds an address that could be read back out. The key is per-process
+// and per-day, so the hashes are not stable enough to track anyone across
+// deploys either.
+func (s *Server) viewerKey(r *http.Request) string {
+	if uid := s.optionalUser(r); uid != "" {
+		return "u:" + uid
+	}
+	mac := hmac.New(sha256.New, s.viewSalt)
+	mac.Write([]byte(clientIP(r)))
+	return "a:" + hex.EncodeToString(mac.Sum(nil)[:16])
+}
 
 func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 	p := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/public/"), "/"), "/")
@@ -39,7 +57,7 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(p) == 3 && p[2] == "views" && r.Method == http.MethodPost {
-		respond(w, nil, s.store.IncrementPublicStoryViews(r.Context(), storyID))
+		respond(w, nil, s.store.IncrementPublicStoryViews(r.Context(), storyID, s.viewerKey(r)))
 		return
 	}
 	if len(p) == 5 && p[2] == "chapters" && p[4] == "comments" && r.Method == http.MethodGet {

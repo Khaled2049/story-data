@@ -54,3 +54,33 @@ func TestVoterMinProfileAge(t *testing.T) {
 		}
 	}
 }
+
+func TestRateLimitSettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://example")
+	t.Setenv("AUTH_MODE", "dev")
+
+	t.Setenv("RATE_LIMIT_READS_PER_MINUTE", "")
+	t.Setenv("RATE_LIMIT_WRITES_PER_MINUTE", "")
+	c, err := Load()
+	if err != nil || c.RateLimitReads != nil || c.RateLimitWrites != nil {
+		t.Fatalf("unset rate limits = %v/%v, %v", c.RateLimitReads, c.RateLimitWrites, err)
+	}
+
+	// 0 is meaningful — it switches a limit off — so it must survive as a
+	// value rather than reading as "unset".
+	t.Setenv("RATE_LIMIT_READS_PER_MINUTE", "0")
+	t.Setenv("RATE_LIMIT_WRITES_PER_MINUTE", "120")
+	if c, err = Load(); err != nil || c.RateLimitReads == nil || *c.RateLimitReads != 0 {
+		t.Fatalf("reads=0 = %v, %v", c.RateLimitReads, err)
+	}
+	if c.RateLimitWrites == nil || *c.RateLimitWrites != 120 {
+		t.Fatalf("writes=120 = %v", c.RateLimitWrites)
+	}
+
+	for _, bad := range []string{"-1", "lots", "1.5"} {
+		t.Setenv("RATE_LIMIT_READS_PER_MINUTE", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("Load() accepted RATE_LIMIT_READS_PER_MINUTE=%q", bad)
+		}
+	}
+}

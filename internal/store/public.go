@@ -169,15 +169,39 @@ func (s *Store) publicStoryExists(ctx context.Context, storyID string) error {
 	return nil
 }
 
-func (s *Store) IncrementPublicStoryViews(ctx context.Context, storyID string) error {
-	result, err := s.db.Exec(ctx, `UPDATE stories SET views=views+1 WHERE id=$1 AND is_published`, storyID)
+// IncrementPublicStoryViews counts one reader once a day. viewerKey identifies
+// the reader — a uid when signed in, a salted hash of their address otherwise
+// — and the insert is what decides whether the counter moves: repeats collide
+// on the primary key and are no-ops. Views drive discovery ranking, and this
+// endpoint takes no credential, so an uncounted duplicate is the entire point
+// rather than an optimization.
+//
+// A story that exists but has already been counted for this reader still
+// returns nil: the caller asked for their view to be recorded, and it is.
+func (s *Store) IncrementPublicStoryViews(ctx context.Context, storyID, viewerKey string) error {
+	if viewerKey == "" {
+		return ErrValidation
+	}
+	if err := s.publicStoryExists(ctx, storyID); err != nil {
+		return err
+	}
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if result.RowsAffected() == 0 {
-		return ErrNotFound
+	defer tx.Rollback(ctx)
+	hit, err := tx.Exec(ctx, `INSERT INTO public_story_view_hits(story_id,viewer_key,day)
+VALUES($1,$2,current_date) ON CONFLICT DO NOTHING`, storyID, viewerKey)
+	if err != nil {
+		return err
 	}
-	return nil
+	if hit.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err = tx.Exec(ctx, `UPDATE stories SET views=views+1 WHERE id=$1 AND is_published`, storyID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) publicStory(ctx context.Context, storyID string) (PublicStory, error) {

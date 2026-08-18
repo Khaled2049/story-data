@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"net/http"
+	"strconv"
+	"strings"
+
 	"github.com/google/uuid"
 	"github.com/kh1011/novelsync-story-data/internal/store"
-	"net/http"
-	"strings"
 )
 
 func (s *Server) competitions(w http.ResponseWriter, r *http.Request) {
@@ -16,9 +18,40 @@ func (s *Server) competitions(w http.ResponseWriter, r *http.Request) {
 		method(w)
 		return
 	}
-	x, e := s.store.ListCompetitions(r.Context(), s.optionalUser(r))
-	respond(w, x, e)
+	limit, ok := pageLimit(w, r)
+	if !ok {
+		return
+	}
+	page, e := s.store.ListCompetitions(r.Context(), s.optionalUser(r), r.URL.Query().Get("cursor"), limit)
+	if e != nil {
+		respond(w, nil, e)
+		return
+	}
+	// The body stays a bare array — the frontend maps over it directly — so the
+	// continuation token rides in a header rather than wrapping the payload in
+	// an envelope that would break every existing client.
+	if page.NextCursor != "" {
+		w.Header().Set("X-Next-Cursor", page.NextCursor)
+	}
+	respond(w, page.Competitions, nil)
 }
+
+// pageLimit reads ?limit=, writing the 400 itself when it is not a positive
+// integer. Absent means the store's default; too large is clamped there, not
+// here, so a client asking for more than a page simply gets a page.
+func pageLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+		return 0, false
+	}
+	return n, true
+}
+
 func (s *Server) competition(w http.ResponseWriter, r *http.Request) {
 	p := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/competitions/"), "/"), "/")
 	if len(p) == 0 || p[0] == "" {

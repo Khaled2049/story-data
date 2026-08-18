@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,10 +18,27 @@ type Server struct {
 	store   *store.Store
 	auth    *auth.Verifier
 	origins map[string]bool
+	limiter *limiter
+	// viewSalt keys the hash that stands in for an anonymous reader's address
+	// in the view-dedup table. Generated per process: the table must be able
+	// to tell two readers apart today without holding anything that could
+	// identify either of them later.
+	viewSalt []byte
 }
 
-func New(s *store.Store, a *auth.Verifier, origins []string) http.Handler {
-	x := &Server{store: s, auth: a, origins: make(map[string]bool, len(origins))}
+// New builds the router. rl bounds how fast one caller may hit the service; a
+// zeroed RateLimit disables the middleware, which is what tests and local
+// stacks want and no deployment should.
+func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.Handler {
+	x := &Server{store: s, auth: a, origins: make(map[string]bool, len(origins)), viewSalt: make([]byte, 32)}
+	if _, err := rand.Read(x.viewSalt); err != nil {
+		// A predictable salt would let anyone precompute the key for an
+		// address and poison another reader's dedup row.
+		panic("story-data: cannot read random bytes for the view salt: " + err.Error())
+	}
+	if !rl.Disabled() {
+		x.limiter = newLimiter(rl)
+	}
 	for _, o := range origins {
 		x.origins[o] = true
 	}
@@ -48,7 +66,10 @@ func New(s *store.Store, a *auth.Verifier, origins []string) http.Handler {
 	m.HandleFunc("/v1/profiles/", x.profileAction)
 	m.HandleFunc("/v1/stories", x.stories)
 	m.HandleFunc("/v1/stories/", x.story)
-	return x.withCORS(x.withJSON(m))
+	// Rate limiting sits inside CORS so a rejected caller still gets the
+	// headers their browser needs to read the 429, and outside everything else
+	// so a throttled request costs no database work.
+	return x.withCORS(x.withRateLimit(x.withJSON(m)))
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {

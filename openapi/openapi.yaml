@@ -81,7 +81,31 @@ paths:
     parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
     post:
       summary: Record a public story view
-      responses: { '204': { description: Recorded }, '404': { description: Story is unavailable } }
+      description: >-
+        Counted once per reader per UTC day. A repeat still returns 204; the
+        counter simply does not move.
+      responses:
+        '204': { description: Recorded }
+        '404': { description: Story is unavailable }
+        '429': { description: Rate limit exceeded }
+  /v1/competitions:
+    get:
+      summary: List published competitions, newest first
+      description: >-
+        Returns a bare array. When more pages remain, the continuation token is
+        in the X-Next-Cursor response header; pass it back as ?cursor=.
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Competitions
+          headers:
+            X-Next-Cursor:
+              schema: { type: string }
+              description: Present only when a further page exists.
+        '400': { description: limit is not a positive integer }
+        '422': { description: cursor is malformed }
   /v1/public/stories/{storyId}/chapters/{chapterId}/comments:
     parameters:
       - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }

@@ -92,12 +92,22 @@ func (s *Store) CreateStoryRating(ctx context.Context, storyID, userID string, r
 	if err := s.publicStoryExists(ctx, storyID); err != nil {
 		return StorySocial{}, err
 	}
-	_, err := s.db.Exec(ctx, `INSERT INTO story_ratings (story_id, user_id, rating) VALUES ($1,$2,$3)`, storyID, userID, rating)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
+		return StorySocial{}, err
+	}
+	defer tx.Rollback(ctx)
+	if err = s.consumeDailyQuota(ctx, tx, userID, "rating", MaxRatingsPerDay); err != nil {
+		return StorySocial{}, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO story_ratings (story_id, user_id, rating) VALUES ($1,$2,$3)`, storyID, userID, rating); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return StorySocial{}, ErrConflict
 		}
+		return StorySocial{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return StorySocial{}, err
 	}
 	return s.storySocialSummary(ctx, storyID)
@@ -192,7 +202,17 @@ func (s *Store) CreateComment(ctx context.Context, storyID, chapterID, userID st
 		}
 		parent = parentID
 	}
-	row := s.db.QueryRow(ctx, `
+	// The budget and the comment commit together: a user must not be able to
+	// spend quota on a write that fails, nor slip a write past the count.
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return Comment{}, err
+	}
+	defer tx.Rollback(ctx)
+	if err = s.consumeDailyQuota(ctx, tx, userID, "comment", MaxCommentsPerDay); err != nil {
+		return Comment{}, err
+	}
+	row := tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO chapter_comments (id, chapter_id, user_id, parent_id, message)
 			VALUES ($1,$2,$3,$4,$5)
@@ -202,7 +222,14 @@ func (s *Store) CreateComment(ctx context.Context, storyID, chapterID, userID st
 		       COALESCE(p.username, ''), 0::bigint, false
 		FROM inserted i LEFT JOIN public_profiles p ON p.user_id = i.user_id`,
 		uuid.New(), chapterID, userID, parent, input.Message)
-	return scanComment(row, storyID)
+	comment, err := scanComment(row, storyID)
+	if err != nil {
+		return Comment{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Comment{}, err
+	}
+	return comment, nil
 }
 
 func (s *Store) UpdateComment(ctx context.Context, storyID, chapterID, commentID, userID, message string) (Comment, error) {

@@ -57,7 +57,14 @@ func main() {
 	if cfg.VoterMinProfileAge != nil {
 		st.VoterMinProfileAge = *cfg.VoterMinProfileAge
 	}
-	h := httpapi.New(st, auth.New(cfg.AuthMode, cfg.FirebaseProjectID, cfg.ServiceToken), cfg.CORSOrigins)
+	rl := httpapi.DefaultRateLimit
+	if cfg.RateLimitReads != nil {
+		rl.ReadsPerMinute = *cfg.RateLimitReads
+	}
+	if cfg.RateLimitWrites != nil {
+		rl.WritesPerMinute = *cfg.RateLimitWrites
+	}
+	h := httpapi.New(st, auth.New(cfg.AuthMode, cfg.FirebaseProjectID, cfg.ServiceToken), cfg.CORSOrigins, rl)
 	log.Printf("story-data listening on %s", cfg.Addr)
 	log.Fatal(http.ListenAndServe(cfg.Addr, h))
 }

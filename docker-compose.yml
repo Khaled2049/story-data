@@ -27,6 +27,12 @@ services:
       # old. Every account in a local stack is minutes old, so the gate is off
       # here. Production leaves it unset and takes the 24h default.
       VOTER_MIN_PROFILE_AGE: "0"
+      # Throttling off locally. The whole stack — Vite, the agents service and
+      # the MCP server — reaches the API from one address, so they would share
+      # a bucket, and a seed script would spend it in seconds. Production
+      # leaves these unset and takes the built-in defaults.
+      RATE_LIMIT_READS_PER_MINUTE: "0"
+      RATE_LIMIT_WRITES_PER_MINUTE: "0"
     ports:
       - "8084:8080"
     depends_on:

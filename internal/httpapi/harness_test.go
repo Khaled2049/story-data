@@ -118,7 +118,11 @@ func run(adminURL string, m *testing.M) (int, error) {
 
 	// AUTH_MODE=dev so tests can act as a user with X-User-ID rather than
 	// minting Firebase tokens. Everything below the auth layer is the real path.
-	testServer = httptest.NewServer(httpapi.New(store.New(testPool), auth.New("dev", "", testServiceToken), nil))
+	// The suite fires thousands of requests from a handful of uids, so the
+	// shared server runs with rate limiting off. TestRateLimit stands up its
+	// own server with a real budget.
+	testServer = httptest.NewServer(httpapi.New(store.New(testPool),
+		auth.New("dev", "", testServiceToken), nil, httpapi.RateLimit{}))
 	defer testServer.Close()
 
 	return m.Run(), nil
@@ -190,6 +194,7 @@ func reset(t *testing.T) {
 type response struct {
 	t      *testing.T
 	Status int
+	Header http.Header
 	Body   []byte
 }
 
@@ -227,7 +232,7 @@ func call(t *testing.T, method, path, uid string, body any, headers ...map[strin
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}
-	return response{t: t, Status: res.StatusCode, Body: raw}
+	return response{t: t, Status: res.StatusCode, Header: res.Header, Body: raw}
 }
 
 // get is call for the bodyless case, which is most reads.

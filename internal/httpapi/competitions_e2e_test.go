@@ -1047,6 +1047,132 @@ func TestCompetitionCancelIsCreatorOrAdminOnly(t *testing.T) {
 	assertBalance(t, escrowAccount(id), tale(100))
 }
 
+// ── listing ─────────────────────────────────────────────────────────────────
+
+// GET /v1/competitions is anonymous and was unpaginated: it selected every
+// non-draft competition and then issued one to three more queries per row. A
+// handful of concurrent callers could hold every connection in a ten-slot pool
+// and take the whole API down, writes included.
+func TestPublicCompetitionsIsPaginatedAndConstantQueryCount(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	// Stays under the per-day draft budget, which is itself part of this fix.
+	const total = 8
+	for i := 0; i < total; i++ {
+		openCompetition(t, alice, fmt.Sprintf("Contest %d", i), tale(1), "0")
+	}
+
+	// A small page and a large one cost the same number of round trips.
+	resetQueryCount()
+	small := get(t, "/v1/competitions?limit=2", "").expect(http.StatusOK)
+	smallQueries := queryCount()
+	if len(small.list()) != 2 {
+		t.Fatalf("limit=2 returned %d competitions", len(small.list()))
+	}
+
+	resetQueryCount()
+	big := get(t, "/v1/competitions?limit=100", "").expect(http.StatusOK)
+	bigQueries := queryCount()
+	if len(big.list()) != total {
+		t.Fatalf("limit=100 returned %d competitions, want %d", len(big.list()), total)
+	}
+	if bigQueries != smallQueries {
+		t.Errorf("query count grew with page size: %d for 2 rows, %d for %d rows",
+			smallQueries, bigQueries, total)
+	}
+	if bigQueries > 4 {
+		t.Errorf("a listing took %d queries; it should be a constant handful", bigQueries)
+	}
+
+	// Paging walks the whole set exactly once.
+	seen := map[string]bool{}
+	cursor := ""
+	for pages := 0; pages < total+1; pages++ {
+		path := "/v1/competitions?limit=3"
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		res := get(t, path, "").expect(http.StatusOK)
+		for _, row := range res.list() {
+			id := row["id"].(string)
+			if seen[id] {
+				t.Fatalf("competition %s appeared on two pages", id)
+			}
+			seen[id] = true
+		}
+		if cursor = res.Header.Get("X-Next-Cursor"); cursor == "" {
+			break
+		}
+	}
+	if len(seen) != total {
+		t.Errorf("paging saw %d of %d competitions", len(seen), total)
+	}
+
+	// The default page is bounded even with no limit given, and a malformed
+	// cursor is a client error rather than a 500.
+	if n := len(get(t, "/v1/competitions", "").expect(http.StatusOK).list()); n != total {
+		t.Errorf("default page returned %d competitions", n)
+	}
+	get(t, "/v1/competitions?limit=0", "").expect(http.StatusBadRequest)
+	get(t, "/v1/competitions?limit=abc", "").expect(http.StatusBadRequest)
+	get(t, "/v1/competitions?cursor=not-a-cursor", "").expect(http.StatusUnprocessableEntity)
+}
+
+// Paging must not drop the per-row fields the single-competition read returns,
+// or the listing quietly becomes a different resource.
+func TestCompetitionListingKeepsJoinedAndResults(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Listed", tale(100), "0")
+	grantInitial(t, bob, dave)
+	enter(t, bob, id)
+	registerVoter(t, dave, id)
+	advance(t, alice, id, "voting")
+	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
+		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
+	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
+
+	listed := get(t, "/v1/competitions", bob).expect(http.StatusOK).list()
+	if len(listed) != 1 {
+		t.Fatalf("expected 1 competition, got %d", len(listed))
+	}
+	row := listed[0]
+	if row["isJoined"] != true {
+		t.Errorf("isJoined = %v for an entrant", row["isJoined"])
+	}
+	results, ok := row["results"].([]any)
+	if !ok || len(results) != 1 {
+		t.Fatalf("settled competition listed without its results: %v", row["results"])
+	}
+	if results[0].(map[string]any)["userId"] != bob {
+		t.Errorf("winner row = %v", results[0])
+	}
+	// A different viewer sees the same record with their own membership.
+	other := get(t, "/v1/competitions", carol).expect(http.StatusOK).list()[0]
+	if other["isJoined"] != false {
+		t.Errorf("isJoined = %v for a non-entrant", other["isJoined"])
+	}
+}
+
+// Creating drafts is metered per day; editing one is not.
+func TestCompetitionDraftsAreRateLimited(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	var last string
+	for i := 0; i < 10; i++ {
+		last = newDraft(t, alice, fmt.Sprintf("Draft %d", i), tale(1), "0")["id"].(string)
+	}
+	call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
+		"title": "One too many", "description": "d", "category": "flash-fiction",
+		"tags": []string{"x"}, "prizeAmount": tale(1), "creatorName": "Alice",
+	}).expect(http.StatusTooManyRequests)
+
+	// Revising an existing draft still works — the budget is on creation.
+	call(t, "POST", "/v1/competition-drafts?competitionId="+last, alice, map[string]any{
+		"title": "Revised", "description": "d", "category": "flash-fiction",
+		"tags": []string{"x"}, "prizeAmount": tale(1), "creatorName": "Alice",
+	}).expect(http.StatusCreated)
+}
+
 // ── phase machine and routing ───────────────────────────────────────────────
 
 func TestCompetitionAdvanceRejectsIllegalTransitions(t *testing.T) {

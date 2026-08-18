@@ -324,6 +324,9 @@ func (s *Store) CreateBookClub(ctx context.Context, user string, in BookClubInpu
 		return BookClub{}, e
 	}
 	defer tx.Rollback(ctx)
+	if e = s.consumeDailyQuota(ctx, tx, user, "book-club", MaxBookClubsPerDay); e != nil {
+		return BookClub{}, e
+	}
 	_, e = tx.Exec(ctx, `INSERT INTO book_clubs(id,owner_id,name,description,image,category,activity,meetup) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, id, user, strings.TrimSpace(in.Name), in.Description, in.Image, in.Category, in.Activity, in.MeetUp)
 	if e != nil {
 		return BookClub{}, e

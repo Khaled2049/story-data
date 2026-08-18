@@ -575,3 +575,25 @@ func TestBookClubGetDoesNotFanOut(t *testing.T) {
 			"per prompt, response and poll", n)
 	}
 }
+
+// Club creation was the one book-club write with no budget: prompts,
+// responses and polls were already metered, but a script could create clubs
+// without limit.
+func TestBookClubCreationIsRateLimited(t *testing.T) {
+	reset(t)
+	for i := 0; i < 5; i++ {
+		newClub(t, alice, fmt.Sprintf("Club %d", i))
+	}
+	call(t, "POST", "/v1/book-clubs", alice, map[string]any{
+		"name": "One too many", "description": "d", "image": "", "category": "c",
+		"activity": "a", "meetUp": "",
+	}).expect(http.StatusTooManyRequests)
+
+	// One user's budget, not the platform's.
+	newClub(t, bob, "Unaffected")
+
+	// The refused club was not created.
+	if n := len(get(t, "/v1/book-clubs", "").expect(http.StatusOK).list()); n != 6 {
+		t.Errorf("listing holds %d clubs, want 6", n)
+	}
+}

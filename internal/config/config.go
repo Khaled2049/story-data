@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,6 +23,10 @@ type Config struct {
 	// and the store's own default applies — local stacks set it to 0 so a
 	// freshly seeded account can vote.
 	VoterMinProfileAge *time.Duration
+	// RateLimitReads and RateLimitWrites bound requests per minute per caller.
+	// nil means the service's own default; 0 disables that half.
+	RateLimitReads  *int
+	RateLimitWrites *int
 }
 
 func Load() (Config, error) {
@@ -38,6 +43,12 @@ func Load() (Config, error) {
 		return Config{}, e
 	}
 	c.VoterMinProfileAge = age
+	if c.RateLimitReads, e = optionalCount("RATE_LIMIT_READS_PER_MINUTE"); e != nil {
+		return Config{}, e
+	}
+	if c.RateLimitWrites, e = optionalCount("RATE_LIMIT_WRITES_PER_MINUTE"); e != nil {
+		return Config{}, e
+	}
 	if c.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL is required")
 	}
@@ -67,6 +78,21 @@ func optionalDuration(key string) (*time.Duration, error) {
 		return nil, fmt.Errorf("%s must not be negative", key)
 	}
 	return &d, nil
+}
+
+// optionalCount parses a non-negative request count, returning nil when unset
+// so the caller keeps its own default. 0 is a meaningful value — it turns a
+// limit off — which is why this cannot use the empty string as the zero.
+func optionalCount(key string) (*int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil, nil
+	}
+	n, e := strconv.Atoi(raw)
+	if e != nil || n < 0 {
+		return nil, fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	return &n, nil
 }
 
 func splitList(v string) []string {
