@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kh1011/novelsync-story-data/internal/auth"
 	"github.com/kh1011/novelsync-story-data/internal/store"
@@ -66,10 +67,12 @@ func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.
 	m.HandleFunc("/v1/profiles/", x.profileAction)
 	m.HandleFunc("/v1/stories", x.stories)
 	m.HandleFunc("/v1/stories/", x.story)
-	// Rate limiting sits inside CORS so a rejected caller still gets the
-	// headers their browser needs to read the 429, and outside everything else
-	// so a throttled request costs no database work.
-	return x.withCORS(x.withRateLimit(x.withJSON(m)))
+	// Logging is outermost so that a request rejected by the rate limiter is
+	// logged too — during an attack those rejections are the signal. Rate
+	// limiting then sits inside CORS, so a throttled caller still gets the
+	// headers their browser needs to read the 429, and outside everything
+	// else, so a throttled request costs no database work.
+	return x.withLogging(x.withCORS(x.withRateLimit(x.withJSON(m))))
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
@@ -361,6 +364,7 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) (string, bool) {
 		writeError(w, http.StatusUnauthorized, e.Error())
 		return "", false
 	}
+	logUser(w, uid)
 	return uid, true
 }
 func (s *Server) withJSON(next http.Handler) http.Handler {
@@ -409,8 +413,40 @@ func respond(w http.ResponseWriter, v any, e error) {
 	case errors.Is(e, store.ErrValidation):
 		writeError(w, http.StatusUnprocessableEntity, e.Error())
 	default:
+		if status, msg, ok := translatePgError(e); ok {
+			writeError(w, status, msg)
+			return
+		}
+		// The client message stays generic; the detail goes to the log, which
+		// is the only place it belongs.
+		logError(w, e)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
+}
+
+// translatePgError turns the constraint violations that a bad request can
+// provoke into the 4xx they are. A validator in internal/store should catch
+// each of these first — this is the backstop for the one that gets missed, and
+// it matters because an attacker-triggerable 500 poisons the error rate that
+// is the natural alert for a real outage.
+func translatePgError(e error) (int, string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(e, &pgErr) {
+		return 0, "", false
+	}
+	switch pgErr.Code {
+	case "23514", "23502", "22P02", "22001", "22003":
+		// check_violation, not_null_violation, invalid_text_representation,
+		// string_data_right_truncation, numeric_value_out_of_range.
+		return http.StatusUnprocessableEntity, "invalid input", true
+	case "23503":
+		// foreign_key_violation: the row this one points at is not there.
+		return http.StatusNotFound, "not found", true
+	case "23505":
+		// unique_violation that no store method claimed as its own conflict.
+		return http.StatusConflict, "already exists", true
+	}
+	return 0, "", false
 }
 func write(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)

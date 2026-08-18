@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,9 +27,27 @@ const (
 	migrateTimeout = 5 * time.Minute
 	maxConns       = 10
 	migrateLockID  = 82104231
+
+	// Without these the server runs on a zero-value http.Server, where a
+	// client that opens a connection and dribbles headers holds a goroutine
+	// and a file descriptor for as long as it likes. Cloud Run's own request
+	// timeout covers the managed deployment; the container is reachable
+	// without that front end locally and anywhere it might be placed later.
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 60 * time.Second
+	idleTimeout       = 120 * time.Second
+	maxHeaderBytes    = 1 << 20
+
+	// Cloud Run sends SIGTERM and then waits. Long enough for an in-flight
+	// ledger transaction to commit, short enough to stay inside that window.
+	shutdownTimeout = 20 * time.Second
 )
 
 func main() {
+	// JSON to stderr, which is what Cloud Run's logging agent parses into
+	// structured entries. Set before anything can log.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
@@ -65,8 +87,60 @@ func main() {
 		rl.WritesPerMinute = *cfg.RateLimitWrites
 	}
 	h := httpapi.New(st, auth.New(cfg.AuthMode, cfg.FirebaseProjectID, cfg.ServiceToken), cfg.CORSOrigins, rl)
-	log.Printf("story-data listening on %s", cfg.Addr)
-	log.Fatal(http.ListenAndServe(cfg.Addr, h))
+	if err = serve(newServer(cfg.Addr, h)); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// newServer builds the HTTP server with every timeout set. Split out so a test
+// can assert none of them is zero — go vet does not catch a bare
+// http.ListenAndServe, and the failure mode is invisible until someone leans
+// on it.
+func newServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+}
+
+// serve runs until the process is asked to stop, then drains. The previous
+// code dropped whatever was in flight when Cloud Run replaced an instance,
+// including half-finished ledger transfers.
+func serve(srv *http.Server) error {
+	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	errs := make(chan error, 1)
+	go func() {
+		slog.Info("listening", "addr", srv.Addr)
+		if e := srv.ListenAndServe(); e != nil && !errors.Is(e, http.ErrServerClosed) {
+			errs <- e
+			return
+		}
+		errs <- nil
+	}()
+
+	select {
+	case e := <-errs:
+		return e
+	case <-stop.Done():
+	}
+
+	slog.Info("shutting down", "timeout", shutdownTimeout.String())
+	ctx, done := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer done()
+	if e := srv.Shutdown(ctx); e != nil {
+		// Shutdown returning here means requests were still running when the
+		// grace period ran out; the listener is closed either way.
+		slog.Error("shutdown timed out with requests still in flight", "error", e)
+		return e
+	}
+	return <-errs
 }
 
 func waitForDatabase(ctx context.Context, db *pgxpool.Pool) error {

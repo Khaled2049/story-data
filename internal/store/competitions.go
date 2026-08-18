@@ -503,6 +503,18 @@ func (s *Store) SaveDraft(ctx context.Context, user string, id string, in Compet
 	if strings.TrimSpace(in.Title) == "" || !validCompetitionInput(in) {
 		return Competition{}, ErrValidation
 	}
+	// A caller-supplied id that is not a uuid used to reach the WHERE clause
+	// and come back as a 500. It cannot name an existing draft, so it is a 404.
+	if id != "" {
+		if _, e := uuid.Parse(id); e != nil {
+			return Competition{}, ErrNotFound
+		}
+	}
+	// The column is NOT NULL; a request that simply omits tags is not a
+	// server error.
+	if in.Tags == nil {
+		in.Tags = []string{}
+	}
 	prize, e := amount(ptrString(in.PrizeAmount))
 	if e != nil {
 		return Competition{}, e

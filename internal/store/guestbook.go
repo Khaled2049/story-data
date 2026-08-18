@@ -397,6 +397,13 @@ func decodeGuestbookCursor(v string) (guestbookCursor, error) {
 	if e != nil || x.ID == "" {
 		return x, ErrValidation
 	}
-	return x, e
+	// The id goes into a uuid-typed comparison. Without this a cursor that is
+	// well-formed base64 and well-formed JSON but carries a non-uuid id
+	// reached PostgreSQL and came back as a 500, which is a client error
+	// dressed as a server fault.
+	if _, e = uuid.Parse(x.ID); e != nil {
+		return guestbookCursor{}, ErrValidation
+	}
+	return x, nil
 }
 func strconvArg(n int) string { return fmt.Sprint(n) }

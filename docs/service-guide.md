@@ -128,6 +128,35 @@ freshly seeded account can vote; a malformed value fails startup rather than
 silently reverting to the default. Ballot size is capped per competition by
 `competitions.max_votes_per_user`.
 
+## Errors, logging and lifecycle
+
+**Error mapping** lives in `respond` (`internal/httpapi/server.go`). The store's
+sentinel errors map to their status codes; anything else falls through
+`translatePgError`, which turns the constraint violations a bad request can
+provoke into the 4xx they are — check/not-null/invalid-text/truncation/numeric
+range to `422`, foreign key to `404`, unclaimed unique violation to `409`.
+Validators in `internal/store` should catch each of these first; this is the
+backstop for the one that gets missed, and it matters because an
+attacker-triggerable 500 poisons the error rate operators alert on. Client
+bodies stay generic — the detail goes to the log.
+
+**Request logging** (`internal/httpapi/logging.go`) is the outermost
+middleware, so throttled and CORS-rejected requests are logged too. One JSON
+line per request: request id, method, path, status, duration, uid, client
+address, and the underlying error when the response was a 500. `/health` is
+skipped. Every response carries `X-Request-ID`; an inbound `X-Request-ID` or
+`X-Cloud-Trace-Context` is preserved so a trace survives across services.
+`cmd/api` installs `slog`'s JSON handler on stderr, which is what Cloud Run
+parses into structured entries.
+
+**Server lifecycle** (`cmd/api/main.go`). `newServer` sets
+`ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout` and
+`MaxHeaderBytes` — a bare `http.ListenAndServe` leaves all of them at zero,
+which lets one slow client hold a goroutine indefinitely. `serve` drains on
+`SIGTERM` with a 20s grace period, so an in-flight ledger transfer commits
+before an instance goes away. Both are covered by tests in `cmd/api`, since
+`go vet` does not catch either.
+
 ## Input validation
 
 `internal/store/validate.go` holds the ceilings and the URL rule; every write
