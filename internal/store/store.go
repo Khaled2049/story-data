@@ -103,6 +103,9 @@ func New(db *pgxpool.Pool) *Store {
 }
 
 func (s *Store) CreateStory(ctx context.Context, owner string, in StoryInput) (Story, error) {
+	if !validStoryInput(in) {
+		return Story{}, ErrValidation
+	}
 	id := uuid.New()
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -191,6 +194,9 @@ func (s *Store) hydrateTags(ctx context.Context, story *Story) error {
 }
 
 func (s *Store) UpdateStory(ctx context.Context, id, owner string, rev int64, in StoryInput) (Story, error) {
+	if !validStoryInput(in) {
+		return Story{}, ErrValidation
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return Story{}, err

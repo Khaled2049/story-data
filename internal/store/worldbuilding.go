@@ -209,7 +209,13 @@ func (s *Store) replaceRelationships(ctx context.Context, tx pgx.Tx, storyID, id
 	return nil
 }
 func (s *Store) CreateCharacter(ctx context.Context, storyID, uid string, in CharacterInput) (Character, error) {
+	if !validCharacterInput(in) {
+		return Character{}, ErrValidation
+	}
 	if e := s.owner(ctx, storyID, uid); e != nil {
+		return Character{}, e
+	}
+	if e := s.entityRoom(ctx, "characters", storyID); e != nil {
 		return Character{}, e
 	}
 	tx, e := s.db.Begin(ctx)
@@ -234,6 +240,9 @@ func (s *Store) CreateCharacter(ctx context.Context, storyID, uid string, in Cha
 	return s.Character(ctx, storyID, x.ID, uid)
 }
 func (s *Store) UpdateCharacter(ctx context.Context, storyID, id, uid string, rev int64, in CharacterInput) (Character, error) {
+	if !validCharacterInput(in) {
+		return Character{}, ErrValidation
+	}
 	if e := s.owner(ctx, storyID, uid); e != nil {
 		return Character{}, e
 	}
@@ -302,7 +311,13 @@ func scanPlace(row pgx.Row) (Place, error) {
 	return x, e
 }
 func (s *Store) CreatePlace(ctx context.Context, storyID, uid string, in PlaceInput) (Place, error) {
+	if !validPlaceInput(in) {
+		return Place{}, ErrValidation
+	}
 	if e := s.owner(ctx, storyID, uid); e != nil {
+		return Place{}, e
+	}
+	if e := s.entityRoom(ctx, "places", storyID); e != nil {
 		return Place{}, e
 	}
 	id := uuid.New()
@@ -313,6 +328,9 @@ func (s *Store) CreatePlace(ctx context.Context, storyID, uid string, in PlaceIn
 	return x, s.writeOutbox(ctx, "place", x.ID, storyID, "upsert", x.Revision)
 }
 func (s *Store) UpdatePlace(ctx context.Context, storyID, id, uid string, rev int64, in PlaceInput) (Place, error) {
+	if !validPlaceInput(in) {
+		return Place{}, ErrValidation
+	}
 	if e := s.owner(ctx, storyID, uid); e != nil {
 		return Place{}, e
 	}
@@ -476,7 +494,13 @@ func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent
 	return out, rows.Err()
 }
 func (s *Store) CreatePlot(ctx context.Context, storyID, uid string, in PlotLineInput) (PlotLine, error) {
+	if !validPlotLineInput(in) {
+		return PlotLine{}, ErrValidation
+	}
 	if e := s.owner(ctx, storyID, uid); e != nil {
+		return PlotLine{}, e
+	}
+	if e := s.entityRoom(ctx, "plot_lines", storyID); e != nil {
 		return PlotLine{}, e
 	}
 	id := uuid.New()
@@ -486,6 +510,9 @@ func (s *Store) CreatePlot(ctx context.Context, storyID, uid string, in PlotLine
 	return x, e
 }
 func (s *Store) UpdatePlot(ctx context.Context, storyID, id, uid string, rev int64, in PlotLineInput) (PlotLine, error) {
+	if !validPlotLineInput(in) {
+		return PlotLine{}, ErrValidation
+	}
 	if e := s.owner(ctx, storyID, uid); e != nil {
 		return PlotLine{}, e
 	}
@@ -541,7 +568,28 @@ func (s *Store) DeletePlot(ctx context.Context, storyID, id, uid string, rev int
 	}
 	return tx.Commit(ctx)
 }
+
+// entityRoom caps how many worldbuilding records one story may hold, the same
+// job chapterLimit does for chapters. Unlike those it is checked before the
+// insert rather than inside it: these tables have no counter to race on, and a
+// caller who wins a race to record 201 characters has not achieved anything
+// the ceiling exists to prevent.
+func (s *Store) entityRoom(ctx context.Context, table, storyID string) error {
+	var n int
+	// table is a package-level literal at every call site, never caller input.
+	if e := s.db.QueryRow(ctx, `SELECT count(*) FROM `+table+` WHERE story_id=$1`, storyID).Scan(&n); e != nil {
+		return e
+	}
+	if n >= maxEntitiesPerStory {
+		return ErrLimit
+	}
+	return nil
+}
+
 func validEvent(in *PlotEventInput) error {
+	if !validPlotEventInput(*in) {
+		return ErrValidation
+	}
 	if in.TensionLevel == 0 {
 		in.TensionLevel = 5
 	}
@@ -615,6 +663,11 @@ func (s *Store) CreateEvent(ctx context.Context, storyID, lineID, uid string, in
 	var n int
 	if e = tx.QueryRow(ctx, `SELECT count(*) FROM plot_events WHERE plot_line_id=$1`, lineID).Scan(&n); e != nil {
 		return PlotEvent{}, e
+	}
+	// Counted inside the transaction, like the story and chapter ceilings, so
+	// concurrent creates cannot both pass the check.
+	if n >= maxEntitiesPerStory {
+		return PlotEvent{}, ErrLimit
 	}
 	id := uuid.New()
 	_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,tension_level,pacing,story_beat,emotional_tone,time_constraint,position,chapter_number,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, lineID, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), n, in.ChapterNumber, emptyToNull(in.Notes))

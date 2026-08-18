@@ -119,7 +119,12 @@ func (s *Store) UpsertPublicProfile(ctx context.Context, userID string, in Profi
 	if !validGuestbookPolicy(policy) {
 		return PublicProfile{}, ErrValidation
 	}
-	if !validProfileText(photo, 2048) || !validProfileText(bio, 300) || !validProfileText(occupation, 50) || !validProfileText(location, 50) {
+	// photoUrl is rendered by every client that shows this profile, so it has
+	// to be a real http(s) URL rather than any 2 KB string.
+	if !validURL(photo) {
+		return PublicProfile{}, ErrValidation
+	}
+	if !validProfileText(bio, 300) || !validProfileText(occupation, 50) || !validProfileText(location, 50) {
 		return PublicProfile{}, ErrValidation
 	}
 	wallet, ok = normalizeWallet(wallet)

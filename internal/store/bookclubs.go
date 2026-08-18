@@ -354,6 +354,11 @@ func (s *Store) UpdateBookClub(ctx context.Context, id, user string, in BookClub
 	return s.GetBookClub(ctx, id)
 }
 func (s *Store) UpdateBookClubSettings(ctx context.Context, id, user string, in BookClubSettings) (BookClub, error) {
+	// Both blobs are stored verbatim and handed back to every member, so they
+	// are bounded as well as parsed.
+	if !validJSONSize(in.BookOfTheMonth) || !validJSONSize(in.ReadingSchedule) {
+		return BookClub{}, ErrValidation
+	}
 	if !jsonValue(in.BookOfTheMonth) || !jsonValue(in.ReadingSchedule) {
 		return BookClub{}, ErrValidation
 	}
@@ -736,7 +741,12 @@ func (s *Store) clubWrite(ctx context.Context, id, user string) error {
 	return ErrForbidden
 }
 func validClubInput(in BookClubInput) bool {
-	return len(strings.TrimSpace(in.Name)) > 0 && len(in.Name) <= 200 && len(in.Description) <= 5000
+	return validRequiredText(in.Name, maxNameChars) &&
+		validText(in.Description, maxDescriptionChars) &&
+		validURL(in.Image) &&
+		validText(in.Category, maxShortFieldChars) &&
+		validText(in.Activity, maxShortFieldChars) &&
+		validText(in.MeetUp, maxNameChars)
 }
 func jsonValue(v json.RawMessage) bool { return len(v) == 0 || json.Valid(v) }
 func nullableJSON(v json.RawMessage) any {

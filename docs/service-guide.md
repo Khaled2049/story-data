@@ -128,6 +128,33 @@ freshly seeded account can vote; a malformed value fails startup rather than
 silently reverting to the default. Ballot size is capped per competition by
 `competitions.max_votes_per_user`.
 
+## Input validation
+
+`internal/store/validate.go` holds the ceilings and the URL rule; every write
+path applies them and returns `422` (`ErrValidation`) rather than letting the
+database decide or storing the value.
+
+- **URL-shaped fields** — story `coverImageUrl`/`thumbnailUrl`, profile
+  `photoUrl`, book-club `image`, character `artUrl`, place `imageUrl` — accept
+  only absolute `http`/`https` URLs, by allowlist. That rejects `javascript:`,
+  `data:`, `vbscript:` and their obfuscations in one predicate instead of
+  enumerating them. Empty is still "not set".
+- **Text ceilings**: title 500, description 5 000, names 200, short fields
+  (category, language, copyright, audience) 100, long-form worldbuilding prose
+  20 000, tags 20 per record at 100 each, JSON blobs 16 KB. Counted in
+  **runes**, matching the SQL `char_length`, so a limit means the same thing in
+  every script.
+- **Per-story entity ceilings**: 200 characters, places, plot lines, and events
+  per plot line, alongside the existing 50 chapters and 100 stories per user.
+- These are the outer wall, deliberately looser than the editor and the MCP
+  write tools (`taleTribe-agents/mcp_server/writes.py`), which carry the
+  product contract. Nothing a client legitimately produced is rejected.
+
+Migration `000016_field_ceilings.sql` mirrors the same rules as SQL `CHECK`
+constraints, added `NOT VALID` — enforced on write, but no table scan at
+deploy, because migrations run at startup and a scan that failed on one legacy
+row would take the service down instead of protecting it.
+
 ## Abuse controls
 
 The service is invokable by anyone — Cloud Run grants `roles/run.invoker` to

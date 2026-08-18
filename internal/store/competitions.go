@@ -500,7 +500,7 @@ func (s *Store) ListDrafts(ctx context.Context, user string) ([]Competition, err
 	return out, rows.Err()
 }
 func (s *Store) SaveDraft(ctx context.Context, user string, id string, in CompetitionInput) (Competition, error) {
-	if strings.TrimSpace(in.Title) == "" {
+	if strings.TrimSpace(in.Title) == "" || !validCompetitionInput(in) {
 		return Competition{}, ErrValidation
 	}
 	prize, e := amount(ptrString(in.PrizeAmount))
@@ -584,6 +584,12 @@ func (s *Store) UpdateCompetition(ctx context.Context, id, user string, in Compe
 		return c, ErrForbidden
 	}
 	if c.Phase != "scheduled" && c.Phase != "open" {
+		return c, ErrValidation
+	}
+	// An empty field means "leave it alone" here, so only what was sent is
+	// bounded — but it is bounded, which an update path that skipped the check
+	// entirely would not be.
+	if !validCompetitionInput(in) {
 		return c, ErrValidation
 	}
 	title := c.Title
