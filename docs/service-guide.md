@@ -104,6 +104,17 @@ permissions. Never trust client-supplied owner IDs.
 `X-Admin: true` so scripts can exercise protected routes without external
 token verification.
 
+### Competition voter eligibility
+
+Casting a competition ballot needs more than a valid token, because a ballot
+decides a winner-take-all prize and Firebase sign-up is free and unverified. A
+voter must have **joined** the competition — registration closes when entries
+do — and must hold a **public profile** at least `VOTER_MIN_PROFILE_AGE` old
+(default 24h, a Go duration such as `48h`). Set it to `0` in local stacks so a
+freshly seeded account can vote; a malformed value fails startup rather than
+silently reverting to the default. Ballot size is capped per competition by
+`competitions.max_votes_per_user`.
+
 ## API conventions
 
 - `GET /health` is the service health check.

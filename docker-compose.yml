@@ -23,6 +23,10 @@ services:
       # which trusts that header anyway, but it means local runs exercise the
       # same code path production uses. Keep in sync with dev-new.sh.
       SERVICE_TOKEN: dev-service-token
+      # Competition ballots normally require a public profile at least a day
+      # old. Every account in a local stack is minutes old, so the gate is off
+      # here. Production leaves it unset and takes the 24h default.
+      VOTER_MIN_PROFILE_AGE: "0"
     ports:
       - "8084:8080"
     depends_on:

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -101,6 +102,31 @@ func enter(t *testing.T, uid, competitionID string) string {
 // endpoint performs only time-implied transitions — the ones that move money
 // have their own endpoints — so a test that wants entries closed before the
 // deadline moves the deadline first, exactly as a host does through PATCH.
+// registerVoter makes uid eligible to cast a ballot. A ballot now requires
+// having joined the competition — registration closes when entries do — and a
+// public profile old enough that accounts minted for one contest cannot swing
+// it. Call this while the competition is still open.
+func registerVoter(t *testing.T, uid, competitionID string) {
+	t.Helper()
+	call(t, "PUT", "/v1/competitions/"+competitionID+"/join", uid, nil).
+		expect(http.StatusNoContent)
+	agedProfile(t, uid)
+}
+
+// agedProfile gives uid a public profile and backdates it past the voting age
+// gate, standing in for an account that has been on the platform a while.
+func agedProfile(t *testing.T, uid string) {
+	t.Helper()
+	call(t, "PUT", "/v1/profiles/me", uid,
+		map[string]any{"username": strings.ReplaceAll(uid, "-", "_")}).
+		expect(http.StatusCreated)
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE public_profiles SET created_at=now()-interval '30 days' WHERE user_id=$1`,
+		uid); err != nil {
+		t.Fatalf("backdate profile for %s: %v", uid, err)
+	}
+}
+
 func advance(t *testing.T, uid, competitionID, phase string) {
 	t.Helper()
 	if phase == "voting" {
@@ -588,6 +614,10 @@ func TestCompetitionBallotRules(t *testing.T) {
 	grantInitial(t, bob, carol, dave)
 	enter(t, bob, id)
 	enter(t, carol, id)
+	registerVoter(t, dave, id)
+	// Entrants joined when they entered; they still need standing to vote.
+	agedProfile(t, bob)
+	agedProfile(t, carol)
 
 	ballot := "/v1/competitions/" + id + "/ballots/me"
 
@@ -636,6 +666,86 @@ func TestCompetitionBallotRules(t *testing.T) {
 	}
 }
 
+// A ballot decides a winner-take-all prize, and it used to require nothing
+// but an authenticated uid — so a slate of throwaway accounts, free and
+// unverified to create, could hand their owner any competition on the
+// platform. Eligibility now costs something: registration that closes with
+// entries, and a profile older than the contest.
+func TestBallotRequiresParticipation(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Eligibility", tale(100), "0")
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	registerVoter(t, dave, id)
+	// carol has standing but never joined; a stranger is exactly the account a
+	// sybil slate is made of.
+	agedProfile(t, carol)
+	advance(t, alice, id, "voting")
+
+	ballot := "/v1/competitions/" + id + "/ballots/me"
+	call(t, "PUT", ballot, carol, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusForbidden)
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusNoContent)
+
+	after := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if after["ballotCount"].(float64) != 1 {
+		t.Errorf("ballotCount = %v, want only the eligible voter", after["ballotCount"])
+	}
+}
+
+func TestBallotRequiresAnEstablishedProfile(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Standing", tale(100), "0")
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	// Both joined; neither has standing yet.
+	call(t, "PUT", "/v1/competitions/"+id+"/join", carol, nil).expect(http.StatusNoContent)
+	call(t, "PUT", "/v1/competitions/"+id+"/join", dave, nil).expect(http.StatusNoContent)
+	call(t, "PUT", "/v1/profiles/me", dave,
+		map[string]any{"username": "user_dave"}).expect(http.StatusCreated)
+	advance(t, alice, id, "voting")
+
+	ballot := "/v1/competitions/" + id + "/ballots/me"
+	// No profile at all.
+	call(t, "PUT", ballot, carol, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusForbidden)
+	// A profile created minutes ago is what a sybil slate has; the age gate is
+	// what it cannot fake.
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusForbidden)
+
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE public_profiles SET created_at=now()-interval '30 days' WHERE user_id=$1`,
+		dave); err != nil {
+		t.Fatal(err)
+	}
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusNoContent)
+}
+
+// The per-competition ceiling lived in the schema and was ignored by a
+// hard-coded 3.
+func TestBallotHonorsMaxVotesPerUser(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "One vote each", tale(100), "0")
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	enter(t, carol, id)
+	registerVoter(t, dave, id)
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE competitions SET max_votes_per_user=1 WHERE id=$1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+	advance(t, alice, id, "voting")
+
+	ballot := "/v1/competitions/" + id + "/ballots/me"
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob, carol}}).
+		expect(http.StatusUnprocessableEntity)
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusNoContent)
+}
+
 // ── settlement ──────────────────────────────────────────────────────────────
 
 func TestCompetitionSettlementPaysWinnerAndHost(t *testing.T) {
@@ -644,6 +754,7 @@ func TestCompetitionSettlementPaysWinnerAndHost(t *testing.T) {
 	grantInitial(t, bob, carol, dave)
 	enter(t, bob, id)
 	enter(t, carol, id)
+	registerVoter(t, dave, id)
 	advance(t, alice, id, "voting")
 
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
@@ -688,6 +799,7 @@ func TestCompetitionSettlementIsIdempotent(t *testing.T) {
 	id := openCompetition(t, alice, "Twice settled", tale(100), tale(10))
 	grantInitial(t, bob, dave)
 	enter(t, bob, id)
+	registerVoter(t, dave, id)
 	advance(t, alice, id, "voting")
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
@@ -782,6 +894,7 @@ func TestCompetitionSettlementWhenTheHostsOwnEntryWins(t *testing.T) {
 	grantInitial(t, bob, dave)
 	enter(t, alice, id)
 	enter(t, bob, id)
+	registerVoter(t, dave, id)
 	advance(t, alice, id, "voting")
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{alice}}).expect(http.StatusNoContent)
@@ -806,6 +919,7 @@ func TestFailedSettlementLeavesTheCompetitionRetryable(t *testing.T) {
 	id := openCompetition(t, alice, "Payout fails", tale(100), "0")
 	grantInitial(t, bob, dave)
 	enter(t, bob, id)
+	registerVoter(t, dave, id)
 	advance(t, alice, id, "voting")
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
@@ -914,6 +1028,7 @@ func TestCompetitionCancelIsIdempotentAndBlockedAfterSettlement(t *testing.T) {
 	other := openCompetition(t, alice, "Already settled", tale(50), "0")
 	grantInitial(t, carol, dave)
 	enter(t, carol, other)
+	registerVoter(t, dave, other)
 	advance(t, alice, other, "voting")
 	call(t, "PUT", "/v1/competitions/"+other+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{carol}}).expect(http.StatusNoContent)

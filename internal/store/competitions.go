@@ -756,18 +756,54 @@ func (s *Store) MyBallot(ctx context.Context, id, user string) (CompetitionBallo
 	}
 	return x, rows.Err()
 }
+
+// voterEligibleTx decides who may influence a prize that pays out
+// winner-take-all. A ballot used to need nothing but an authenticated uid, so
+// anyone able to sign up — free, unlimited and unverified — could register
+// throwaway accounts and hand themselves any competition on the platform.
+//
+// Two cheap-for-honest-users, costly-for-sybils conditions apply. The voter
+// must have joined the competition, which closes when entries do, so a slate
+// of accounts has to exist and register before the outcome is knowable. And
+// the voter must hold a public profile that is at least VoterMinProfileAge
+// old: a profile costs a unique username, and the age requirement means a
+// batch of accounts minted for one competition cannot vote in it.
+//
+// Neither is sufficient alone and neither is a substitute for rate limiting
+// (finding 4); they raise the price of a sybil slate, they do not make one
+// impossible.
+func (s *Store) voterEligibleTx(ctx context.Context, tx pgx.Tx, id, user string) error {
+	var joined bool
+	if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM competition_participants WHERE competition_id=$1 AND user_id=$2)`, id, user).Scan(&joined); e != nil {
+		return e
+	}
+	if !joined {
+		return ErrForbidden
+	}
+	var created time.Time
+	e := tx.QueryRow(ctx, `SELECT created_at FROM public_profiles WHERE user_id=$1`, user).Scan(&created)
+	if errors.Is(e, pgx.ErrNoRows) {
+		return ErrForbidden
+	}
+	if e != nil {
+		return e
+	}
+	if time.Since(created) < s.VoterMinProfileAge {
+		return ErrForbidden
+	}
+	return nil
+}
+
 func (s *Store) CastBallot(ctx context.Context, id, user string, choices []string) error {
 	choices = unique(choices)
-	if len(choices) > 3 {
-		return ErrValidation
-	}
 	tx, e := s.db.Begin(ctx)
 	if e != nil {
 		return e
 	}
 	defer tx.Rollback(ctx)
 	var phase string
-	e = tx.QueryRow(ctx, `SELECT phase FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase)
+	var maxVotes int
+	e = tx.QueryRow(ctx, `SELECT phase,max_votes_per_user FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &maxVotes)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -776,6 +812,14 @@ func (s *Store) CastBallot(ctx context.Context, id, user string, choices []strin
 	}
 	if phase != "voting" {
 		return ErrValidation
+	}
+	// The per-competition ceiling, which the host sets; the hard-coded 3 this
+	// replaces ignored the column entirely.
+	if len(choices) > maxVotes {
+		return ErrValidation
+	}
+	if e = s.voterEligibleTx(ctx, tx, id, user); e != nil {
+		return e
 	}
 	for _, v := range choices {
 		if v == user {
