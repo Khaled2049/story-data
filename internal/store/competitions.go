@@ -181,6 +181,36 @@ func (s *Store) balance(ctx context.Context, id string) (TokenBalance, error) {
 	}
 	return TokenBalance{id, taleAsset, "TALE", 18, b}, e
 }
+
+// mergePostings collapses a transfer's postings to one line per account and
+// drops the ones that net to zero, which the delta <> 0 check would reject.
+// Accounts come back sorted so every transfer takes its FOR UPDATE row locks
+// in the same order and concurrent transfers cannot deadlock against each
+// other.
+func mergePostings(ps []posting) ([]posting, error) {
+	sums := map[string]*big.Int{}
+	order := make([]string, 0, len(ps))
+	for _, p := range ps {
+		n, ok := new(big.Int).SetString(p.delta, 10)
+		if !ok {
+			return nil, ErrValidation
+		}
+		if sums[p.account] == nil {
+			sums[p.account] = new(big.Int)
+			order = append(order, p.account)
+		}
+		sums[p.account].Add(sums[p.account], n)
+	}
+	sort.Strings(order)
+	out := make([]posting, 0, len(order))
+	for _, a := range order {
+		if sums[a].Sign() != 0 {
+			out = append(out, posting{a, sums[a].String()})
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) transfer(ctx context.Context, key, reason, competition string, ps []posting) error {
 	tx, e := s.db.Begin(ctx)
 	if e != nil {
@@ -204,6 +234,15 @@ func (s *Store) transferTx(ctx context.Context, tx pgx.Tx, key, reason, competit
 	}
 	if exists {
 		return nil
+	}
+	// ledger_postings is keyed (transfer_key, account_id), so an account that
+	// appears twice in one transfer aborts the whole insert with 23505. Merge
+	// here rather than in each caller: settlement legitimately credits one
+	// account from two sources (prize refund + host fee share when the creator
+	// is also the recipient), and that must post as a single net line.
+	ps, e = mergePostings(ps)
+	if e != nil {
+		return e
 	}
 	sum := big.NewInt(0)
 	for _, p := range ps {
@@ -655,7 +694,17 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 }
 
 func (s *Store) ListSubmissions(ctx context.Context, id string) ([]CompetitionSubmission, error) {
-	rows, e := s.db.Query(ctx, `SELECT user_id,story_id,story_title,story_author_name,cover_image_url,status,submitted_at FROM competition_submissions WHERE competition_id=$1 AND status='submitted' ORDER BY submitted_at`, id)
+	return listSubmissions(ctx, s.db, id)
+}
+
+// querier is the read surface shared by *pgxpool.Pool and pgx.Tx, so a helper
+// can run either standalone or inside a caller's transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func listSubmissions(ctx context.Context, q querier, id string) ([]CompetitionSubmission, error) {
+	rows, e := q.Query(ctx, `SELECT user_id,story_id,story_title,story_author_name,cover_image_url,status,submitted_at FROM competition_submissions WHERE competition_id=$1 AND status='submitted' ORDER BY submitted_at`, id)
 	if e != nil {
 		return nil, e
 	}
@@ -800,16 +849,26 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 	if c.Phase != "voting" && c.Phase != "settling" {
 		return c, ErrValidation
 	}
-	_, e = s.db.Exec(ctx, `UPDATE competitions SET phase='settling',settlement_claimed_at=COALESCE(settlement_claimed_at,now()) WHERE id=$1 AND phase IN ('voting','settling')`, id)
+	// Everything below — the settling claim, the payout, the results rows and
+	// the final settled phase — commits or rolls back together. Claiming the
+	// phase on its own connection used to survive a failed payout, leaving the
+	// competition in 'settling', which settle re-entered and cancel refused:
+	// the escrow was then unreachable by any code path.
+	tx, e := s.db.Begin(ctx)
 	if e != nil {
 		return c, e
 	}
-	subs, e := s.ListSubmissions(ctx, id)
+	defer tx.Rollback(ctx)
+	_, e = tx.Exec(ctx, `UPDATE competitions SET phase='settling',settlement_claimed_at=COALESCE(settlement_claimed_at,now()) WHERE id=$1 AND phase IN ('voting','settling')`, id)
+	if e != nil {
+		return c, e
+	}
+	subs, e := listSubmissions(ctx, tx, id)
 	if e != nil {
 		return c, e
 	}
 	votes := map[string]int{}
-	rows, e := s.db.Query(ctx, `SELECT submission_user_id,count(*) FROM competition_ballot_choices WHERE competition_id=$1 GROUP BY submission_user_id`, id)
+	rows, e := tx.Query(ctx, `SELECT submission_user_id,count(*) FROM competition_ballot_choices WHERE competition_id=$1 GROUP BY submission_user_id`, id)
 	if e != nil {
 		return c, e
 	}
@@ -852,14 +911,9 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 			post = append(post, posting{account(c.CreatorID), host.String()})
 		}
 	}
-	if e = s.transfer(ctx, "escrow:release:"+id, "escrow:release", id, post); e != nil {
+	if e = s.transferTx(ctx, tx, "escrow:release:"+id, "escrow:release", id, post); e != nil {
 		return c, e
 	}
-	tx, e := s.db.Begin(ctx)
-	if e != nil {
-		return c, e
-	}
-	defer tx.Rollback(ctx)
 	_, e = tx.Exec(ctx, `DELETE FROM competition_results WHERE competition_id=$1`, id)
 	if e != nil {
 		return c, e
@@ -881,10 +935,6 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 	if e != nil {
 		return c, e
 	}
-	// Without this commit the deferred rollback discarded the results rows and
-	// the settled phase — after the payout transfer had already committed on
-	// its own connection. Every settlement paid out and then stranded the
-	// competition in 'settling'.
 	if e = tx.Commit(ctx); e != nil {
 		return c, e
 	}

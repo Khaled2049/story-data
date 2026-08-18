@@ -734,6 +734,134 @@ func TestCompetitionSettlementRefusedBeforeVoting(t *testing.T) {
 	assertBalance(t, escrowAccount(id), tale(100))
 }
 
+// Settlement builds one ledger transfer, and ledger_postings is keyed
+// (transfer_key, account_id). The two scenarios below are the ones where the
+// same account is credited twice in that transfer — the returned prize plus
+// the host's cut of the entry fees. Before the postings were merged, both
+// aborted the transfer on a duplicate-key violation, after the phase had
+// already been committed as "settling" on a separate connection: settle then
+// re-entered the same failure forever and cancel refused the phase outright,
+// so the escrow was unreachable by any code path.
+func TestCompetitionSettlementWithFeesAndNoWinnerPaysTheHostOnce(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Fees, nobody voted", tale(100), tale(10))
+	grantInitial(t, bob, carol)
+	enter(t, bob, id)
+	enter(t, carol, id)
+	advance(t, alice, id, "voting")
+
+	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusOK).json()
+	if settled["phase"] != "settled" {
+		t.Fatalf("phase = %v, want settled", settled["phase"])
+	}
+
+	// No winner, so the 100 prize returns to alice; 20 in fees splits 2 to the
+	// treasury and 18 to alice as host. Both credits land on one account and
+	// must post as a single net line of 118.
+	assertBalance(t, userAccount(alice), tale(initialGrantTale-100+100+18))
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
+	assertBalance(t, userAccount(carol), tale(initialGrantTale-10))
+	assertBalance(t, platformAccount(), tale(2))
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+}
+
+func TestCompetitionSettlementWhenTheHostsOwnEntryWins(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Host wins", tale(100), tale(10))
+	grantInitial(t, bob, dave)
+	enter(t, alice, id)
+	enter(t, bob, id)
+	advance(t, alice, id, "voting")
+	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
+		map[string]any{"submissionIds": []string{alice}}).expect(http.StatusNoContent)
+
+	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
+
+	// alice escrowed 100 and paid a 10 entry fee, then took the 100 prize and
+	// 18 of the 20 in fees.
+	assertBalance(t, userAccount(alice), tale(initialGrantTale-100-10+100+18))
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
+	assertBalance(t, platformAccount(), tale(2))
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+}
+
+// A settlement that cannot pay out must leave nothing behind. The phase claim
+// used to commit on its own connection, so a failure here stranded the
+// competition in "settling"; now the claim, the payout and the results share
+// one transaction and roll back together.
+func TestFailedSettlementLeavesTheCompetitionRetryable(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Payout fails", tale(100), "0")
+	grantInitial(t, bob, dave)
+	enter(t, bob, id)
+	advance(t, alice, id, "voting")
+	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
+		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
+
+	// Empty the escrow behind the API's back so the payout hits the
+	// insufficient-funds guard inside the transfer.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE token_accounts SET balance=0 WHERE account_id=$1`, escrowAccount(id)); err != nil {
+		t.Fatal(err)
+	}
+	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusUnprocessableEntity)
+
+	after := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if after["phase"] != "voting" {
+		t.Fatalf("a failed settlement left phase %v, want voting", after["phase"])
+	}
+	var transfers int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM ledger_transfers WHERE idempotency_key=$1`,
+		"escrow:release:"+id).Scan(&transfers); err != nil {
+		t.Fatal(err)
+	}
+	if transfers != 0 {
+		t.Errorf("a failed settlement recorded %d payout transfers", transfers)
+	}
+
+	// Put the escrow back and the same call now succeeds.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE token_accounts SET balance=$2::numeric WHERE account_id=$1`,
+		escrowAccount(id), tale(100)); err != nil {
+		t.Fatal(err)
+	}
+	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusOK).json()
+	if settled["phase"] != "settled" {
+		t.Errorf("retried settlement left phase %v", settled["phase"])
+	}
+	assertBalance(t, escrowAccount(id), "0")
+}
+
+// Rows the old code already stranded in "settling" are reset to "voting" by
+// migration 000014 when no payout committed. Settle must also finish one that
+// arrives in that phase directly, which is what the migration relies on for
+// the rows it deliberately leaves alone.
+func TestSettlementResumesFromTheSettlingPhase(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Stranded", tale(100), tale(10))
+	grantInitial(t, bob)
+	enter(t, bob, id)
+	advance(t, alice, id, "voting")
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE competitions SET phase='settling' WHERE id=$1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusOK).json()
+	if settled["phase"] != "settled" {
+		t.Fatalf("phase = %v, want settled", settled["phase"])
+	}
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+}
+
 // ── cancellation ────────────────────────────────────────────────────────────
 
 func TestCompetitionCancelRefundsPrizeAndEveryEntryFee(t *testing.T) {
