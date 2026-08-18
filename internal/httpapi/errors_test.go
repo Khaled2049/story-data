@@ -1,5 +1,8 @@
 package httpapi
 
+// The one test that lives beside the handlers rather than in ./e2e: it covers
+// an unexported function, which the black-box suite deliberately cannot reach.
+
 import (
 	"errors"
 	"fmt"

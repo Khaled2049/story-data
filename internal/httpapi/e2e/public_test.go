@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Public reads: the anonymous discovery surface.
 //

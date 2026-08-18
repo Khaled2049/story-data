@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Social: story likes, ratings, chapter comments and comment likes.
 //

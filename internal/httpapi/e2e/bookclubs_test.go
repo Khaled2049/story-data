@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Book clubs: clubs, membership, reading progress, discussion prompts and
 // polls.

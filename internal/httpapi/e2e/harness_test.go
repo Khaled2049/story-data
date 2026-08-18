@@ -1,12 +1,16 @@
-package httpapi_test
-
-// End-to-end HTTP tests: a real PostgreSQL database with the real migrations,
-// the real store, and the real router. Nothing is mocked — the point is to
-// catch the things unit tests cannot, like a route that never dispatches or a
-// query that only fails against actual SQL.
+// Package e2e drives the service end to end: a real PostgreSQL database with
+// the real migrations, the real store, and the real router, over real HTTP.
+// Nothing is mocked — the point is to catch what unit tests cannot, like a
+// route that never dispatches or a query that only fails against actual SQL.
+//
+// It is a separate package rather than a _test.go file beside the handlers so
+// that it can only reach the service the way a client does. Tests that need an
+// unexported symbol belong next to it instead; internal/httpapi/errors_test.go
+// is the one such case today.
 //
 // The suite creates its own throwaway database so it can never touch the dev
 // one. Point it elsewhere with TEST_DATABASE_URL.
+package e2e
 
 import (
 	"bytes"
@@ -41,10 +45,49 @@ const defaultAdminURL = "postgres://postgres:postgres@localhost:5433/postgres?ss
 const testServiceToken = "test-service-token"
 
 var (
-	testPool    *pgxpool.Pool
-	testServer  *httptest.Server
-	truncateSQL string
+	testPool   *pgxpool.Pool
+	testServer *httptest.Server
+	// tableCount is only a sanity check that the migrations ran; reset
+	// discovers the tables it needs for itself.
+	tableCount int
 )
+
+// resetSQL empties the schema between tests. It truncates only the tables that
+// actually hold a row, because TRUNCATE costs the same whether a table has a
+// million rows or none: every table named needs an ACCESS EXCLUSIVE lock, a
+// new relfilenode on disk, and catalog updates. Naming all 46 unconditionally
+// cost ~50ms a test — about 7 of the suite's 11 seconds — and grew with every
+// migration that added a table. Probing first costs microseconds per empty
+// table and leaves the same tables empty afterwards.
+//
+// It runs server-side as one round trip rather than a query plus a truncate,
+// and discovers the table list on every call so a new migration needs no
+// change here.
+//
+// RESTART IDENTITY is kept for the tables that are truncated, but nothing
+// depends on it: the only sequence in the schema belongs to goose_db_version,
+// which is excluded. CASCADE likewise cannot widen the effect — a table
+// holding a referencing row is non-empty, so it is already in the list.
+const resetSQL = `
+DO $$
+DECLARE
+	t text;
+	victims text[] := '{}';
+	occupied bool;
+BEGIN
+	FOR t IN
+		SELECT tablename FROM pg_tables
+		WHERE schemaname = 'public' AND tablename <> 'goose_db_version'
+	LOOP
+		EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I)', t) INTO occupied;
+		IF occupied THEN
+			victims := victims || quote_ident(t);
+		END IF;
+	END LOOP;
+	IF array_length(victims, 1) > 0 THEN
+		EXECUTE 'TRUNCATE ' || array_to_string(victims, ', ') || ' RESTART IDENTITY CASCADE';
+	END IF;
+END $$`
 
 func TestMain(m *testing.M) {
 	adminURL := os.Getenv("TEST_DATABASE_URL")
@@ -110,9 +153,8 @@ func run(adminURL string, m *testing.M) (int, error) {
 	defer testPool.Close()
 
 	if err := testPool.QueryRow(ctx, `
-		SELECT string_agg(format('%I', tablename), ', ')
-		FROM pg_tables
-		WHERE schemaname = 'public' AND tablename <> 'goose_db_version'`).Scan(&truncateSQL); err != nil {
+		SELECT count(*) FROM pg_tables
+		WHERE schemaname = 'public' AND tablename <> 'goose_db_version'`).Scan(&tableCount); err != nil {
 		return 0, err
 	}
 
@@ -143,7 +185,7 @@ func migrateTestDB(ctx context.Context, dsn string) error {
 		return err
 	}
 	defer db.Close()
-	dir, err := filepath.Abs(filepath.Join("..", "..", "migrations"))
+	dir, err := filepath.Abs(filepath.Join("..", "..", "..", "migrations"))
 	if err != nil {
 		return err
 	}
@@ -179,12 +221,10 @@ func queryCount() int64 { return queries.n.Load() }
 // reset empties every table so each test starts from a known state.
 func reset(t *testing.T) {
 	t.Helper()
-	if truncateSQL == "" {
+	if tableCount == 0 {
 		t.Fatal("no tables found to truncate — did migrations run?")
 	}
-	_, err := testPool.Exec(context.Background(),
-		"TRUNCATE "+truncateSQL+" RESTART IDENTITY CASCADE")
-	if err != nil {
+	if _, err := testPool.Exec(context.Background(), resetSQL); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
 }

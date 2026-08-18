@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // The service-token path end to end through the real router. The suite runs
 // AUTH_MODE=dev, where X-User-ID is trusted anyway, so the load-bearing case

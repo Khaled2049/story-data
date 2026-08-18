@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Competitions and the TALE token ledger.
 //

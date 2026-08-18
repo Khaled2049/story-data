@@ -52,6 +52,7 @@ cmd/api/                 process startup, connection retry, and migrations
 internal/config/         environment-variable configuration
 internal/auth/           Firebase token and local development identity checks
 internal/httpapi/        route dispatch, request decoding, and HTTP responses
+internal/httpapi/e2e/    black-box suite: real router, real store, real SQL
 internal/store/          SQL queries, transactions, authorization checks, DTOs
 migrations/              ordered PostgreSQL schema migrations
 openapi/openapi.yaml     API contract for consumers
@@ -60,6 +61,14 @@ terraform/               production infrastructure configuration
 
 Keep HTTP handlers thin. Authorization, SQL, transaction boundaries, and data
 invariants belong in `internal/store`.
+
+Tests for the HTTP surface live in `internal/httpapi/e2e`, a separate package
+that reaches the service only the way a client does — over HTTP, through the
+exported constructor. Put a new endpoint's tests there. A test that needs an
+unexported symbol goes beside the code it covers instead
+(`internal/httpapi/errors_test.go` is the current example). The suite needs a
+PostgreSQL server; it creates its own throwaway database and never touches the
+dev one.
 
 ## Data model and migrations
 
@@ -286,10 +295,14 @@ go run ./cmd/api
 
 ## Development checklist
 
+`make` lists the common commands; every one is a thin wrapper around the tool
+it names, so nothing here is available only through make.
+
 Before handing off a change:
 
-1. Run `gofmt -w internal cmd` for Go changes.
-2. Run `go test ./...`.
+1. Run `make fmt` (`gofmt -w internal cmd`) for Go changes.
+2. Run `make test` (`go test ./...`), which needs PostgreSQL — `make db`
+   starts one. `make check` does steps 1 and 2 plus `go vet` in one pass.
 3. Start the service and check `GET /health`.
 4. Exercise changed authenticated endpoints with a Firebase token or the local
    `X-User-ID` development header.

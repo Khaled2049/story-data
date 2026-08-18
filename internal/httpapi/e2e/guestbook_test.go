@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Guestbook: entries, threaded replies, votes, and the five-policy wall.
 //

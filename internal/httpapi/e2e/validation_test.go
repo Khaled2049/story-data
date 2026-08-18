@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Field validation: what the system of record refuses to store.
 //

@@ -12,6 +12,11 @@ indexing, local setup, and production notes, read the
 
 ## Local development
 
+`make` lists the common commands — `make up` starts PostgreSQL and the API in
+Docker, `make db` starts only the database, `make test` runs the suite, and
+`make check` runs format, vet and tests together. Each is a thin wrapper; the
+underlying commands are below and in the [service guide](docs/service-guide.md).
+
 Create a local `story_data` database in Postgres (the existing creditProxy
 Postgres container is suitable), then run:
 
