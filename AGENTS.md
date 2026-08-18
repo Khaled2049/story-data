@@ -6,11 +6,20 @@ Firebase replacement for identity or legacy-only features.
 
 ## Commands
 
-- `docker compose up --build`: run local PostgreSQL (with pgvector) and API.
-- `go test ./...`: run the Go test suite.
-- `gofmt -w internal cmd`: format changed Go code.
-- `go run ./cmd/api migrate`: apply migrations manually; normal API startup
-  also migrates under an advisory lock.
+`make` lists every target; each is a thin wrapper around the underlying tool,
+so either form works.
+
+- `make up` (`docker compose up --build -d`): local PostgreSQL (with pgvector)
+  and API.
+- `make db` (`docker compose up -d postgres`): just the database, which is all
+  the tests need.
+- `make test` (`go test ./... -count=1`): the Go test suite. `make test-unit`
+  skips the packages that need a database; `make test RUN=<regex>` narrows.
+- `make fmt` (`gofmt -w internal cmd`): format changed Go code.
+- `make check`: format check, vet and the full suite — what CI rejects a
+  change for.
+- `make migrate` (`go run ./cmd/api migrate`): apply migrations manually;
+  normal API startup also migrates under an advisory lock.
 
 ## Data and API rules
 

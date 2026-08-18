@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Social: story likes, ratings, chapter comments and comment likes.
 //
@@ -9,6 +9,7 @@ package httpapi_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -422,5 +423,66 @@ func TestSocialCommentCascadesWithItsChapter(t *testing.T) {
 	}
 	if remaining != 0 {
 		t.Errorf("expected comments to cascade with the chapter, %d remain", remaining)
+	}
+}
+
+// ── daily budgets ───────────────────────────────────────────────────────────
+
+// Comments were unmetered: one account could post without limit on any
+// chapter, which is the cheapest way to make a shared surface unusable. The
+// budget is per user per day and lives in the database, so it survives a
+// restart and holds across instances — the in-process rate limiter only
+// bounds bursts.
+func TestCommentRateLimit(t *testing.T) {
+	reset(t)
+	storyID, chapterID := socialFixture(t)
+
+	for i := 0; i < 100; i++ {
+		call(t, "POST", commentsPath(storyID, chapterID), bob,
+			map[string]any{"message": fmt.Sprintf("comment %d", i)}).
+			expect(http.StatusCreated)
+	}
+	call(t, "POST", commentsPath(storyID, chapterID), bob,
+		map[string]any{"message": "one too many"}).
+		expect(http.StatusTooManyRequests)
+
+	// The budget is per account, not per chapter or per story.
+	second := newChapter(t, alice, storyID, "Chapter Two", 2)["id"].(string)
+	call(t, "POST", commentsPath(storyID, second), bob,
+		map[string]any{"message": "different chapter"}).
+		expect(http.StatusTooManyRequests)
+
+	// And it is one user's budget, not everyone's.
+	call(t, "POST", commentsPath(storyID, chapterID), carol,
+		map[string]any{"message": "unaffected"}).expect(http.StatusCreated)
+
+	// A rejected comment must not be stored.
+	listed := get(t, publicCommentsPath(storyID, chapterID), "").
+		expect(http.StatusOK).list()
+	if len(listed) != 101 {
+		t.Errorf("chapter holds %d comments, want 101", len(listed))
+	}
+}
+
+func TestRatingRateLimit(t *testing.T) {
+	reset(t)
+	// A rating is one per story per user, so spending the budget means rating
+	// many different stories.
+	ids := make([]string, 0, 51)
+	for i := 0; i < 51; i++ {
+		ids = append(ids, newPublishedStory(t, alice, fmt.Sprintf("Work %d", i))["id"].(string))
+	}
+	for i := 0; i < 50; i++ {
+		call(t, "POST", "/v1/stories/"+ids[i]+"/ratings", bob,
+			map[string]any{"rating": 5}).expect(http.StatusCreated)
+	}
+	call(t, "POST", "/v1/stories/"+ids[50]+"/ratings", bob,
+		map[string]any{"rating": 5}).expect(http.StatusTooManyRequests)
+
+	// The refused rating left nothing behind.
+	story := get(t, "/v1/public/stories/"+ids[50], "").expect(http.StatusOK).
+		json()["story"].(map[string]any)
+	if story["ratingsCount"].(float64) != 0 {
+		t.Errorf("a rejected rating was recorded: %v", story["ratingsCount"])
 	}
 }

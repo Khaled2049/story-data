@@ -85,11 +85,27 @@ type Context struct {
 	Chapters []Chapter
 }
 
-type Store struct{ db *pgxpool.Pool }
+// DefaultVoterMinProfileAge is how long a public profile must have existed
+// before its owner may cast a competition ballot. Long enough that a slate of
+// accounts registered for one competition cannot vote in it, short enough that
+// a real reader who joins a platform to follow a contest is not shut out.
+const DefaultVoterMinProfileAge = 24 * time.Hour
 
-func New(db *pgxpool.Pool) *Store { return &Store{db: db} }
+type Store struct {
+	db *pgxpool.Pool
+	// VoterMinProfileAge gates competition ballots on account standing. Set it
+	// to 0 for local development and tests, where every account is minutes old.
+	VoterMinProfileAge time.Duration
+}
+
+func New(db *pgxpool.Pool) *Store {
+	return &Store{db: db, VoterMinProfileAge: DefaultVoterMinProfileAge}
+}
 
 func (s *Store) CreateStory(ctx context.Context, owner string, in StoryInput) (Story, error) {
+	if !validStoryInput(in) {
+		return Story{}, ErrValidation
+	}
 	id := uuid.New()
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -178,6 +194,9 @@ func (s *Store) hydrateTags(ctx context.Context, story *Story) error {
 }
 
 func (s *Store) UpdateStory(ctx context.Context, id, owner string, rev int64, in StoryInput) (Story, error) {
+	if !validStoryInput(in) {
+		return Story{}, ErrValidation
+	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return Story{}, err

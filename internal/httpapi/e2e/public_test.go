@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Public reads: the anonymous discovery surface.
 //
@@ -7,6 +7,7 @@ package httpapi_test
 // does a listing leak chapter prose it should not.
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"testing"
@@ -129,19 +130,57 @@ func TestPublicStoryCarriesTagsAndSocialCounters(t *testing.T) {
 
 // ── views ───────────────────────────────────────────────────────────────────
 
-func TestPublicStoryViews(t *testing.T) {
+// views drives discovery ranking and the endpoint takes no credential, so it
+// counts readers per day rather than requests. It used to be one UPDATE per
+// call: a shell loop could set any story's count to any number.
+func TestViewsAreDeduplicated(t *testing.T) {
 	reset(t)
 	storyID := newPublishedStory(t, alice, "Watched")["id"].(string)
+	views := func() float64 {
+		story := get(t, publicStoryPath(storyID), "").expect(http.StatusOK).json()["story"].(map[string]any)
+		return story["views"].(float64)
+	}
+	from := func(ip string) {
+		call(t, "POST", publicStoryPath(storyID)+"/views", "", nil,
+			map[string]string{"X-Forwarded-For": ip}).expect(http.StatusNoContent)
+	}
 
-	for i := 0; i < 3; i++ {
-		call(t, "POST", publicStoryPath(storyID)+"/views", "", nil).
+	// The flood the review reproduced. Every call still succeeds — the reader
+	// asked for their view to be recorded and it is — but the counter moves
+	// once.
+	for i := 0; i < 50; i++ {
+		from("203.0.113.7")
+	}
+	if got := views(); got != 1 {
+		t.Errorf("views after 50 requests from one reader = %v, want 1", got)
+	}
+
+	// A different reader is a different view.
+	from("198.51.100.4")
+	if got := views(); got != 2 {
+		t.Errorf("views after a second reader = %v, want 2", got)
+	}
+
+	// A signed-in reader is keyed on their uid, so they count once however
+	// their address moves around.
+	for i := 0; i < 5; i++ {
+		call(t, "POST", publicStoryPath(storyID)+"/views", bob, nil,
+			map[string]string{"X-Forwarded-For": fmt.Sprintf("192.0.2.%d", i)}).
 			expect(http.StatusNoContent)
 	}
-	story := get(t, publicStoryPath(storyID), "").expect(http.StatusOK).json()["story"].(map[string]any)
-	// Pinned as-is: the counter is unauthenticated and unthrottled, so it
-	// measures requests rather than readers.
-	if story["views"].(float64) != 3 {
-		t.Errorf("views = %v, want 3", story["views"])
+	if got := views(); got != 3 {
+		t.Errorf("views after a signed-in reader = %v, want 3", got)
+	}
+
+	// Only the hash is stored; the table must never hold an address.
+	var addresses int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM public_story_view_hits WHERE viewer_key LIKE '%203.0.113.7%'`).
+		Scan(&addresses); err != nil {
+		t.Fatal(err)
+	}
+	if addresses != 0 {
+		t.Errorf("view rows hold %d raw client addresses", addresses)
 	}
 
 	draft := newStory(t, alice, "Unwatched")["id"].(string)

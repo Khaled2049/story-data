@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Reading progress and history.
 //

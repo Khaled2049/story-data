@@ -52,6 +52,7 @@ cmd/api/                 process startup, connection retry, and migrations
 internal/config/         environment-variable configuration
 internal/auth/           Firebase token and local development identity checks
 internal/httpapi/        route dispatch, request decoding, and HTTP responses
+internal/httpapi/e2e/    black-box suite: real router, real store, real SQL
 internal/store/          SQL queries, transactions, authorization checks, DTOs
 migrations/              ordered PostgreSQL schema migrations
 openapi/openapi.yaml     API contract for consumers
@@ -60,6 +61,14 @@ terraform/               production infrastructure configuration
 
 Keep HTTP handlers thin. Authorization, SQL, transaction boundaries, and data
 invariants belong in `internal/store`.
+
+Tests for the HTTP surface live in `internal/httpapi/e2e`, a separate package
+that reaches the service only the way a client does — over HTTP, through the
+exported constructor. Put a new endpoint's tests there. A test that needs an
+unexported symbol goes beside the code it covers instead
+(`internal/httpapi/errors_test.go` is the current example). The suite needs a
+PostgreSQL server; it creates its own throwaway database and never touches the
+dev one.
 
 ## Data model and migrations
 
@@ -104,6 +113,118 @@ permissions. Never trust client-supplied owner IDs.
 `X-Admin: true` so scripts can exercise protected routes without external
 token verification.
 
+### Competition read visibility
+
+A published competition is readable by anyone, including anonymous callers —
+that is the public contest page. A **draft** is its author's private working
+copy and answers only to them; every other caller, admin included, gets `404`
+rather than `403`, because confirming that a draft id exists is itself the
+disclosure. `GET /v1/competitions/{id}/submissions` **requires
+authentication** and is gated on the same rule: the list carries the Firebase
+uid of every entrant, which joins directly against the public profile
+directory. The guard lives in `GetCompetition`/`ListSubmissions`, not in the
+internal `competition()` helper, which every store method uses with the acting
+user and must keep working for an admin operating on someone else's record.
+
+### Competition voter eligibility
+
+Casting a competition ballot needs more than a valid token, because a ballot
+decides a winner-take-all prize and Firebase sign-up is free and unverified. A
+voter must have **joined** the competition — registration closes when entries
+do — and must hold a **public profile** at least `VOTER_MIN_PROFILE_AGE` old
+(default 24h, a Go duration such as `48h`). Set it to `0` in local stacks so a
+freshly seeded account can vote; a malformed value fails startup rather than
+silently reverting to the default. Ballot size is capped per competition by
+`competitions.max_votes_per_user`.
+
+## Errors, logging and lifecycle
+
+**Error mapping** lives in `respond` (`internal/httpapi/server.go`). The store's
+sentinel errors map to their status codes; anything else falls through
+`translatePgError`, which turns the constraint violations a bad request can
+provoke into the 4xx they are — check/not-null/invalid-text/truncation/numeric
+range to `422`, foreign key to `404`, unclaimed unique violation to `409`.
+Validators in `internal/store` should catch each of these first; this is the
+backstop for the one that gets missed, and it matters because an
+attacker-triggerable 500 poisons the error rate operators alert on. Client
+bodies stay generic — the detail goes to the log.
+
+**Request logging** (`internal/httpapi/logging.go`) is the outermost
+middleware, so throttled and CORS-rejected requests are logged too. One JSON
+line per request: request id, method, path, status, duration, uid, client
+address, and the underlying error when the response was a 500. `/health` is
+skipped. Every response carries `X-Request-ID`; an inbound `X-Request-ID` or
+`X-Cloud-Trace-Context` is preserved so a trace survives across services.
+`cmd/api` installs `slog`'s JSON handler on stderr, which is what Cloud Run
+parses into structured entries.
+
+**Server lifecycle** (`cmd/api/main.go`). `newServer` sets
+`ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout` and
+`MaxHeaderBytes` — a bare `http.ListenAndServe` leaves all of them at zero,
+which lets one slow client hold a goroutine indefinitely. `serve` drains on
+`SIGTERM` with a 20s grace period, so an in-flight ledger transfer commits
+before an instance goes away. Both are covered by tests in `cmd/api`, since
+`go vet` does not catch either.
+
+## Input validation
+
+`internal/store/validate.go` holds the ceilings and the URL rule; every write
+path applies them and returns `422` (`ErrValidation`) rather than letting the
+database decide or storing the value.
+
+- **URL-shaped fields** — story `coverImageUrl`/`thumbnailUrl`, profile
+  `photoUrl`, book-club `image`, character `artUrl`, place `imageUrl` — accept
+  only absolute `http`/`https` URLs, by allowlist. That rejects `javascript:`,
+  `data:`, `vbscript:` and their obfuscations in one predicate instead of
+  enumerating them. Empty is still "not set".
+- **Text ceilings**: title 500, description 5 000, names 200, short fields
+  (category, language, copyright, audience) 100, long-form worldbuilding prose
+  20 000, tags 20 per record at 100 each, JSON blobs 16 KB. Counted in
+  **runes**, matching the SQL `char_length`, so a limit means the same thing in
+  every script.
+- **Per-story entity ceilings**: 200 characters, places, plot lines, and events
+  per plot line, alongside the existing 50 chapters and 100 stories per user.
+- These are the outer wall, deliberately looser than the editor and the MCP
+  write tools (`taleTribe-agents/mcp_server/writes.py`), which carry the
+  product contract. Nothing a client legitimately produced is rejected.
+
+Migration `000016_field_ceilings.sql` mirrors the same rules as SQL `CHECK`
+constraints, added `NOT VALID` — enforced on write, but no table scan at
+deploy, because migrations run at startup and a scan that failed on one legacy
+row would take the service down instead of protecting it.
+
+## Abuse controls
+
+The service is invokable by anyone — Cloud Run grants `roles/run.invoker` to
+`allUsers` and `/v1/public/*` needs no credential — so throttling is part of
+the contract, at two layers.
+
+**Per-caller request budget** (`internal/httpapi/ratelimit.go`). Middleware
+keyed on the authenticated caller where there is one and the client address
+otherwise, defaulting to 300 reads and 60 writes per minute. Override with
+`RATE_LIMIT_READS_PER_MINUTE` / `RATE_LIMIT_WRITES_PER_MINUTE`; `0` disables
+that half, which is what the local stack does. Over budget is `429` with
+`Retry-After`. `GET /health` is exempt so a flood cannot fail the liveness
+probe. Buckets are per instance and in memory: this bounds a burst, it is not
+a platform-wide quota. `clientIP` reads the **last** `X-Forwarded-For` entry,
+the one Google's front end appends — putting a load balancer in front of the
+service invalidates that assumption.
+
+**Durable daily budgets** (`internal/store/quota.go`, table
+`user_daily_usage`). Per user, per action, in UTC days, spent in the same
+transaction as the write they meter: comments (100), ratings (50), competition
+drafts (10) and book clubs (5). The guestbook and book-club discussion domains
+predate this and keep their own tables. Over budget is `429`.
+
+Two related bounds: `POST /v1/public/stories/{id}/views` counts one reader per
+story per day (`public_story_view_hits`, keyed on uid or a salted hash of the
+address — never a raw IP), and `GET /v1/competitions` is paged with a constant
+query count rather than selecting the whole table and hydrating row by row.
+
+Not covered here: there is no edge rate limiting. Attaching Cloud Armor needs
+an external load balancer in front of Cloud Run, which the service does not
+have today.
+
 ## API conventions
 
 - `GET /health` is the service health check.
@@ -111,6 +232,10 @@ token verification.
   [`openapi/openapi.yaml`](../openapi/openapi.yaml).
 - Collection endpoints return JSON arrays, including `[]` when no records
   exist; they should never return `null` for an empty collection.
+- Public listings are paged. `GET /v1/public/stories` carries its cursor in the
+  body (`nextCursor`). `GET /v1/competitions` keeps a bare array — clients map
+  over it directly — and returns its continuation token in the `X-Next-Cursor`
+  response header. Both accept `?limit=` and `?cursor=`.
 - Story, chapter, and worldbuilding mutations use optimistic concurrency.
   Clients send `If-Match: <revision>` for writes that update/delete an existing
   record. A stale revision returns `409 Conflict`.
@@ -170,10 +295,14 @@ go run ./cmd/api
 
 ## Development checklist
 
+`make` lists the common commands; every one is a thin wrapper around the tool
+it names, so nothing here is available only through make.
+
 Before handing off a change:
 
-1. Run `gofmt -w internal cmd` for Go changes.
-2. Run `go test ./...`.
+1. Run `make fmt` (`gofmt -w internal cmd`) for Go changes.
+2. Run `make test` (`go test ./...`), which needs PostgreSQL — `make db`
+   starts one. `make check` does steps 1 and 2 plus `go vet` in one pass.
 3. Start the service and check `GET /health`.
 4. Exercise changed authenticated endpoints with a Firebase token or the local
    `X-User-ID` development header.

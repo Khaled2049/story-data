@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -50,6 +52,9 @@ type Competition struct {
 	Results         []CompetitionResult `json:"results,omitempty"`
 	ResultsDigest   string              `json:"resultsDigest,omitempty"`
 	SettledAt       *time.Time          `json:"settledAt,omitempty"`
+	// createdAt backs the listing cursor. Unexported because it is ordering
+	// state, not part of the record the API promises.
+	createdAt time.Time
 }
 type TokenAmount struct {
 	AssetID  string `json:"assetId"`
@@ -181,6 +186,36 @@ func (s *Store) balance(ctx context.Context, id string) (TokenBalance, error) {
 	}
 	return TokenBalance{id, taleAsset, "TALE", 18, b}, e
 }
+
+// mergePostings collapses a transfer's postings to one line per account and
+// drops the ones that net to zero, which the delta <> 0 check would reject.
+// Accounts come back sorted so every transfer takes its FOR UPDATE row locks
+// in the same order and concurrent transfers cannot deadlock against each
+// other.
+func mergePostings(ps []posting) ([]posting, error) {
+	sums := map[string]*big.Int{}
+	order := make([]string, 0, len(ps))
+	for _, p := range ps {
+		n, ok := new(big.Int).SetString(p.delta, 10)
+		if !ok {
+			return nil, ErrValidation
+		}
+		if sums[p.account] == nil {
+			sums[p.account] = new(big.Int)
+			order = append(order, p.account)
+		}
+		sums[p.account].Add(sums[p.account], n)
+	}
+	sort.Strings(order)
+	out := make([]posting, 0, len(order))
+	for _, a := range order {
+		if sums[a].Sign() != 0 {
+			out = append(out, posting{a, sums[a].String()})
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) transfer(ctx context.Context, key, reason, competition string, ps []posting) error {
 	tx, e := s.db.Begin(ctx)
 	if e != nil {
@@ -204,6 +239,15 @@ func (s *Store) transferTx(ctx context.Context, tx pgx.Tx, key, reason, competit
 	}
 	if exists {
 		return nil
+	}
+	// ledger_postings is keyed (transfer_key, account_id), so an account that
+	// appears twice in one transfer aborts the whole insert with 23505. Merge
+	// here rather than in each caller: settlement legitimately credits one
+	// account from two sources (prize refund + host fee share when the creator
+	// is also the recipient), and that must post as a single net line.
+	ps, e = mergePostings(ps)
+	if e != nil {
+		return e
 	}
 	sum := big.NewInt(0)
 	for _, p := range ps {
@@ -269,28 +313,171 @@ func (s *Store) transferTx(ctx context.Context, tx pgx.Tx, key, reason, competit
 	return nil
 }
 
-func (s *Store) ListCompetitions(ctx context.Context, viewer string) ([]Competition, error) {
-	rows, e := s.db.Query(ctx, `SELECT id FROM competitions WHERE phase<>'draft' ORDER BY created_at DESC`)
-	if e != nil {
-		return nil, e
+// The competition listing is public and unauthenticated, so it is paged rather
+// than returning the whole table.
+const defaultCompetitionPageSize = 50
+const maxCompetitionPageSize = 100
+
+type CompetitionPage struct {
+	Competitions []Competition
+	NextCursor   string
+}
+
+type competitionCursor struct {
+	CreatedAt time.Time `json:"createdAt"`
+	ID        string    `json:"id"`
+}
+
+// ListCompetitions returns one page in three queries, whatever the page size.
+// It used to select every non-draft competition with no limit and then call
+// competition() per row, which issues one to three queries of its own — a few
+// concurrent anonymous requests were enough to exhaust a ten-connection pool
+// and take the whole API down, writes included.
+func (s *Store) ListCompetitions(ctx context.Context, viewer, cursor string, pageSize int) (CompetitionPage, error) {
+	if pageSize <= 0 {
+		pageSize = defaultCompetitionPageSize
 	}
-	defer rows.Close()
+	if pageSize > maxCompetitionPageSize {
+		pageSize = maxCompetitionPageSize
+	}
+	args := []any{}
+	where := `WHERE phase<>'draft'`
+	if cursor != "" {
+		after, e := decodeCompetitionCursor(cursor)
+		if e != nil {
+			return CompetitionPage{}, ErrValidation
+		}
+		args = append(args, after.CreatedAt, mustUUID(after.ID))
+		where += ` AND (created_at, id) < ($1, $2)`
+	}
+	args = append(args, pageSize+1)
+	rows, e := s.db.Query(ctx, competitionSelect+` `+where+
+		` ORDER BY created_at DESC, id DESC LIMIT $`+fmt.Sprint(len(args)), args...)
+	if e != nil {
+		return CompetitionPage{}, e
+	}
 	out := []Competition{}
 	for rows.Next() {
-		var id uuid.UUID
-		if e = rows.Scan(&id); e != nil {
-			return nil, e
-		}
-		x, z := s.competition(ctx, id.String(), viewer)
+		x, z := scanCompetition(rows)
 		if z != nil {
-			return nil, z
+			rows.Close()
+			return CompetitionPage{}, z
 		}
 		out = append(out, x)
 	}
-	return out, rows.Err()
+	// Closed before the hydration queries run, so the pool is not asked for a
+	// second connection while this cursor is still open.
+	rows.Close()
+	if e = rows.Err(); e != nil {
+		return CompetitionPage{}, e
+	}
+
+	page := CompetitionPage{Competitions: out}
+	if len(out) > pageSize {
+		out = out[:pageSize]
+		page.Competitions = out
+		page.NextCursor, _ = encodeCompetitionCursor(out[len(out)-1])
+	}
+	if e = s.hydrateCompetitions(ctx, page.Competitions, viewer); e != nil {
+		return CompetitionPage{}, e
+	}
+	return page, nil
 }
+
+// hydrateCompetitions fills in the two fields the row itself cannot carry:
+// whether the viewer has joined, and the ranked results of a settled contest.
+// Both are one set-based query for the whole page.
+func (s *Store) hydrateCompetitions(ctx context.Context, list []Competition, viewer string) error {
+	if len(list) == 0 {
+		return nil
+	}
+	ids := make([]string, len(list))
+	byID := make(map[string]*Competition, len(list))
+	settled := []string{}
+	for i := range list {
+		ids[i] = list[i].ID
+		byID[list[i].ID] = &list[i]
+		if list[i].Phase == "settled" {
+			settled = append(settled, list[i].ID)
+		}
+	}
+	if viewer != "" {
+		rows, e := s.db.Query(ctx, `SELECT competition_id FROM competition_participants WHERE user_id=$1 AND competition_id = ANY($2::uuid[])`, viewer, ids)
+		if e != nil {
+			return e
+		}
+		for rows.Next() {
+			var cid uuid.UUID
+			if e = rows.Scan(&cid); e != nil {
+				rows.Close()
+				return e
+			}
+			if c := byID[cid.String()]; c != nil {
+				c.IsJoined = true
+			}
+		}
+		rows.Close()
+		if e = rows.Err(); e != nil {
+			return e
+		}
+	}
+	if len(settled) == 0 {
+		return nil
+	}
+	return s.eachRow(ctx, `SELECT competition_id,rank,user_id,submission_id,votes,amount::text FROM competition_results WHERE competition_id = ANY($1::uuid[]) ORDER BY competition_id,rank`, settled, func(rows pgx.Rows) error {
+		var cid uuid.UUID
+		var r CompetitionResult
+		if e := rows.Scan(&cid, &r.Rank, &r.UserID, &r.SubmissionID, &r.Votes, &r.Amount); e != nil {
+			return e
+		}
+		if c := byID[cid.String()]; c != nil {
+			c.Results = append(c.Results, r)
+		}
+		return nil
+	})
+}
+
+func encodeCompetitionCursor(c Competition) (string, error) {
+	raw, e := json.Marshal(competitionCursor{CreatedAt: c.createdAt, ID: c.ID})
+	if e != nil {
+		return "", e
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func decodeCompetitionCursor(v string) (competitionCursor, error) {
+	raw, e := base64.RawURLEncoding.DecodeString(v)
+	if e != nil {
+		return competitionCursor{}, e
+	}
+	var out competitionCursor
+	if e = json.Unmarshal(raw, &out); e != nil {
+		return competitionCursor{}, e
+	}
+	if _, e = uuid.Parse(out.ID); e != nil {
+		return competitionCursor{}, e
+	}
+	return out, nil
+}
+
+// GetCompetition is the external read. A draft is its author's private
+// working copy — an unannounced prize pool, entry fee and schedule — so it is
+// visible only to them. Everyone else gets 404 rather than 403: confirming
+// that an id exists is itself the leak, since draft ids travel through URLs,
+// screenshots and support tickets.
+//
+// The guard lives here rather than in competition(), which every internal
+// caller uses with the acting user and which must keep working for an admin
+// operating on someone else's record.
 func (s *Store) GetCompetition(ctx context.Context, id, viewer string) (Competition, error) {
-	return s.competition(ctx, id, viewer)
+	x, e := s.competition(ctx, id, viewer)
+	if e != nil {
+		return x, e
+	}
+	if x.Phase == "draft" && (viewer == "" || x.CreatorID != viewer) {
+		return Competition{}, ErrNotFound
+	}
+	return x, nil
 }
 func (s *Store) ListDrafts(ctx context.Context, user string) ([]Competition, error) {
 	rows, e := s.db.Query(ctx, `SELECT id FROM competitions WHERE creator_id=$1 AND phase='draft' ORDER BY updated_at DESC`, user)
@@ -313,8 +500,20 @@ func (s *Store) ListDrafts(ctx context.Context, user string) ([]Competition, err
 	return out, rows.Err()
 }
 func (s *Store) SaveDraft(ctx context.Context, user string, id string, in CompetitionInput) (Competition, error) {
-	if strings.TrimSpace(in.Title) == "" {
+	if strings.TrimSpace(in.Title) == "" || !validCompetitionInput(in) {
 		return Competition{}, ErrValidation
+	}
+	// A caller-supplied id that is not a uuid used to reach the WHERE clause
+	// and come back as a 500. It cannot name an existing draft, so it is a 404.
+	if id != "" {
+		if _, e := uuid.Parse(id); e != nil {
+			return Competition{}, ErrNotFound
+		}
+	}
+	// The column is NOT NULL; a request that simply omits tags is not a
+	// server error.
+	if in.Tags == nil {
+		in.Tags = []string{}
 	}
 	prize, e := amount(ptrString(in.PrizeAmount))
 	if e != nil {
@@ -326,10 +525,26 @@ func (s *Store) SaveDraft(ctx context.Context, user string, id string, in Compet
 	}
 	if id == "" {
 		id = uuid.NewString()
-		_, e = s.db.Exec(ctx, `INSERT INTO competitions(id,creator_id,creator_name,title,description,category,tags,max_participants,start_at,deadline_at,voting_deadline_at,prize_amount,entry_fee) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, user, defaultName(in.CreatorName), strings.TrimSpace(in.Title), in.Description, in.Category, in.Tags, in.MaxParticipants, in.StartDate, in.Deadline, in.VotingDeadline, prize, fee)
-	} else {
-		_, e = s.db.Exec(ctx, `UPDATE competitions SET title=$1,description=$2,category=$3,tags=$4,max_participants=$5,start_at=$6,deadline_at=$7,voting_deadline_at=$8,prize_amount=$9,entry_fee=$10,updated_at=now() WHERE id=$11 AND creator_id=$12 AND phase='draft'`, in.Title, in.Description, in.Category, in.Tags, in.MaxParticipants, in.StartDate, in.Deadline, in.VotingDeadline, prize, fee, id, user)
+		// Only creating a draft is metered. Editing one is bounded by the
+		// drafts a user already has, and a host revising a competition
+		// repeatedly is ordinary use.
+		tx, z := s.db.Begin(ctx)
+		if z != nil {
+			return Competition{}, z
+		}
+		defer tx.Rollback(ctx)
+		if z = s.consumeDailyQuota(ctx, tx, user, "competition-draft", MaxCompetitionDraftsPerDay); z != nil {
+			return Competition{}, z
+		}
+		if _, z = tx.Exec(ctx, `INSERT INTO competitions(id,creator_id,creator_name,title,description,category,tags,max_participants,start_at,deadline_at,voting_deadline_at,prize_amount,entry_fee) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, user, defaultName(in.CreatorName), strings.TrimSpace(in.Title), in.Description, in.Category, in.Tags, in.MaxParticipants, in.StartDate, in.Deadline, in.VotingDeadline, prize, fee); z != nil {
+			return Competition{}, z
+		}
+		if z = tx.Commit(ctx); z != nil {
+			return Competition{}, z
+		}
+		return s.competition(ctx, id, user)
 	}
+	_, e = s.db.Exec(ctx, `UPDATE competitions SET title=$1,description=$2,category=$3,tags=$4,max_participants=$5,start_at=$6,deadline_at=$7,voting_deadline_at=$8,prize_amount=$9,entry_fee=$10,updated_at=now() WHERE id=$11 AND creator_id=$12 AND phase='draft'`, in.Title, in.Description, in.Category, in.Tags, in.MaxParticipants, in.StartDate, in.Deadline, in.VotingDeadline, prize, fee, id, user)
 	if e != nil {
 		return Competition{}, e
 	}
@@ -381,6 +596,12 @@ func (s *Store) UpdateCompetition(ctx context.Context, id, user string, in Compe
 		return c, ErrForbidden
 	}
 	if c.Phase != "scheduled" && c.Phase != "open" {
+		return c, ErrValidation
+	}
+	// An empty field means "leave it alone" here, so only what was sent is
+	// bounded — but it is bounded, which an update path that skipped the check
+	// entirely would not be.
+	if !validCompetitionInput(in) {
 		return c, ErrValidation
 	}
 	title := c.Title
@@ -481,7 +702,8 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 	// $2 is the story, referenced once: an earlier version bound the caller's
 	// id as an extra parameter the SQL never used, which PostgreSQL cannot
 	// type-infer — it made every submission fail with a 500.
-	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1`, id, storyID).Scan(&phase, &owner, &title, &author, &cover, &fee)
+	var prize, escrowed string
+	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text,c.prize_amount::text,COALESCE((SELECT a.balance::text FROM token_accounts a WHERE a.account_id=$3),'0') FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1`, id, storyID, escrow(id)).Scan(&phase, &owner, &title, &author, &cover, &fee, &prize, &escrowed)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -490,6 +712,15 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 	}
 	if phase != "open" || owner != user {
 		return ErrForbidden
+	}
+	// Defence in depth against an unfunded competition taking money. Publish
+	// is the only path that opens one and it escrows the prize first, so the
+	// escrow always covers the advertised prize on top of the fees held in it.
+	// If it does not, the competition cannot pay out and must not collect.
+	held, ok := new(big.Int).SetString(escrowed, 10)
+	want, ok2 := new(big.Int).SetString(prize, 10)
+	if !ok || !ok2 || held.Cmp(want) < 0 {
+		return ErrValidation
 	}
 	var joined bool
 	_ = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM competition_participants WHERE competition_id=$1 AND user_id=$2)`, id, user).Scan(&joined)
@@ -654,8 +885,28 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 	return s.competition(ctx, id, user)
 }
 
-func (s *Store) ListSubmissions(ctx context.Context, id string) ([]CompetitionSubmission, error) {
-	rows, e := s.db.Query(ctx, `SELECT user_id,story_id,story_title,story_author_name,cover_image_url,status,submitted_at FROM competition_submissions WHERE competition_id=$1 AND status='submitted' ORDER BY submitted_at`, id)
+// ListSubmissions is the external read, and a submission list is a membership
+// list: it maps Firebase uids to competition participation, which joins
+// straight against the public profile directory. It is therefore gated on the
+// caller being able to see the competition at all, which also means an unknown
+// id returns 404 instead of an empty array.
+//
+// Settlement uses listSubmissions with its own transaction rather than this.
+func (s *Store) ListSubmissions(ctx context.Context, id, viewer string) ([]CompetitionSubmission, error) {
+	if _, e := s.GetCompetition(ctx, id, viewer); e != nil {
+		return nil, e
+	}
+	return listSubmissions(ctx, s.db, id)
+}
+
+// querier is the read surface shared by *pgxpool.Pool and pgx.Tx, so a helper
+// can run either standalone or inside a caller's transaction.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func listSubmissions(ctx context.Context, q querier, id string) ([]CompetitionSubmission, error) {
+	rows, e := q.Query(ctx, `SELECT user_id,story_id,story_title,story_author_name,cover_image_url,status,submitted_at FROM competition_submissions WHERE competition_id=$1 AND status='submitted' ORDER BY submitted_at`, id)
 	if e != nil {
 		return nil, e
 	}
@@ -697,18 +948,54 @@ func (s *Store) MyBallot(ctx context.Context, id, user string) (CompetitionBallo
 	}
 	return x, rows.Err()
 }
+
+// voterEligibleTx decides who may influence a prize that pays out
+// winner-take-all. A ballot used to need nothing but an authenticated uid, so
+// anyone able to sign up — free, unlimited and unverified — could register
+// throwaway accounts and hand themselves any competition on the platform.
+//
+// Two cheap-for-honest-users, costly-for-sybils conditions apply. The voter
+// must have joined the competition, which closes when entries do, so a slate
+// of accounts has to exist and register before the outcome is knowable. And
+// the voter must hold a public profile that is at least VoterMinProfileAge
+// old: a profile costs a unique username, and the age requirement means a
+// batch of accounts minted for one competition cannot vote in it.
+//
+// Neither is sufficient alone and neither is a substitute for rate limiting
+// (finding 4); they raise the price of a sybil slate, they do not make one
+// impossible.
+func (s *Store) voterEligibleTx(ctx context.Context, tx pgx.Tx, id, user string) error {
+	var joined bool
+	if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM competition_participants WHERE competition_id=$1 AND user_id=$2)`, id, user).Scan(&joined); e != nil {
+		return e
+	}
+	if !joined {
+		return ErrForbidden
+	}
+	var created time.Time
+	e := tx.QueryRow(ctx, `SELECT created_at FROM public_profiles WHERE user_id=$1`, user).Scan(&created)
+	if errors.Is(e, pgx.ErrNoRows) {
+		return ErrForbidden
+	}
+	if e != nil {
+		return e
+	}
+	if time.Since(created) < s.VoterMinProfileAge {
+		return ErrForbidden
+	}
+	return nil
+}
+
 func (s *Store) CastBallot(ctx context.Context, id, user string, choices []string) error {
 	choices = unique(choices)
-	if len(choices) > 3 {
-		return ErrValidation
-	}
 	tx, e := s.db.Begin(ctx)
 	if e != nil {
 		return e
 	}
 	defer tx.Rollback(ctx)
 	var phase string
-	e = tx.QueryRow(ctx, `SELECT phase FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase)
+	var maxVotes int
+	e = tx.QueryRow(ctx, `SELECT phase,max_votes_per_user FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &maxVotes)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -717,6 +1004,14 @@ func (s *Store) CastBallot(ctx context.Context, id, user string, choices []strin
 	}
 	if phase != "voting" {
 		return ErrValidation
+	}
+	// The per-competition ceiling, which the host sets; the hard-coded 3 this
+	// replaces ignored the column entirely.
+	if len(choices) > maxVotes {
+		return ErrValidation
+	}
+	if e = s.voterEligibleTx(ctx, tx, id, user); e != nil {
+		return e
 	}
 	for _, v := range choices {
 		if v == user {
@@ -763,24 +1058,34 @@ func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string,
 	if !admin && c.CreatorID != user {
 		return c, ErrForbidden
 	}
-	next := target
-	if next == "" {
-		now := time.Now()
-		if c.Phase == "scheduled" && c.StartDate != nil && !now.Before(*c.StartDate) {
-			next = "open"
-		}
-		if c.Phase == "open" && c.Deadline != nil && now.After(*c.Deadline) {
-			next = "voting"
-		}
+	// Advance is the scheduler, not a general phase setter: the only
+	// transitions it performs are the ones the clock already implies. Every
+	// phase change that moves money has its own endpoint that moves it —
+	// draft->open escrows the prize in PublishCompetition, and ->cancelled
+	// refunds the prize and every held entry fee in CancelCompetition.
+	// Honouring a caller-supplied target let a creator open a competition
+	// whose prize was never escrowed, collect entry fees against the
+	// advertised prize, and then "cancel" it without refunding a thing.
+	next := ""
+	now := time.Now()
+	switch {
+	case c.Phase == "scheduled" && c.StartDate != nil && !now.Before(*c.StartDate):
+		next = "open"
+	case c.Phase == "open" && c.Deadline != nil && now.After(*c.Deadline):
+		next = "voting"
+	}
+	// A target is accepted only as an assertion about the transition that is
+	// already due. Asking for anything else is a request for a door this
+	// endpoint does not have.
+	if target != "" && target != next {
+		return c, ErrValidation
 	}
 	if next == "" {
 		return c, nil
 	}
-	allowed := map[string]map[string]bool{"scheduled": {"open": true, "cancelled": true}, "open": {"voting": true, "cancelled": true}, "voting": {"cancelled": true}, "draft": {"scheduled": true, "open": true, "cancelled": true}}
-	if !allowed[c.Phase][next] {
-		return c, ErrValidation
-	}
-	_, e = s.db.Exec(ctx, `UPDATE competitions SET phase=$1,updated_at=now() WHERE id=$2`, next, id)
+	// Guarded on the phase it was read at, so two concurrent calls cannot both
+	// apply the transition.
+	_, e = s.db.Exec(ctx, `UPDATE competitions SET phase=$1,updated_at=now() WHERE id=$2 AND phase=$3`, next, id, c.Phase)
 	if e != nil {
 		return c, e
 	}
@@ -800,16 +1105,26 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 	if c.Phase != "voting" && c.Phase != "settling" {
 		return c, ErrValidation
 	}
-	_, e = s.db.Exec(ctx, `UPDATE competitions SET phase='settling',settlement_claimed_at=COALESCE(settlement_claimed_at,now()) WHERE id=$1 AND phase IN ('voting','settling')`, id)
+	// Everything below — the settling claim, the payout, the results rows and
+	// the final settled phase — commits or rolls back together. Claiming the
+	// phase on its own connection used to survive a failed payout, leaving the
+	// competition in 'settling', which settle re-entered and cancel refused:
+	// the escrow was then unreachable by any code path.
+	tx, e := s.db.Begin(ctx)
 	if e != nil {
 		return c, e
 	}
-	subs, e := s.ListSubmissions(ctx, id)
+	defer tx.Rollback(ctx)
+	_, e = tx.Exec(ctx, `UPDATE competitions SET phase='settling',settlement_claimed_at=COALESCE(settlement_claimed_at,now()) WHERE id=$1 AND phase IN ('voting','settling')`, id)
+	if e != nil {
+		return c, e
+	}
+	subs, e := listSubmissions(ctx, tx, id)
 	if e != nil {
 		return c, e
 	}
 	votes := map[string]int{}
-	rows, e := s.db.Query(ctx, `SELECT submission_user_id,count(*) FROM competition_ballot_choices WHERE competition_id=$1 GROUP BY submission_user_id`, id)
+	rows, e := tx.Query(ctx, `SELECT submission_user_id,count(*) FROM competition_ballot_choices WHERE competition_id=$1 GROUP BY submission_user_id`, id)
 	if e != nil {
 		return c, e
 	}
@@ -852,14 +1167,9 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 			post = append(post, posting{account(c.CreatorID), host.String()})
 		}
 	}
-	if e = s.transfer(ctx, "escrow:release:"+id, "escrow:release", id, post); e != nil {
+	if e = s.transferTx(ctx, tx, "escrow:release:"+id, "escrow:release", id, post); e != nil {
 		return c, e
 	}
-	tx, e := s.db.Begin(ctx)
-	if e != nil {
-		return c, e
-	}
-	defer tx.Rollback(ctx)
 	_, e = tx.Exec(ctx, `DELETE FROM competition_results WHERE competition_id=$1`, id)
 	if e != nil {
 		return c, e
@@ -881,23 +1191,21 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 	if e != nil {
 		return c, e
 	}
-	// Without this commit the deferred rollback discarded the results rows and
-	// the settled phase — after the payout transfer had already committed on
-	// its own connection. Every settlement paid out and then stranded the
-	// competition in 'settling'.
 	if e = tx.Commit(ctx); e != nil {
 		return c, e
 	}
 	return s.competition(ctx, id, user)
 }
-func (s *Store) competition(ctx context.Context, id, viewer string) (Competition, error) {
+
+// competitionSelect is shared by the single-row read and the listing so the
+// two can never drift into returning different shapes of the same record.
+const competitionSelect = `SELECT id,title,description,category,tags,creator_id,creator_name,phase,start_at,deadline_at,voting_deadline_at,max_participants,participants_count,submission_count,ballot_count,prize_amount::text,entry_fee::text,fee_bps,entry_fees_held::text,COALESCE(results_digest,''),settled_at,created_at FROM competitions`
+
+func scanCompetition(row pgx.Row) (Competition, error) {
 	var x Competition
 	var uid uuid.UUID
 	var prize, fee string
-	e := s.db.QueryRow(ctx, `SELECT id,title,description,category,tags,creator_id,creator_name,phase,start_at,deadline_at,voting_deadline_at,max_participants,participants_count,submission_count,ballot_count,prize_amount::text,entry_fee::text,fee_bps,entry_fees_held::text,COALESCE(results_digest,''),settled_at FROM competitions WHERE id=$1`, id).Scan(&uid, &x.Title, &x.Description, &x.Category, &x.Tags, &x.CreatorID, &x.CreatorName, &x.Phase, &x.StartDate, &x.Deadline, &x.VotingDeadline, &x.MaxParticipants, &x.Participants, &x.SubmissionCount, &x.BallotCount, &prize, &fee, &x.FeeBps, &x.EntryFeesHeld, &x.ResultsDigest, &x.SettledAt)
-	if errors.Is(e, pgx.ErrNoRows) {
-		return x, ErrNotFound
-	}
+	e := row.Scan(&uid, &x.Title, &x.Description, &x.Category, &x.Tags, &x.CreatorID, &x.CreatorName, &x.Phase, &x.StartDate, &x.Deadline, &x.VotingDeadline, &x.MaxParticipants, &x.Participants, &x.SubmissionCount, &x.BallotCount, &prize, &fee, &x.FeeBps, &x.EntryFeesHeld, &x.ResultsDigest, &x.SettledAt, &x.createdAt)
 	if e != nil {
 		return x, e
 	}
@@ -906,6 +1214,17 @@ func (s *Store) competition(ctx context.Context, id, viewer string) (Competition
 	x.Published = x.Phase != "draft"
 	x.PrizePool = tokenAmount(prize)
 	x.EntryFee = tokenAmount(fee)
+	return x, nil
+}
+
+func (s *Store) competition(ctx context.Context, id, viewer string) (Competition, error) {
+	x, e := scanCompetition(s.db.QueryRow(ctx, competitionSelect+` WHERE id=$1`, id))
+	if errors.Is(e, pgx.ErrNoRows) {
+		return x, ErrNotFound
+	}
+	if e != nil {
+		return x, e
+	}
 	if viewer != "" {
 		_ = s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM competition_participants WHERE competition_id=$1 AND user_id=$2)`, id, viewer).Scan(&x.IsJoined)
 	}

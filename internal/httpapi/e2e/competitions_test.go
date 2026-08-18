@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Competitions and the TALE token ledger.
 //
@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -97,8 +98,42 @@ func enter(t *testing.T, uid, competitionID string) string {
 	return story["id"].(string)
 }
 
+// advance drives a competition to the phase the clock has made due. The
+// endpoint performs only time-implied transitions — the ones that move money
+// have their own endpoints — so a test that wants entries closed before the
+// deadline moves the deadline first, exactly as a host does through PATCH.
+// registerVoter makes uid eligible to cast a ballot. A ballot now requires
+// having joined the competition — registration closes when entries do — and a
+// public profile old enough that accounts minted for one contest cannot swing
+// it. Call this while the competition is still open.
+func registerVoter(t *testing.T, uid, competitionID string) {
+	t.Helper()
+	call(t, "PUT", "/v1/competitions/"+competitionID+"/join", uid, nil).
+		expect(http.StatusNoContent)
+	agedProfile(t, uid)
+}
+
+// agedProfile gives uid a public profile and backdates it past the voting age
+// gate, standing in for an account that has been on the platform a while.
+func agedProfile(t *testing.T, uid string) {
+	t.Helper()
+	call(t, "PUT", "/v1/profiles/me", uid,
+		map[string]any{"username": strings.ReplaceAll(uid, "-", "_")}).
+		expect(http.StatusCreated)
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE public_profiles SET created_at=now()-interval '30 days' WHERE user_id=$1`,
+		uid); err != nil {
+		t.Fatalf("backdate profile for %s: %v", uid, err)
+	}
+}
+
 func advance(t *testing.T, uid, competitionID, phase string) {
 	t.Helper()
+	if phase == "voting" {
+		call(t, "PATCH", "/v1/competitions/"+competitionID, uid, map[string]any{
+			"deadline": time.Now().UTC().Add(-time.Minute).Format(time.RFC3339),
+		}).expect(http.StatusOK)
+	}
 	got := call(t, "POST", "/v1/competitions/"+competitionID+"/advance", uid,
 		map[string]any{"targetPhase": phase}).expect(http.StatusOK).json()
 	if got["phase"] != phase {
@@ -322,6 +357,78 @@ func TestCompetitionDraftIsPrivateUntilPublished(t *testing.T) {
 	}
 }
 
+// A draft is the host's private working copy — an unannounced prize pool,
+// entry fee and schedule. It used to be world-readable by id, and draft ids
+// travel through URLs, screenshots and support tickets.
+func TestDraftIsNotReadableByStrangers(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	draft := newDraft(t, alice, "Secret Draft", tale(500), tale(10))
+	id := draft["id"].(string)
+
+	// 404 rather than 403: confirming the id exists is itself the leak.
+	get(t, "/v1/competitions/"+id, bob).expect(http.StatusNotFound)
+	get(t, "/v1/competitions/"+id, "").expect(http.StatusNotFound)
+	// An admin has no business reading an unannounced prize either.
+	get(t, "/v1/competitions/"+id, bob, map[string]string{"X-Admin": "true"}).
+		expect(http.StatusNotFound)
+
+	// The author still sees their own work.
+	mine := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if mine["phase"] != "draft" || mine["prizePool"].(map[string]any)["amount"] != tale(500) {
+		t.Errorf("owner read = %v", mine)
+	}
+}
+
+// The submission list maps Firebase uids to competition participation, which
+// joins straight against the public profile directory. It was the one route in
+// the subtree reachable with no credential at all.
+func TestDraftSubmissionsAreNotAnonymous(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	draftID := newDraft(t, alice, "Unlaunched", tale(10), "0")["id"].(string)
+	published := openCompetition(t, alice, "Launched", tale(10), "0")
+	grantInitial(t, bob)
+	enter(t, bob, published)
+
+	// Anonymous callers are turned away before the handler reads anything.
+	get(t, "/v1/competitions/"+draftID+"/submissions", "").expect(http.StatusUnauthorized)
+	get(t, "/v1/competitions/"+published+"/submissions", "").expect(http.StatusUnauthorized)
+
+	// Signed in is not enough for a draft nobody has announced.
+	get(t, "/v1/competitions/"+draftID+"/submissions", carol).expect(http.StatusNotFound)
+	// The host sees their own.
+	get(t, "/v1/competitions/"+draftID+"/submissions", alice).expect(http.StatusOK).list()
+
+	// A published competition's entrants stay visible to any signed-in reader,
+	// which is what the gallery needs.
+	subs := get(t, "/v1/competitions/"+published+"/submissions", carol).
+		expect(http.StatusOK).list()
+	if len(subs) != 1 || subs[0]["userId"] != bob {
+		t.Errorf("published submissions = %v", subs)
+	}
+}
+
+// Regression guard: the fix must not narrow the public reader.
+func TestPublishedCompetitionStaysPubliclyReadable(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Open to all", tale(100), "0")
+
+	anon := get(t, "/v1/competitions/"+id, "").expect(http.StatusOK).json()
+	if anon["id"] != id || anon["phase"] != "open" {
+		t.Errorf("anonymous read = %v", anon)
+	}
+	get(t, "/v1/competitions/"+id, bob).expect(http.StatusOK)
+
+	// And the listing keeps excluding drafts while including this one.
+	grantInitial(t, alice)
+	newDraft(t, alice, "Still hidden", tale(1), "0")
+	listed := get(t, "/v1/competitions", "").expect(http.StatusOK).list()
+	if len(listed) != 1 || listed[0]["id"] != id {
+		t.Errorf("public listing = %v", listed)
+	}
+}
+
 func TestCompetitionDraftValidation(t *testing.T) {
 	reset(t)
 
@@ -478,7 +585,7 @@ func TestCompetitionSubmitRequiresJoinAndStoryOwnership(t *testing.T) {
 	call(t, "POST", submit, bob, map[string]any{"storyId": bobStory["id"]}).
 		expect(http.StatusConflict)
 
-	subs := get(t, "/v1/competitions/"+id+"/submissions", "").expect(http.StatusOK).list()
+	subs := get(t, "/v1/competitions/"+id+"/submissions", alice).expect(http.StatusOK).list()
 	if len(subs) != 1 {
 		t.Fatalf("expected 1 submission, got %d", len(subs))
 	}
@@ -529,7 +636,7 @@ func TestCompetitionEntryFeeIsEscrowedAndRefundedOnWithdraw(t *testing.T) {
 	if after["submissionCount"].(float64) != 0 {
 		t.Errorf("submissionCount after withdraw = %v, want 0", after["submissionCount"])
 	}
-	if subs := get(t, "/v1/competitions/"+id+"/submissions", "").expect(http.StatusOK).list(); len(subs) != 0 {
+	if subs := get(t, "/v1/competitions/"+id+"/submissions", alice).expect(http.StatusOK).list(); len(subs) != 0 {
 		t.Errorf("withdrawn submission still listed: %v", subs)
 	}
 	assertLedgerIntact(t)
@@ -579,6 +686,10 @@ func TestCompetitionBallotRules(t *testing.T) {
 	grantInitial(t, bob, carol, dave)
 	enter(t, bob, id)
 	enter(t, carol, id)
+	registerVoter(t, dave, id)
+	// Entrants joined when they entered; they still need standing to vote.
+	agedProfile(t, bob)
+	agedProfile(t, carol)
 
 	ballot := "/v1/competitions/" + id + "/ballots/me"
 
@@ -627,6 +738,86 @@ func TestCompetitionBallotRules(t *testing.T) {
 	}
 }
 
+// A ballot decides a winner-take-all prize, and it used to require nothing
+// but an authenticated uid — so a slate of throwaway accounts, free and
+// unverified to create, could hand their owner any competition on the
+// platform. Eligibility now costs something: registration that closes with
+// entries, and a profile older than the contest.
+func TestBallotRequiresParticipation(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Eligibility", tale(100), "0")
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	registerVoter(t, dave, id)
+	// carol has standing but never joined; a stranger is exactly the account a
+	// sybil slate is made of.
+	agedProfile(t, carol)
+	advance(t, alice, id, "voting")
+
+	ballot := "/v1/competitions/" + id + "/ballots/me"
+	call(t, "PUT", ballot, carol, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusForbidden)
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusNoContent)
+
+	after := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if after["ballotCount"].(float64) != 1 {
+		t.Errorf("ballotCount = %v, want only the eligible voter", after["ballotCount"])
+	}
+}
+
+func TestBallotRequiresAnEstablishedProfile(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Standing", tale(100), "0")
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	// Both joined; neither has standing yet.
+	call(t, "PUT", "/v1/competitions/"+id+"/join", carol, nil).expect(http.StatusNoContent)
+	call(t, "PUT", "/v1/competitions/"+id+"/join", dave, nil).expect(http.StatusNoContent)
+	call(t, "PUT", "/v1/profiles/me", dave,
+		map[string]any{"username": "user_dave"}).expect(http.StatusCreated)
+	advance(t, alice, id, "voting")
+
+	ballot := "/v1/competitions/" + id + "/ballots/me"
+	// No profile at all.
+	call(t, "PUT", ballot, carol, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusForbidden)
+	// A profile created minutes ago is what a sybil slate has; the age gate is
+	// what it cannot fake.
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusForbidden)
+
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE public_profiles SET created_at=now()-interval '30 days' WHERE user_id=$1`,
+		dave); err != nil {
+		t.Fatal(err)
+	}
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusNoContent)
+}
+
+// The per-competition ceiling lived in the schema and was ignored by a
+// hard-coded 3.
+func TestBallotHonorsMaxVotesPerUser(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "One vote each", tale(100), "0")
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	enter(t, carol, id)
+	registerVoter(t, dave, id)
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE competitions SET max_votes_per_user=1 WHERE id=$1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+	advance(t, alice, id, "voting")
+
+	ballot := "/v1/competitions/" + id + "/ballots/me"
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob, carol}}).
+		expect(http.StatusUnprocessableEntity)
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusNoContent)
+}
+
 // ── settlement ──────────────────────────────────────────────────────────────
 
 func TestCompetitionSettlementPaysWinnerAndHost(t *testing.T) {
@@ -635,6 +826,7 @@ func TestCompetitionSettlementPaysWinnerAndHost(t *testing.T) {
 	grantInitial(t, bob, carol, dave)
 	enter(t, bob, id)
 	enter(t, carol, id)
+	registerVoter(t, dave, id)
 	advance(t, alice, id, "voting")
 
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
@@ -679,6 +871,7 @@ func TestCompetitionSettlementIsIdempotent(t *testing.T) {
 	id := openCompetition(t, alice, "Twice settled", tale(100), tale(10))
 	grantInitial(t, bob, dave)
 	enter(t, bob, id)
+	registerVoter(t, dave, id)
 	advance(t, alice, id, "voting")
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
@@ -734,6 +927,136 @@ func TestCompetitionSettlementRefusedBeforeVoting(t *testing.T) {
 	assertBalance(t, escrowAccount(id), tale(100))
 }
 
+// Settlement builds one ledger transfer, and ledger_postings is keyed
+// (transfer_key, account_id). The two scenarios below are the ones where the
+// same account is credited twice in that transfer — the returned prize plus
+// the host's cut of the entry fees. Before the postings were merged, both
+// aborted the transfer on a duplicate-key violation, after the phase had
+// already been committed as "settling" on a separate connection: settle then
+// re-entered the same failure forever and cancel refused the phase outright,
+// so the escrow was unreachable by any code path.
+func TestCompetitionSettlementWithFeesAndNoWinnerPaysTheHostOnce(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Fees, nobody voted", tale(100), tale(10))
+	grantInitial(t, bob, carol)
+	enter(t, bob, id)
+	enter(t, carol, id)
+	advance(t, alice, id, "voting")
+
+	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusOK).json()
+	if settled["phase"] != "settled" {
+		t.Fatalf("phase = %v, want settled", settled["phase"])
+	}
+
+	// No winner, so the 100 prize returns to alice; 20 in fees splits 2 to the
+	// treasury and 18 to alice as host. Both credits land on one account and
+	// must post as a single net line of 118.
+	assertBalance(t, userAccount(alice), tale(initialGrantTale-100+100+18))
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
+	assertBalance(t, userAccount(carol), tale(initialGrantTale-10))
+	assertBalance(t, platformAccount(), tale(2))
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+}
+
+func TestCompetitionSettlementWhenTheHostsOwnEntryWins(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Host wins", tale(100), tale(10))
+	grantInitial(t, bob, dave)
+	enter(t, alice, id)
+	enter(t, bob, id)
+	registerVoter(t, dave, id)
+	advance(t, alice, id, "voting")
+	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
+		map[string]any{"submissionIds": []string{alice}}).expect(http.StatusNoContent)
+
+	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
+
+	// alice escrowed 100 and paid a 10 entry fee, then took the 100 prize and
+	// 18 of the 20 in fees.
+	assertBalance(t, userAccount(alice), tale(initialGrantTale-100-10+100+18))
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
+	assertBalance(t, platformAccount(), tale(2))
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+}
+
+// A settlement that cannot pay out must leave nothing behind. The phase claim
+// used to commit on its own connection, so a failure here stranded the
+// competition in "settling"; now the claim, the payout and the results share
+// one transaction and roll back together.
+func TestFailedSettlementLeavesTheCompetitionRetryable(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Payout fails", tale(100), "0")
+	grantInitial(t, bob, dave)
+	enter(t, bob, id)
+	registerVoter(t, dave, id)
+	advance(t, alice, id, "voting")
+	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
+		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
+
+	// Empty the escrow behind the API's back so the payout hits the
+	// insufficient-funds guard inside the transfer.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE token_accounts SET balance=0 WHERE account_id=$1`, escrowAccount(id)); err != nil {
+		t.Fatal(err)
+	}
+	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusUnprocessableEntity)
+
+	after := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if after["phase"] != "voting" {
+		t.Fatalf("a failed settlement left phase %v, want voting", after["phase"])
+	}
+	var transfers int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM ledger_transfers WHERE idempotency_key=$1`,
+		"escrow:release:"+id).Scan(&transfers); err != nil {
+		t.Fatal(err)
+	}
+	if transfers != 0 {
+		t.Errorf("a failed settlement recorded %d payout transfers", transfers)
+	}
+
+	// Put the escrow back and the same call now succeeds.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE token_accounts SET balance=$2::numeric WHERE account_id=$1`,
+		escrowAccount(id), tale(100)); err != nil {
+		t.Fatal(err)
+	}
+	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusOK).json()
+	if settled["phase"] != "settled" {
+		t.Errorf("retried settlement left phase %v", settled["phase"])
+	}
+	assertBalance(t, escrowAccount(id), "0")
+}
+
+// Rows the old code already stranded in "settling" are reset to "voting" by
+// migration 000014 when no payout committed. Settle must also finish one that
+// arrives in that phase directly, which is what the migration relies on for
+// the rows it deliberately leaves alone.
+func TestSettlementResumesFromTheSettlingPhase(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Stranded", tale(100), tale(10))
+	grantInitial(t, bob)
+	enter(t, bob, id)
+	advance(t, alice, id, "voting")
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE competitions SET phase='settling' WHERE id=$1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusOK).json()
+	if settled["phase"] != "settled" {
+		t.Fatalf("phase = %v, want settled", settled["phase"])
+	}
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+}
+
 // ── cancellation ────────────────────────────────────────────────────────────
 
 func TestCompetitionCancelRefundsPrizeAndEveryEntryFee(t *testing.T) {
@@ -777,6 +1100,7 @@ func TestCompetitionCancelIsIdempotentAndBlockedAfterSettlement(t *testing.T) {
 	other := openCompetition(t, alice, "Already settled", tale(50), "0")
 	grantInitial(t, carol, dave)
 	enter(t, carol, other)
+	registerVoter(t, dave, other)
 	advance(t, alice, other, "voting")
 	call(t, "PUT", "/v1/competitions/"+other+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{carol}}).expect(http.StatusNoContent)
@@ -793,6 +1117,132 @@ func TestCompetitionCancelIsCreatorOrAdminOnly(t *testing.T) {
 	call(t, "POST", "/v1/competitions/"+id+"/cancel", bob,
 		map[string]any{"reason": "mine now"}).expect(http.StatusForbidden)
 	assertBalance(t, escrowAccount(id), tale(100))
+}
+
+// ── listing ─────────────────────────────────────────────────────────────────
+
+// GET /v1/competitions is anonymous and was unpaginated: it selected every
+// non-draft competition and then issued one to three more queries per row. A
+// handful of concurrent callers could hold every connection in a ten-slot pool
+// and take the whole API down, writes included.
+func TestPublicCompetitionsIsPaginatedAndConstantQueryCount(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	// Stays under the per-day draft budget, which is itself part of this fix.
+	const total = 8
+	for i := 0; i < total; i++ {
+		openCompetition(t, alice, fmt.Sprintf("Contest %d", i), tale(1), "0")
+	}
+
+	// A small page and a large one cost the same number of round trips.
+	resetQueryCount()
+	small := get(t, "/v1/competitions?limit=2", "").expect(http.StatusOK)
+	smallQueries := queryCount()
+	if len(small.list()) != 2 {
+		t.Fatalf("limit=2 returned %d competitions", len(small.list()))
+	}
+
+	resetQueryCount()
+	big := get(t, "/v1/competitions?limit=100", "").expect(http.StatusOK)
+	bigQueries := queryCount()
+	if len(big.list()) != total {
+		t.Fatalf("limit=100 returned %d competitions, want %d", len(big.list()), total)
+	}
+	if bigQueries != smallQueries {
+		t.Errorf("query count grew with page size: %d for 2 rows, %d for %d rows",
+			smallQueries, bigQueries, total)
+	}
+	if bigQueries > 4 {
+		t.Errorf("a listing took %d queries; it should be a constant handful", bigQueries)
+	}
+
+	// Paging walks the whole set exactly once.
+	seen := map[string]bool{}
+	cursor := ""
+	for pages := 0; pages < total+1; pages++ {
+		path := "/v1/competitions?limit=3"
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		res := get(t, path, "").expect(http.StatusOK)
+		for _, row := range res.list() {
+			id := row["id"].(string)
+			if seen[id] {
+				t.Fatalf("competition %s appeared on two pages", id)
+			}
+			seen[id] = true
+		}
+		if cursor = res.Header.Get("X-Next-Cursor"); cursor == "" {
+			break
+		}
+	}
+	if len(seen) != total {
+		t.Errorf("paging saw %d of %d competitions", len(seen), total)
+	}
+
+	// The default page is bounded even with no limit given, and a malformed
+	// cursor is a client error rather than a 500.
+	if n := len(get(t, "/v1/competitions", "").expect(http.StatusOK).list()); n != total {
+		t.Errorf("default page returned %d competitions", n)
+	}
+	get(t, "/v1/competitions?limit=0", "").expect(http.StatusBadRequest)
+	get(t, "/v1/competitions?limit=abc", "").expect(http.StatusBadRequest)
+	get(t, "/v1/competitions?cursor=not-a-cursor", "").expect(http.StatusUnprocessableEntity)
+}
+
+// Paging must not drop the per-row fields the single-competition read returns,
+// or the listing quietly becomes a different resource.
+func TestCompetitionListingKeepsJoinedAndResults(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Listed", tale(100), "0")
+	grantInitial(t, bob, dave)
+	enter(t, bob, id)
+	registerVoter(t, dave, id)
+	advance(t, alice, id, "voting")
+	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
+		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
+	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
+
+	listed := get(t, "/v1/competitions", bob).expect(http.StatusOK).list()
+	if len(listed) != 1 {
+		t.Fatalf("expected 1 competition, got %d", len(listed))
+	}
+	row := listed[0]
+	if row["isJoined"] != true {
+		t.Errorf("isJoined = %v for an entrant", row["isJoined"])
+	}
+	results, ok := row["results"].([]any)
+	if !ok || len(results) != 1 {
+		t.Fatalf("settled competition listed without its results: %v", row["results"])
+	}
+	if results[0].(map[string]any)["userId"] != bob {
+		t.Errorf("winner row = %v", results[0])
+	}
+	// A different viewer sees the same record with their own membership.
+	other := get(t, "/v1/competitions", carol).expect(http.StatusOK).list()[0]
+	if other["isJoined"] != false {
+		t.Errorf("isJoined = %v for a non-entrant", other["isJoined"])
+	}
+}
+
+// Creating drafts is metered per day; editing one is not.
+func TestCompetitionDraftsAreRateLimited(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	var last string
+	for i := 0; i < 10; i++ {
+		last = newDraft(t, alice, fmt.Sprintf("Draft %d", i), tale(1), "0")["id"].(string)
+	}
+	call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
+		"title": "One too many", "description": "d", "category": "flash-fiction",
+		"tags": []string{"x"}, "prizeAmount": tale(1), "creatorName": "Alice",
+	}).expect(http.StatusTooManyRequests)
+
+	// Revising an existing draft still works — the budget is on creation.
+	call(t, "POST", "/v1/competition-drafts?competitionId="+last, alice, map[string]any{
+		"title": "Revised", "description": "d", "category": "flash-fiction",
+		"tags": []string{"x"}, "prizeAmount": tale(1), "creatorName": "Alice",
+	}).expect(http.StatusCreated)
 }
 
 // ── phase machine and routing ───────────────────────────────────────────────
@@ -814,6 +1264,138 @@ func TestCompetitionAdvanceRejectsIllegalTransitions(t *testing.T) {
 
 	call(t, "POST", "/v1/competitions/"+id+"/advance", bob,
 		map[string]any{"targetPhase": "cancelled"}).expect(http.StatusForbidden)
+}
+
+// /advance used to apply any phase the caller named, which gave every
+// money-moving transition a second door with no money logic behind it. A
+// draft could be opened without escrowing the prize and an open competition
+// "cancelled" without refunding the entry fees it had collected.
+func TestAdvanceCannotOpenAnUnfundedDraft(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	draft := newDraft(t, alice, "Never funded", tale(500), tale(10))
+	id := draft["id"].(string)
+
+	call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{"targetPhase": "open"}).expect(http.StatusUnprocessableEntity)
+
+	still := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if still["phase"] != "draft" {
+		t.Fatalf("phase = %v, want draft", still["phase"])
+	}
+	// The prize was never escrowed, which is precisely why the competition
+	// must not be reachable by entrants.
+	assertBalance(t, userAccount(alice), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), "0")
+
+	// Publishing is the door that funds it.
+	call(t, "POST", "/v1/competition-publish", alice,
+		map[string]any{"competitionId": id}).expect(http.StatusOK)
+	assertBalance(t, escrowAccount(id), tale(500))
+	assertLedgerIntact(t)
+}
+
+func TestAdvanceCannotCancel(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "No silent cancel", tale(100), tale(10))
+	grantInitial(t, bob)
+	enter(t, bob, id)
+
+	call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{"targetPhase": "cancelled"}).expect(http.StatusUnprocessableEntity)
+
+	open := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if open["phase"] != "open" {
+		t.Fatalf("phase = %v, want open", open["phase"])
+	}
+	assertBalance(t, escrowAccount(id), tale(110))
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
+
+	// The real cancel endpoint refunds, which is the whole reason /advance
+	// must not be able to reach the phase.
+	call(t, "POST", "/v1/competitions/"+id+"/cancel", alice,
+		map[string]any{"reason": "changed my mind"}).expect(http.StatusOK)
+	assertBalance(t, userAccount(bob), tale(initialGrantTale))
+	assertBalance(t, userAccount(alice), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+}
+
+// Only the clock decides. A target is accepted as an assertion about the
+// transition already due, and rejected otherwise.
+func TestAdvanceOnlyFollowsTheClock(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	now := time.Now().UTC()
+	draft := call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
+		"title": "Opens later", "description": "d", "category": "flash-fiction",
+		"tags":        []string{"x"},
+		"startDate":   now.Add(time.Hour).Format(time.RFC3339),
+		"deadline":    now.Add(2 * time.Hour).Format(time.RFC3339),
+		"prizeAmount": tale(10), "creatorName": "Alice",
+		"votingDeadline": now.Add(3 * time.Hour).Format(time.RFC3339),
+	}).expect(http.StatusCreated).json()
+	id := draft["id"].(string)
+	published := call(t, "POST", "/v1/competition-publish", alice,
+		map[string]any{"competitionId": id}).expect(http.StatusOK).json()
+	if published["phase"] != "scheduled" {
+		t.Fatalf("a future start should publish as scheduled, got %v", published["phase"])
+	}
+
+	// Nothing is due yet: an empty target is a no-op, a named one is refused.
+	idle := call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{}).expect(http.StatusOK).json()
+	if idle["phase"] != "scheduled" {
+		t.Errorf("advance moved a competition whose start has not arrived: %v", idle["phase"])
+	}
+	call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{"targetPhase": "open"}).expect(http.StatusUnprocessableEntity)
+
+	// Bringing the start forward is a host action with its own endpoint; once
+	// it is in the past the same advance call performs the transition.
+	call(t, "PATCH", "/v1/competitions/"+id, alice, map[string]any{
+		"startDate": now.Add(-time.Minute).Format(time.RFC3339),
+	}).expect(http.StatusOK)
+	opened := call(t, "POST", "/v1/competitions/"+id+"/advance", alice,
+		map[string]any{"targetPhase": "open"}).expect(http.StatusOK).json()
+	if opened["phase"] != "open" {
+		t.Fatalf("phase = %v, want open", opened["phase"])
+	}
+}
+
+// Defence in depth: even if a competition were opened without its prize in
+// escrow, it must not be able to take an entry fee it could never pay out
+// against.
+func TestSubmitRejectsUnfundedCompetition(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Escrow drained", tale(100), tale(10))
+	grantInitial(t, bob)
+	// Empty the escrow behind the API's back to stand in for a competition
+	// that reached "open" without being funded.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE token_accounts SET balance=0 WHERE account_id=$1`, escrowAccount(id)); err != nil {
+		t.Fatal(err)
+	}
+
+	story := newStory(t, bob, "bob's entry")
+	call(t, "PUT", "/v1/competitions/"+id+"/join", bob, nil).expect(http.StatusNoContent)
+	call(t, "POST", "/v1/competitions/"+id+"/submissions/me", bob,
+		map[string]any{"storyId": story["id"]}).expect(http.StatusUnprocessableEntity)
+
+	// The rejection must be complete: no fee taken, no submission recorded.
+	assertBalance(t, userAccount(bob), tale(initialGrantTale))
+	if subs := get(t, "/v1/competitions/"+id+"/submissions", bob).
+		expect(http.StatusOK).list(); len(subs) != 0 {
+		t.Errorf("a rejected submission was recorded: %d entries", len(subs))
+	}
+	// Undo the injected corruption before the invariant check, which would
+	// otherwise flag the escrow this test emptied by hand.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE token_accounts SET balance=$2::numeric WHERE account_id=$1`,
+		escrowAccount(id), tale(100)); err != nil {
+		t.Fatal(err)
+	}
+	assertLedgerIntact(t)
 }
 
 func TestCompetitionDiscardDraft(t *testing.T) {
@@ -847,6 +1429,9 @@ func TestCompetitionUnknownAndMalformedIDs(t *testing.T) {
 	// Empty collections serialize as [], never null.
 	get(t, "/v1/competitions", alice).expect(http.StatusOK).list()
 	get(t, "/v1/me/competitions/drafts", alice).expect(http.StatusOK).list()
+	// A submission list for an id that does not exist is a 404, not an empty
+	// array: the list is gated on being able to read the competition, so it
+	// cannot answer for one that is not there.
 	get(t, "/v1/competitions/11111111-1111-1111-1111-111111111111/submissions", alice).
-		expect(http.StatusOK).list()
+		expect(http.StatusNotFound)
 }

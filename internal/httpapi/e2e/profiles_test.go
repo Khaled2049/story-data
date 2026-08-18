@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Public profiles and the follow graph.
 //

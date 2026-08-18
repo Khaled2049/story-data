@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 // Worldbuilding: characters, places, plot lines and plot events.
 //

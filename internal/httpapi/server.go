@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kh1011/novelsync-story-data/internal/auth"
 	"github.com/kh1011/novelsync-story-data/internal/store"
@@ -17,10 +19,27 @@ type Server struct {
 	store   *store.Store
 	auth    *auth.Verifier
 	origins map[string]bool
+	limiter *limiter
+	// viewSalt keys the hash that stands in for an anonymous reader's address
+	// in the view-dedup table. Generated per process: the table must be able
+	// to tell two readers apart today without holding anything that could
+	// identify either of them later.
+	viewSalt []byte
 }
 
-func New(s *store.Store, a *auth.Verifier, origins []string) http.Handler {
-	x := &Server{store: s, auth: a, origins: make(map[string]bool, len(origins))}
+// New builds the router. rl bounds how fast one caller may hit the service; a
+// zeroed RateLimit disables the middleware, which is what tests and local
+// stacks want and no deployment should.
+func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.Handler {
+	x := &Server{store: s, auth: a, origins: make(map[string]bool, len(origins)), viewSalt: make([]byte, 32)}
+	if _, err := rand.Read(x.viewSalt); err != nil {
+		// A predictable salt would let anyone precompute the key for an
+		// address and poison another reader's dedup row.
+		panic("story-data: cannot read random bytes for the view salt: " + err.Error())
+	}
+	if !rl.Disabled() {
+		x.limiter = newLimiter(rl)
+	}
 	for _, o := range origins {
 		x.origins[o] = true
 	}
@@ -48,7 +67,12 @@ func New(s *store.Store, a *auth.Verifier, origins []string) http.Handler {
 	m.HandleFunc("/v1/profiles/", x.profileAction)
 	m.HandleFunc("/v1/stories", x.stories)
 	m.HandleFunc("/v1/stories/", x.story)
-	return x.withCORS(x.withJSON(m))
+	// Logging is outermost so that a request rejected by the rate limiter is
+	// logged too — during an attack those rejections are the signal. Rate
+	// limiting then sits inside CORS, so a throttled caller still gets the
+	// headers their browser needs to read the 429, and outside everything
+	// else, so a throttled request costs no database work.
+	return x.withLogging(x.withCORS(x.withRateLimit(x.withJSON(m))))
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
@@ -340,6 +364,7 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) (string, bool) {
 		writeError(w, http.StatusUnauthorized, e.Error())
 		return "", false
 	}
+	logUser(w, uid)
 	return uid, true
 }
 func (s *Server) withJSON(next http.Handler) http.Handler {
@@ -388,8 +413,40 @@ func respond(w http.ResponseWriter, v any, e error) {
 	case errors.Is(e, store.ErrValidation):
 		writeError(w, http.StatusUnprocessableEntity, e.Error())
 	default:
+		if status, msg, ok := translatePgError(e); ok {
+			writeError(w, status, msg)
+			return
+		}
+		// The client message stays generic; the detail goes to the log, which
+		// is the only place it belongs.
+		logError(w, e)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
+}
+
+// translatePgError turns the constraint violations that a bad request can
+// provoke into the 4xx they are. A validator in internal/store should catch
+// each of these first — this is the backstop for the one that gets missed, and
+// it matters because an attacker-triggerable 500 poisons the error rate that
+// is the natural alert for a real outage.
+func translatePgError(e error) (int, string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(e, &pgErr) {
+		return 0, "", false
+	}
+	switch pgErr.Code {
+	case "23514", "23502", "22P02", "22001", "22003":
+		// check_violation, not_null_violation, invalid_text_representation,
+		// string_data_right_truncation, numeric_value_out_of_range.
+		return http.StatusUnprocessableEntity, "invalid input", true
+	case "23503":
+		// foreign_key_violation: the row this one points at is not there.
+		return http.StatusNotFound, "not found", true
+	case "23505":
+		// unique_violation that no store method claimed as its own conflict.
+		return http.StatusConflict, "already exists", true
+	}
+	return 0, "", false
 }
 func write(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)

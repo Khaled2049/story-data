@@ -1,4 +1,4 @@
-package httpapi_test
+package e2e
 
 import (
 	"net/http"
@@ -15,7 +15,7 @@ const allowedOrigin = "https://thetaletribe.com"
 
 func corsServer(t *testing.T, origins ...string) *httptest.Server {
 	t.Helper()
-	s := httptest.NewServer(httpapi.New(store.New(testPool), auth.New("dev", "", testServiceToken), origins))
+	s := httptest.NewServer(httpapi.New(store.New(testPool), auth.New("dev", "", testServiceToken), origins, httpapi.RateLimit{}))
 	t.Cleanup(s.Close)
 	return s
 }
