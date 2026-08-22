@@ -15,28 +15,34 @@ const profileBatchLimit = 50
 
 // PublicProfile is safe to expose to anonymous readers.
 type PublicProfile struct {
-	UserID          string    `json:"userId"`
-	Username        string    `json:"username"`
-	PhotoURL        string    `json:"photoUrl,omitempty"`
-	Bio             string    `json:"bio,omitempty"`
-	Occupation      string    `json:"occupation,omitempty"`
-	Location        string    `json:"location,omitempty"`
-	WalletAddress   string    `json:"walletAddress,omitempty"`
-	GuestbookPolicy string    `json:"guestbookPolicy"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	UserID           string    `json:"userId"`
+	Username         string    `json:"username"`
+	PhotoURL         string    `json:"photoUrl,omitempty"`
+	FirstName        string    `json:"firstName,omitempty"`
+	LastName         string    `json:"lastName,omitempty"`
+	Bio              string    `json:"bio,omitempty"`
+	Occupation       string    `json:"occupation,omitempty"`
+	Location         string    `json:"location,omitempty"`
+	WritingInterests string    `json:"writingInterests,omitempty"`
+	WalletAddress    string    `json:"walletAddress,omitempty"`
+	GuestbookPolicy  string    `json:"guestbookPolicy"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 // ProfileInput uses pointers so PATCH can distinguish omitted fields from
 // intentional empty-string clears.
 type ProfileInput struct {
-	Username        *string `json:"username,omitempty"`
-	PhotoURL        *string `json:"photoUrl,omitempty"`
-	Bio             *string `json:"bio,omitempty"`
-	Occupation      *string `json:"occupation,omitempty"`
-	Location        *string `json:"location,omitempty"`
-	WalletAddress   *string `json:"walletAddress,omitempty"`
-	GuestbookPolicy *string `json:"guestbookPolicy,omitempty"`
+	Username         *string `json:"username,omitempty"`
+	PhotoURL         *string `json:"photoUrl,omitempty"`
+	FirstName        *string `json:"firstName,omitempty"`
+	LastName         *string `json:"lastName,omitempty"`
+	Bio              *string `json:"bio,omitempty"`
+	Occupation       *string `json:"occupation,omitempty"`
+	Location         *string `json:"location,omitempty"`
+	WritingInterests *string `json:"writingInterests,omitempty"`
+	WalletAddress    *string `json:"walletAddress,omitempty"`
+	GuestbookPolicy  *string `json:"guestbookPolicy,omitempty"`
 }
 
 func (s *Store) GetPublicProfile(ctx context.Context, userID string) (PublicProfile, error) {
@@ -112,7 +118,7 @@ func (s *Store) UpsertPublicProfile(ctx context.Context, userID string, in Profi
 	if !ok {
 		return PublicProfile{}, ErrValidation
 	}
-	photo, bio, occupation, location, wallet, policy := value(in.PhotoURL), value(in.Bio), value(in.Occupation), value(in.Location), value(in.WalletAddress), value(in.GuestbookPolicy)
+	photo, firstName, lastName, bio, occupation, location, writingInterests, wallet, policy := value(in.PhotoURL), value(in.FirstName), value(in.LastName), value(in.Bio), value(in.Occupation), value(in.Location), value(in.WritingInterests), value(in.WalletAddress), value(in.GuestbookPolicy)
 	if policy == "" {
 		policy = "everyone"
 	}
@@ -124,16 +130,18 @@ func (s *Store) UpsertPublicProfile(ctx context.Context, userID string, in Profi
 	if !validURL(photo) {
 		return PublicProfile{}, ErrValidation
 	}
-	if !validProfileText(bio, 300) || !validProfileText(occupation, 50) || !validProfileText(location, 50) {
+	if !validProfileText(firstName, 50) || !validProfileText(lastName, 50) ||
+		!validProfileText(bio, 300) || !validProfileText(occupation, 50) || !validProfileText(location, 50) ||
+		!validProfileText(writingInterests, 200) {
 		return PublicProfile{}, ErrValidation
 	}
 	wallet, ok = normalizeWallet(wallet)
 	if !ok {
 		return PublicProfile{}, ErrValidation
 	}
-	x, err := scanPublicProfile(s.db.QueryRow(ctx, `INSERT INTO public_profiles (user_id, username, username_lower, photo_url, bio, occupation, location, wallet_address, guestbook_policy)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username, username_lower=EXCLUDED.username_lower, photo_url=EXCLUDED.photo_url, bio=EXCLUDED.bio, occupation=EXCLUDED.occupation, location=EXCLUDED.location, wallet_address=EXCLUDED.wallet_address, guestbook_policy=EXCLUDED.guestbook_policy, updated_at=now()
-RETURNING user_id, username, photo_url, bio, occupation, location, COALESCE(wallet_address,''), guestbook_policy, created_at, updated_at`, userID, username, strings.ToLower(username), photo, bio, occupation, location, emptyToNull(wallet), policy))
+	x, err := scanPublicProfile(s.db.QueryRow(ctx, `INSERT INTO public_profiles (user_id, username, username_lower, photo_url, first_name, last_name, bio, occupation, location, writing_interests, wallet_address, guestbook_policy)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username, username_lower=EXCLUDED.username_lower, photo_url=EXCLUDED.photo_url, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name, bio=EXCLUDED.bio, occupation=EXCLUDED.occupation, location=EXCLUDED.location, writing_interests=EXCLUDED.writing_interests, wallet_address=EXCLUDED.wallet_address, guestbook_policy=EXCLUDED.guestbook_policy, updated_at=now()
+RETURNING user_id, username, photo_url, first_name, last_name, bio, occupation, location, writing_interests, COALESCE(wallet_address,''), guestbook_policy, created_at, updated_at`, userID, username, strings.ToLower(username), photo, firstName, lastName, bio, occupation, location, writingInterests, emptyToNull(wallet), policy))
 	if isUniqueViolation(err) {
 		return PublicProfile{}, ErrUsernameTaken
 	}
@@ -145,12 +153,18 @@ func (s *Store) PatchPublicProfile(ctx context.Context, userID string, in Profil
 	if err != nil {
 		return PublicProfile{}, err
 	}
-	username, photo, bio, occupation, location, wallet, policy := current.Username, current.PhotoURL, current.Bio, current.Occupation, current.Location, current.WalletAddress, current.GuestbookPolicy
+	username, photo, firstName, lastName, bio, occupation, location, writingInterests, wallet, policy := current.Username, current.PhotoURL, current.FirstName, current.LastName, current.Bio, current.Occupation, current.Location, current.WritingInterests, current.WalletAddress, current.GuestbookPolicy
 	if in.Username != nil {
 		username = *in.Username
 	}
 	if in.PhotoURL != nil {
 		photo = *in.PhotoURL
+	}
+	if in.FirstName != nil {
+		firstName = *in.FirstName
+	}
+	if in.LastName != nil {
+		lastName = *in.LastName
 	}
 	if in.Bio != nil {
 		bio = *in.Bio
@@ -161,20 +175,23 @@ func (s *Store) PatchPublicProfile(ctx context.Context, userID string, in Profil
 	if in.Location != nil {
 		location = *in.Location
 	}
+	if in.WritingInterests != nil {
+		writingInterests = *in.WritingInterests
+	}
 	if in.WalletAddress != nil {
 		wallet = *in.WalletAddress
 	}
 	if in.GuestbookPolicy != nil {
 		policy = *in.GuestbookPolicy
 	}
-	return s.UpsertPublicProfile(ctx, userID, ProfileInput{Username: &username, PhotoURL: &photo, Bio: &bio, Occupation: &occupation, Location: &location, WalletAddress: &wallet, GuestbookPolicy: &policy})
+	return s.UpsertPublicProfile(ctx, userID, ProfileInput{Username: &username, PhotoURL: &photo, FirstName: &firstName, LastName: &lastName, Bio: &bio, Occupation: &occupation, Location: &location, WritingInterests: &writingInterests, WalletAddress: &wallet, GuestbookPolicy: &policy})
 }
 
-const profileSelect = `SELECT user_id, username, photo_url, bio, occupation, location, COALESCE(wallet_address,''), guestbook_policy, created_at, updated_at FROM public_profiles`
+const profileSelect = `SELECT user_id, username, photo_url, first_name, last_name, bio, occupation, location, writing_interests, COALESCE(wallet_address,''), guestbook_policy, created_at, updated_at FROM public_profiles`
 
 func scanPublicProfile(row pgx.Row) (PublicProfile, error) {
 	var x PublicProfile
-	err := row.Scan(&x.UserID, &x.Username, &x.PhotoURL, &x.Bio, &x.Occupation, &x.Location, &x.WalletAddress, &x.GuestbookPolicy, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&x.UserID, &x.Username, &x.PhotoURL, &x.FirstName, &x.LastName, &x.Bio, &x.Occupation, &x.Location, &x.WritingInterests, &x.WalletAddress, &x.GuestbookPolicy, &x.CreatedAt, &x.UpdatedAt)
 	return x, err
 }
 func value(v *string) string {

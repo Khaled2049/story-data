@@ -28,10 +28,17 @@ func TestProfileCreateAndRead(t *testing.T) {
 	created := putProfile(t, alice, map[string]any{
 		"username": "alice_v", "bio": "Writes at night.", "occupation": "Cartographer",
 		"location": "Lisbon", "photoUrl": "https://example.test/a.png",
+		"firstName": "Alice", "lastName": "Vale", "writingInterests": "Slow-burn sci-fi.",
 	}).expect(http.StatusCreated).json()
 
 	if created["username"] != "alice_v" || created["userId"] != alice {
 		t.Errorf("profile = %v", created)
+	}
+	if created["firstName"] != "Alice" || created["lastName"] != "Vale" {
+		t.Errorf("name = %v %v", created["firstName"], created["lastName"])
+	}
+	if created["writingInterests"] != "Slow-burn sci-fi." {
+		t.Errorf("writingInterests = %v", created["writingInterests"])
 	}
 	// A policy the caller did not set defaults to the open wall, so accounts
 	// that predate the setting keep the behaviour they had.
@@ -43,6 +50,9 @@ func TestProfileCreateAndRead(t *testing.T) {
 	public := get(t, profileOf(alice), "").expect(http.StatusOK).json()
 	if public["bio"] != "Writes at night." {
 		t.Errorf("bio = %v", public["bio"])
+	}
+	if public["firstName"] != "Alice" || public["lastName"] != "Vale" || public["writingInterests"] != "Slow-burn sci-fi." {
+		t.Errorf("public profile did not expose name/writingInterests: %v", public)
 	}
 
 	mine := get(t, "/v1/profiles/me", alice).expect(http.StatusOK).json()
@@ -161,6 +171,15 @@ func TestProfileFieldLimitsAndPolicy(t *testing.T) {
 	}).expect(http.StatusUnprocessableEntity)
 	putProfile(t, alice, map[string]any{
 		"username": "alice_v", "location": strings.Repeat("x", 51),
+	}).expect(http.StatusUnprocessableEntity)
+	putProfile(t, alice, map[string]any{
+		"username": "alice_v", "firstName": strings.Repeat("x", 51),
+	}).expect(http.StatusUnprocessableEntity)
+	putProfile(t, alice, map[string]any{
+		"username": "alice_v", "lastName": strings.Repeat("x", 51),
+	}).expect(http.StatusUnprocessableEntity)
+	putProfile(t, alice, map[string]any{
+		"username": "alice_v", "writingInterests": strings.Repeat("x", 201),
 	}).expect(http.StatusUnprocessableEntity)
 
 	for _, policy := range []string{"everyone", "followers", "following", "mutuals", "nobody"} {
