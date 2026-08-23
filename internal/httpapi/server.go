@@ -64,6 +64,8 @@ func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.
 	m.HandleFunc("/v1/competition-drafts", x.competitionDrafts)
 	m.HandleFunc("/v1/competition-publish", x.competitionPublish)
 	m.HandleFunc("/v1/me/follows", x.myFollows)
+	m.HandleFunc("/v1/me/wall", x.myWall)
+	m.HandleFunc("/v1/me/followers/recent", x.myRecentFollowers)
 	m.HandleFunc("/v1/profiles/", x.profileAction)
 	m.HandleFunc("/v1/stories", x.stories)
 	m.HandleFunc("/v1/stories/", x.story)

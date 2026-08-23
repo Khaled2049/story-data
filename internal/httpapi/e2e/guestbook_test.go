@@ -65,6 +65,12 @@ func wallEntries(t *testing.T, owner, viewer string) []map[string]any {
 	return out
 }
 
+func wallTotalCount(t *testing.T, owner, viewer string) int {
+	t.Helper()
+	page := get(t, publicWallOf(owner)+"?limit=1", viewer).expect(http.StatusOK).json()
+	return int(page["totalCount"].(float64))
+}
+
 func replies(t *testing.T, owner, entryID, viewer string) []map[string]any {
 	t.Helper()
 	raw := get(t, publicWallOf(owner)+"/"+entryID+"/replies", viewer).
@@ -103,6 +109,9 @@ func TestGuestbookEntryLifecycle(t *testing.T) {
 	if seen := wallEntries(t, alice, ""); len(seen) != 1 {
 		t.Fatalf("anonymous read saw %d entries, want 1", len(seen))
 	}
+	if n := wallTotalCount(t, alice, ""); n != 1 {
+		t.Errorf("totalCount = %d, want 1", n)
+	}
 
 	// An author with no profile falls back to a placeholder rather than failing.
 	postEntry(t, carol, alice, "No profile here.")
@@ -115,11 +124,17 @@ func TestGuestbookEntryLifecycle(t *testing.T) {
 	if !found {
 		t.Error("expected a profile-less author to read back as 'unknown'")
 	}
+	if n := wallTotalCount(t, alice, ""); n != 2 {
+		t.Errorf("totalCount = %d, want 2", n)
+	}
 
 	call(t, "DELETE", guestbookOf(alice)+"/"+entry["id"].(string), bob, nil).
 		expect(http.StatusNoContent)
 	if seen := wallEntries(t, alice, ""); len(seen) != 1 {
 		t.Errorf("after deletion the wall has %d entries, want 1", len(seen))
+	}
+	if n := wallTotalCount(t, alice, ""); n != 1 {
+		t.Errorf("totalCount after delete = %d, want 1", n)
 	}
 }
 
@@ -366,6 +381,9 @@ func TestGuestbookPaginationCoversEveryEntryExactlyOnce(t *testing.T) {
 		if len(entries) > 2 {
 			t.Fatalf("page returned %d entries, limit was 2", len(entries))
 		}
+		if n := int(page["totalCount"].(float64)); n != total {
+			t.Errorf("totalCount = %d, want %d", n, total)
+		}
 		for _, raw := range entries {
 			e := raw.(map[string]any)
 			id := e["id"].(string)
@@ -503,4 +521,166 @@ func TestFollowGraph(t *testing.T) {
 	call(t, "DELETE", followPath(bob), alice, nil).expect(http.StatusNoContent)
 
 	get(t, "/v1/me/follows", "").expect(http.StatusUnauthorized)
+}
+
+func wallEntriesFor(t *testing.T, viewer, filter string) []map[string]any {
+	t.Helper()
+	url := "/v1/me/wall"
+	if filter != "" {
+		url += "?filter=" + filter
+	}
+	page := get(t, url, viewer).expect(http.StatusOK).json()
+	raw := page["entries"].([]any)
+	out := []map[string]any{}
+	for _, e := range raw {
+		out = append(out, e.(map[string]any))
+	}
+	return out
+}
+
+func wallIDs(entries []map[string]any) map[string]bool {
+	ids := map[string]bool{}
+	for _, e := range entries {
+		ids[e["id"].(string)] = true
+	}
+	return ids
+}
+
+func seedWallFixture(t *testing.T) (onBobsWall, onAlicesWall, aliceOnCarols, strangerOnAlices, strangerOnCarols map[string]any) {
+	t.Helper()
+	newProfile(t, alice, "alice_w", "everyone")
+	newProfile(t, bob, "bob_w", "everyone")
+	newProfile(t, carol, "carol_w", "everyone")
+	follow(t, alice, bob)
+
+	onBobsWall = postEntry(t, bob, bob, "bob on his own wall")
+	onAlicesWall = postEntry(t, bob, alice, "bob left alice a note")
+	aliceOnCarols = postEntry(t, alice, carol, "alice left carol a note")
+	strangerOnAlices = postEntry(t, dave, alice, "a stranger's note to alice")
+	strangerOnCarols = postEntry(t, dave, carol, "a stranger's note to carol, invisible to alice")
+	return
+}
+
+func TestWallAllIsUnionOfOwnAuthoredAndFollowed(t *testing.T) {
+	reset(t)
+	onBobsWall, onAlicesWall, aliceOnCarols, strangerOnAlices, strangerOnCarols := seedWallFixture(t)
+
+	ids := wallIDs(wallEntriesFor(t, alice, "all"))
+	for _, want := range []map[string]any{onBobsWall, onAlicesWall, aliceOnCarols, strangerOnAlices} {
+		if !ids[want["id"].(string)] {
+			t.Errorf("expected %v in alice's all-filter wall: %v", want["content"], ids)
+		}
+	}
+	if ids[strangerOnCarols["id"].(string)] {
+		t.Error("a stranger's note on a third party's wall should not appear")
+	}
+	if len(ids) != 4 {
+		t.Errorf("all-filter returned %d entries, want 4", len(ids))
+	}
+}
+
+func TestWallFollowingExcludesSelfAndStrangers(t *testing.T) {
+	reset(t)
+	onBobsWall, onAlicesWall, _, strangerOnAlices, _ := seedWallFixture(t)
+
+	entries := wallEntriesFor(t, alice, "following")
+	ids := wallIDs(entries)
+	if !ids[onBobsWall["id"].(string)] || !ids[onAlicesWall["id"].(string)] {
+		t.Errorf("expected both of bob's entries in the following filter: %v", ids)
+	}
+	if ids[strangerOnAlices["id"].(string)] {
+		t.Error("a stranger's note should not appear under 'following'")
+	}
+	if len(ids) != 2 {
+		t.Errorf("following-filter returned %d entries, want 2 (both authored by bob)", len(ids))
+	}
+	for _, e := range entries {
+		if e["authorId"] != bob {
+			t.Errorf("entry not authored by a followed user: %v", e)
+		}
+	}
+}
+
+func TestWallMineIsClassicOwnerWall(t *testing.T) {
+	reset(t)
+	_, onAlicesWall, aliceOnCarols, strangerOnAlices, _ := seedWallFixture(t)
+
+	ids := wallIDs(wallEntriesFor(t, alice, "mine"))
+	if !ids[onAlicesWall["id"].(string)] || !ids[strangerOnAlices["id"].(string)] {
+		t.Errorf("expected both entries on alice's own wall: %v", ids)
+	}
+	if ids[aliceOnCarols["id"].(string)] {
+		t.Error("an entry alice authored on someone else's wall should not appear under 'mine'")
+	}
+	if len(ids) != 2 {
+		t.Errorf("mine-filter returned %d entries, want 2", len(ids))
+	}
+}
+
+func TestWallUsernamesAndDefaultsAndAuth(t *testing.T) {
+	reset(t)
+	_, onAlicesWall, _, _, _ := seedWallFixture(t)
+
+	// No filter defaults to "all".
+	def := wallIDs(wallEntriesFor(t, alice, ""))
+	all := wallIDs(wallEntriesFor(t, alice, "all"))
+	if len(def) != len(all) {
+		t.Errorf("default filter returned %d entries, 'all' returned %d", len(def), len(all))
+	}
+
+	for _, e := range wallEntriesFor(t, alice, "mine") {
+		if e["id"] == onAlicesWall["id"] {
+			if e["ownerUsername"] != "alice_w" || e["authorUsername"] != "bob_w" {
+				t.Errorf("entry = %v", e)
+			}
+		}
+	}
+
+	// An unrecognized filter is bad input, not a server error.
+	get(t, "/v1/me/wall?filter=trending", alice).expect(http.StatusUnprocessableEntity)
+
+	// Someone who follows nobody and owns nothing sees an empty wall, not an error.
+	if got := wallEntriesFor(t, erin, "all"); len(got) != 0 {
+		t.Errorf("erin's wall = %v, want none", got)
+	}
+
+	// Requires authentication.
+	get(t, "/v1/me/wall", "").expect(http.StatusUnauthorized)
+}
+
+func TestWallPagination(t *testing.T) {
+	reset(t)
+	const total = 5
+	for i := 0; i < total; i++ {
+		postEntry(t, bob, alice, fmt.Sprintf("entry %d", i))
+	}
+
+	seen := map[string]bool{}
+	cursor := ""
+	for pages := 0; pages < 10; pages++ {
+		url := "/v1/me/wall?filter=mine&limit=2"
+		if cursor != "" {
+			url += "&cursor=" + cursor
+		}
+		page := get(t, url, alice).expect(http.StatusOK).json()
+		entries := page["entries"].([]any)
+		if len(entries) > 2 {
+			t.Fatalf("page returned %d entries, limit was 2", len(entries))
+		}
+		for _, raw := range entries {
+			id := raw.(map[string]any)["id"].(string)
+			if seen[id] {
+				t.Errorf("entry %s appeared on two pages", id)
+			}
+			seen[id] = true
+		}
+		next, ok := page["nextCursor"]
+		if !ok || next == nil || next == "" {
+			break
+		}
+		cursor = next.(string)
+	}
+	if len(seen) != total {
+		t.Errorf("pagination covered %d of %d entries", len(seen), total)
+	}
 }

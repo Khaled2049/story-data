@@ -43,6 +43,15 @@ type GuestbookReply struct {
 type GuestbookPage struct {
 	Entries    []GuestbookEntry `json:"entries"`
 	NextCursor string           `json:"nextCursor,omitempty"`
+	TotalCount int              `json:"totalCount"`
+}
+type GuestbookActivityEntry struct {
+	GuestbookEntry
+	OwnerUsername string `json:"ownerUsername"`
+}
+type GuestbookActivityPage struct {
+	Entries    []GuestbookActivityEntry `json:"entries"`
+	NextCursor string                   `json:"nextCursor,omitempty"`
 }
 type guestbookCursor struct {
 	CreatedAt time.Time `json:"createdAt"`
@@ -92,6 +101,70 @@ func (s *Store) ListGuestbookEntries(ctx context.Context, ownerID, viewerID, cur
 	if len(items) > limit {
 		page.Entries = items[:limit]
 		page.NextCursor, _ = encodeGuestbookCursor(page.Entries[limit-1])
+	}
+	if err := s.db.QueryRow(ctx, `SELECT count(*) FROM guestbook_entries WHERE owner_id=$1`, ownerID).Scan(&page.TotalCount); err != nil {
+		return GuestbookPage{}, err
+	}
+	return page, nil
+}
+
+func (s *Store) ListPersonalWall(ctx context.Context, viewerID, filter, cursor string, limit int) (GuestbookActivityPage, error) {
+	if limit <= 0 {
+		limit = guestbookPageSize
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	var scope string
+	switch filter {
+	case "", "all":
+		scope = "(e.owner_id=$1 OR e.author_id=$1 OR e.author_id IN (SELECT followed_id FROM user_follows WHERE follower_id=$1))"
+	case "following":
+		scope = "e.author_id IN (SELECT followed_id FROM user_follows WHERE follower_id=$1)"
+	case "mine":
+		scope = "e.owner_id=$1"
+	default:
+		return GuestbookActivityPage{}, ErrValidation
+	}
+	args := []any{viewerID}
+	where := ""
+	if cursor != "" {
+		c, err := decodeGuestbookCursor(cursor)
+		if err != nil {
+			return GuestbookActivityPage{}, ErrValidation
+		}
+		args = append(args, c.CreatedAt, c.ID)
+		where = " AND (e.created_at,e.id) < ($2,$3)"
+	}
+	args = append(args, limit+1)
+	rows, err := s.db.Query(ctx, `SELECT e.id,e.owner_id,COALESCE(po.username,'unknown'),e.author_id,COALESCE(pa.username,'unknown'),e.content,e.created_at,
+ (SELECT count(*) FROM guestbook_replies r WHERE r.entry_id=e.id),
+ (SELECT count(*) FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.vote='up'),
+ (SELECT count(*) FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.vote='down'),
+ COALESCE((SELECT v.vote FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.user_id=$1),'')
+ FROM guestbook_entries e
+ LEFT JOIN public_profiles po ON po.user_id=e.owner_id
+ LEFT JOIN public_profiles pa ON pa.user_id=e.author_id
+ WHERE `+scope+where+` ORDER BY e.created_at DESC,e.id DESC LIMIT $`+strconvArg(len(args)), args...)
+	if err != nil {
+		return GuestbookActivityPage{}, err
+	}
+	defer rows.Close()
+	items := []GuestbookActivityEntry{}
+	for rows.Next() {
+		x, err := scanGuestbookActivityEntry(rows)
+		if err != nil {
+			return GuestbookActivityPage{}, err
+		}
+		items = append(items, x)
+	}
+	if err := rows.Err(); err != nil {
+		return GuestbookActivityPage{}, err
+	}
+	page := GuestbookActivityPage{Entries: items}
+	if len(items) > limit {
+		page.Entries = items[:limit]
+		page.NextCursor, _ = encodeGuestbookCursor(page.Entries[limit-1].GuestbookEntry)
 	}
 	return page, nil
 }
@@ -368,6 +441,13 @@ func scanGuestbookEntry(row pgx.Row) (GuestbookEntry, error) {
 	var x GuestbookEntry
 	var id uuid.UUID
 	e := row.Scan(&id, &x.OwnerID, &x.AuthorID, &x.AuthorUsername, &x.Content, &x.CreatedAt, &x.CommentCount, &x.UpvoteCount, &x.DownvoteCount, &x.UserVote)
+	x.ID = id.String()
+	return x, e
+}
+func scanGuestbookActivityEntry(row pgx.Row) (GuestbookActivityEntry, error) {
+	var x GuestbookActivityEntry
+	var id uuid.UUID
+	e := row.Scan(&id, &x.OwnerID, &x.OwnerUsername, &x.AuthorID, &x.AuthorUsername, &x.Content, &x.CreatedAt, &x.CommentCount, &x.UpvoteCount, &x.DownvoteCount, &x.UserVote)
 	x.ID = id.String()
 	return x, e
 }

@@ -15,6 +15,22 @@ import (
 
 func profileOf(uid string) string { return "/v1/public/profiles/" + uid }
 
+// profileList extracts the "profiles" array out of the {profiles,nextCursor}
+// envelope the directory listing returns.
+func profileList(t *testing.T, url, viewer string) []map[string]any {
+	t.Helper()
+	page := get(t, url, viewer).expect(http.StatusOK).json()
+	raw, ok := page["profiles"]
+	if !ok || raw == nil {
+		t.Fatalf("profiles missing or null in %v", page)
+	}
+	out := []map[string]any{}
+	for _, x := range raw.([]any) {
+		out = append(out, x.(map[string]any))
+	}
+	return out
+}
+
 func putProfile(t *testing.T, uid string, body map[string]any) response {
 	t.Helper()
 	return call(t, "PUT", "/v1/profiles/me", uid, body)
@@ -201,8 +217,7 @@ func TestProfileDirectoryBatchAndSearch(t *testing.T) {
 	newProfile(t, carol, "carla_v", "everyone")
 
 	// The batch form is what list surfaces use instead of one request per row.
-	batch := get(t, "/v1/public/profiles?ids="+alice+","+carol, "").
-		expect(http.StatusOK).list()
+	batch := profileList(t, "/v1/public/profiles?ids="+alice+","+carol, "")
 	if len(batch) != 2 {
 		t.Fatalf("batch returned %d profiles, want 2", len(batch))
 	}
@@ -211,22 +226,21 @@ func TestProfileDirectoryBatchAndSearch(t *testing.T) {
 		t.Errorf("batch order = %v", batch)
 	}
 	// Unknown ids are skipped rather than erroring or padding with nulls.
-	mixed := get(t, "/v1/public/profiles?ids="+alice+",user-nobody", "").
-		expect(http.StatusOK).list()
+	mixed := profileList(t, "/v1/public/profiles?ids="+alice+",user-nobody", "")
 	if len(mixed) != 1 {
 		t.Errorf("expected unknown ids to be skipped, got %v", mixed)
 	}
 
 	// Prefix search is case-insensitive on the username.
-	found := get(t, "/v1/public/profiles?query=BOB", "").expect(http.StatusOK).list()
+	found := profileList(t, "/v1/public/profiles?query=BOB", "")
 	if len(found) != 1 || found[0]["username"] != "bobby_v" {
 		t.Errorf("search = %v", found)
 	}
 	// An exact username is a prefix of itself.
-	if exact := get(t, "/v1/public/profiles?query=bobby_v", "").expect(http.StatusOK).list(); len(exact) != 1 {
+	if exact := profileList(t, "/v1/public/profiles?query=bobby_v", ""); len(exact) != 1 {
 		t.Errorf("exact-match search = %v", exact)
 	}
-	if none := get(t, "/v1/public/profiles?query=zzz", "").expect(http.StatusOK).list(); len(none) != 0 {
+	if none := profileList(t, "/v1/public/profiles?query=zzz", ""); len(none) != 0 {
 		t.Errorf("expected no matches, got %v", none)
 	}
 
@@ -234,18 +248,18 @@ func TestProfileDirectoryBatchAndSearch(t *testing.T) {
 	// to match literally rather than standing in for any character.
 	newProfile(t, dave, "ada_b", "everyone")
 	newProfile(t, erin, "adaXb", "everyone")
-	underscore := get(t, "/v1/public/profiles?query=ada_b", "").expect(http.StatusOK).list()
+	underscore := profileList(t, "/v1/public/profiles?query=ada_b", "")
 	if len(underscore) != 1 || underscore[0]["username"] != "ada_b" {
 		t.Errorf("underscore matched as a wildcard: %v", underscore)
 	}
 	// A bare wildcard is likewise literal, and matches nothing.
-	if pct := get(t, "/v1/public/profiles?query=%25", "").expect(http.StatusOK).list(); len(pct) != 0 {
+	if pct := profileList(t, "/v1/public/profiles?query=%25", ""); len(pct) != 0 {
 		t.Errorf("a percent sign matched as a wildcard: %v", pct)
 	}
 
 	// With neither ids nor a query it is a plain directory listing — every
 	// profile created above, newest first.
-	if all := get(t, "/v1/public/profiles", "").expect(http.StatusOK).list(); len(all) != 5 {
+	if all := profileList(t, "/v1/public/profiles", ""); len(all) != 5 {
 		t.Errorf("directory listing returned %d profiles, want 5", len(all))
 	}
 
@@ -253,6 +267,88 @@ func TestProfileDirectoryBatchAndSearch(t *testing.T) {
 	get(t, "/v1/public/profiles?query=bob&ids="+alice, "").expect(http.StatusBadRequest)
 	get(t, "/v1/public/profiles?limit=0", "").expect(http.StatusBadRequest)
 	get(t, "/v1/public/profiles?limit=51", "").expect(http.StatusBadRequest)
+}
+
+func TestProfileDirectoryStats(t *testing.T) {
+	reset(t)
+	newProfile(t, alice, "alice_v", "everyone")
+	newProfile(t, bob, "bob_v", "everyone")
+	follow(t, bob, alice)
+
+	profile := get(t, profileOf(alice), "").expect(http.StatusOK).json()
+	if profile["followerCount"].(float64) != 1 {
+		t.Errorf("alice followerCount = %v, want 1", profile["followerCount"])
+	}
+	if profile["isWriter"] != false {
+		t.Errorf("alice isWriter = %v, want false (no published story)", profile["isWriter"])
+	}
+
+	call(t, "POST", "/v1/stories", alice, map[string]any{"title": "Alice's Book"}).
+		expect(http.StatusCreated).json()
+	// Publishing status is set on the story elsewhere in the suite; a draft
+	// alone must not flip isWriter — only a published story counts.
+	stillReader := get(t, profileOf(alice), "").expect(http.StatusOK).json()
+	if stillReader["isWriter"] != false {
+		t.Errorf("a draft story made isWriter true: %v", stillReader)
+	}
+}
+
+func TestProfileDirectoryPaginationAndSort(t *testing.T) {
+	reset(t)
+	users := []string{alice, bob, carol, dave, erin}
+	names := []string{"zed_v", "yara_v", "xavi_v", "wren_v", "vale_v"}
+	for i, u := range users {
+		newProfile(t, u, names[i], "everyone")
+	}
+
+	// Newest-first pagination covers every profile exactly once.
+	seen := map[string]bool{}
+	cursor := ""
+	for pages := 0; pages < 10; pages++ {
+		url := "/v1/public/profiles?limit=2"
+		if cursor != "" {
+			url += "&cursor=" + cursor
+		}
+		page := get(t, url, "").expect(http.StatusOK).json()
+		entries := page["profiles"].([]any)
+		if len(entries) > 2 {
+			t.Fatalf("page returned %d profiles, limit was 2", len(entries))
+		}
+		for _, raw := range entries {
+			id := raw.(map[string]any)["userId"].(string)
+			if seen[id] {
+				t.Errorf("profile %s appeared on two pages", id)
+			}
+			seen[id] = true
+		}
+		next, ok := page["nextCursor"]
+		if !ok || next == nil || next == "" {
+			break
+		}
+		cursor = next.(string)
+	}
+	if len(seen) != len(users) {
+		t.Errorf("pagination covered %d of %d profiles", len(seen), len(users))
+	}
+
+	// A–Z sort orders by username, case-insensitively, and paginates the same way.
+	az := profileList(t, "/v1/public/profiles?sort=az&limit=50", "")
+	usernames := make([]string, len(az))
+	for i, p := range az {
+		usernames[i] = p["username"].(string)
+	}
+	for i := 1; i < len(usernames); i++ {
+		if strings.ToLower(usernames[i-1]) > strings.ToLower(usernames[i]) {
+			t.Errorf("az order broken at %d: %v", i, usernames)
+		}
+	}
+
+	// A cursor minted for one sort is invalid input for the other.
+	newestPage := get(t, "/v1/public/profiles?limit=1", "").expect(http.StatusOK).json()
+	newestCursor := newestPage["nextCursor"].(string)
+	get(t, "/v1/public/profiles?sort=az&limit=1&cursor="+newestCursor, "").
+		expect(http.StatusUnprocessableEntity)
+	get(t, "/v1/public/profiles?cursor=not-base64!!", "").expect(http.StatusUnprocessableEntity)
 }
 
 // ── follows ─────────────────────────────────────────────────────────────────
@@ -281,4 +377,30 @@ func TestProfileFollowGraphShape(t *testing.T) {
 	call(t, "PUT", "/v1/profiles/"+alice+"/follow", alice, nil).
 		expect(http.StatusUnprocessableEntity)
 	call(t, "PUT", "/v1/profiles/"+bob+"/follow", "", nil).expect(http.StatusUnauthorized)
+}
+
+func TestRecentFollowers(t *testing.T) {
+	reset(t)
+	newProfile(t, bob, "bob_v", "everyone")
+	newProfile(t, carol, "carol_v", "everyone")
+
+	call(t, "PUT", "/v1/profiles/"+alice+"/follow", bob, nil).expect(http.StatusNoContent)
+	call(t, "PUT", "/v1/profiles/"+alice+"/follow", carol, nil).expect(http.StatusNoContent)
+
+	recent := get(t, "/v1/me/followers/recent", alice).expect(http.StatusOK).list()
+	if len(recent) != 2 {
+		t.Fatalf("recent followers = %d, want 2", len(recent))
+	}
+	// Newest follow first.
+	if recent[0]["userId"] != carol || recent[1]["userId"] != bob {
+		t.Errorf("order = %v", recent)
+	}
+	if recent[0]["username"] != "carol_v" {
+		t.Errorf("username not hydrated: %v", recent[0])
+	}
+
+	if none := get(t, "/v1/me/followers/recent", bob).expect(http.StatusOK).list(); len(none) != 0 {
+		t.Errorf("bob has no followers, got %v", none)
+	}
+	get(t, "/v1/me/followers/recent", "").expect(http.StatusUnauthorized)
 }

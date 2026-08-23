@@ -25,7 +25,7 @@ func (s *Server) profiles(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "query and ids cannot be combined")
 			return
 		}
-		x, err := s.store.ListPublicProfiles(r.Context(), r.URL.Query().Get("query"), ids, limit)
+		x, err := s.store.ListPublicProfiles(r.Context(), r.URL.Query().Get("query"), ids, r.URL.Query().Get("sort"), r.URL.Query().Get("cursor"), limit)
 		respond(w, x, err)
 		return
 	}
@@ -35,6 +35,24 @@ func (s *Server) profiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	notFound(w)
+}
+
+func (s *Server) myRecentFollowers(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		method(w)
+		return
+	}
+	limit, err := profileLimit(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	x, err := s.store.ListRecentFollowers(r.Context(), uid, limit)
+	respond(w, x, err)
 }
 
 func (s *Server) myProfile(w http.ResponseWriter, r *http.Request) {

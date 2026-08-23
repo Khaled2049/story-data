@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -28,6 +30,28 @@ type PublicProfile struct {
 	GuestbookPolicy  string    `json:"guestbookPolicy"`
 	CreatedAt        time.Time `json:"createdAt"`
 	UpdatedAt        time.Time `json:"updatedAt"`
+	FollowerCount    int       `json:"followerCount"`
+	IsWriter         bool      `json:"isWriter"`
+}
+
+type ProfilePage struct {
+	Profiles   []PublicProfile `json:"profiles"`
+	NextCursor string          `json:"nextCursor,omitempty"`
+}
+
+type profileCursor struct {
+	Sort      string     `json:"sort"`
+	CreatedAt *time.Time `json:"createdAt,omitempty"`
+	Username  string     `json:"username,omitempty"`
+	UserID    string     `json:"userId"`
+}
+
+// FollowerEntry backs the "Followed you back" list — who recently followed
+// the given user, newest first.
+type FollowerEntry struct {
+	UserID     string    `json:"userId"`
+	Username   string    `json:"username"`
+	FollowedAt time.Time `json:"followedAt"`
 }
 
 // ProfileInput uses pointers so PATCH can distinguish omitted fields from
@@ -53,29 +77,29 @@ func (s *Store) GetPublicProfile(ctx context.Context, userID string) (PublicProf
 	return x, err
 }
 
-func (s *Store) ListPublicProfiles(ctx context.Context, prefix string, ids []string, limit int) ([]PublicProfile, error) {
+func (s *Store) ListPublicProfiles(ctx context.Context, prefix string, ids []string, sort, cursor string, limit int) (ProfilePage, error) {
 	if limit <= 0 || limit > profileBatchLimit {
 		limit = profilePageSize
 	}
 	if len(ids) > 0 {
 		if len(ids) > profileBatchLimit {
-			return nil, ErrValidation
+			return ProfilePage{}, ErrValidation
 		}
 		rows, err := s.db.Query(ctx, profileSelect+` WHERE user_id = ANY($1)`, ids)
 		if err != nil {
-			return nil, err
+			return ProfilePage{}, err
 		}
 		defer rows.Close()
 		byID := map[string]PublicProfile{}
 		for rows.Next() {
 			x, e := scanPublicProfile(rows)
 			if e != nil {
-				return nil, e
+				return ProfilePage{}, e
 			}
 			byID[x.UserID] = x
 		}
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return ProfilePage{}, err
 		}
 		out := make([]PublicProfile, 0, len(ids))
 		for _, id := range ids {
@@ -83,31 +107,133 @@ func (s *Store) ListPublicProfiles(ctx context.Context, prefix string, ids []str
 				out = append(out, x)
 			}
 		}
-		return out, nil
+		return ProfilePage{Profiles: out}, nil
 	}
 	prefix = strings.ToLower(strings.TrimSpace(prefix))
-	query, args := profileSelect+` ORDER BY created_at DESC, user_id DESC LIMIT $1`, []any{limit}
 	if prefix != "" {
 		// LIKE rather than a >= / < range: the range's upper bound was
 		// prefix + U+10FFFF, and this database's collation sorts that
 		// noncharacter as if it were absent, so the bound collapsed onto the
 		// prefix itself and the range matched nothing at all.
-		query, args = profileSelect+` WHERE username_lower LIKE $1 ESCAPE '\' ORDER BY username_lower, user_id LIMIT $2`, []any{likePrefix(prefix), limit}
+		rows, err := s.db.Query(ctx, profileSelect+` WHERE username_lower LIKE $1 ESCAPE '\' ORDER BY username_lower, user_id LIMIT $2`, likePrefix(prefix), limit)
+		if err != nil {
+			return ProfilePage{}, err
+		}
+		defer rows.Close()
+		out := []PublicProfile{}
+		for rows.Next() {
+			x, e := scanPublicProfile(rows)
+			if e != nil {
+				return ProfilePage{}, e
+			}
+			out = append(out, x)
+		}
+		return ProfilePage{Profiles: out}, rows.Err()
 	}
+
+	if sort != "az" {
+		sort = "newest"
+	}
+	var c profileCursor
+	if cursor != "" {
+		var err error
+		c, err = decodeProfileCursor(cursor)
+		if err != nil || c.Sort != sort {
+			return ProfilePage{}, ErrValidation
+		}
+	}
+
+	var query string
+	var args []any
+	if sort == "az" {
+		where := ""
+		args = []any{}
+		if cursor != "" {
+			where = " WHERE (lower(username),user_id) > ($1,$2)"
+			args = append(args, c.Username, c.UserID)
+		}
+		args = append(args, limit+1)
+		query = profileSelect + where + ` ORDER BY lower(username) ASC, user_id ASC LIMIT $` + strconvArg(len(args))
+	} else {
+		where := ""
+		args = []any{}
+		if cursor != "" {
+			where = " WHERE (created_at,user_id) < ($1,$2)"
+			args = append(args, *c.CreatedAt, c.UserID)
+		}
+		args = append(args, limit+1)
+		query = profileSelect + where + ` ORDER BY created_at DESC, user_id DESC LIMIT $` + strconvArg(len(args))
+	}
+
 	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return ProfilePage{}, err
+	}
+	defer rows.Close()
+	items := []PublicProfile{}
+	for rows.Next() {
+		x, e := scanPublicProfile(rows)
+		if e != nil {
+			return ProfilePage{}, e
+		}
+		items = append(items, x)
+	}
+	if err := rows.Err(); err != nil {
+		return ProfilePage{}, err
+	}
+	page := ProfilePage{Profiles: items}
+	if len(items) > limit {
+		page.Profiles = items[:limit]
+		page.NextCursor, _ = encodeProfileCursor(sort, page.Profiles[limit-1])
+	}
+	return page, nil
+}
+
+// ListRecentFollowers returns userID's most recent followers, newest first —
+// backs the "Followed you back" panel.
+func (s *Store) ListRecentFollowers(ctx context.Context, userID string, limit int) ([]FollowerEntry, error) {
+	if limit <= 0 || limit > profileBatchLimit {
+		limit = profilePageSize
+	}
+	rows, err := s.db.Query(ctx, `SELECT f.follower_id, COALESCE(p.username,'unknown'), f.created_at
+ FROM user_follows f LEFT JOIN public_profiles p ON p.user_id=f.follower_id
+ WHERE f.followed_id=$1 ORDER BY f.created_at DESC LIMIT $2`, userID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []PublicProfile{}
+	out := []FollowerEntry{}
 	for rows.Next() {
-		x, e := scanPublicProfile(rows)
-		if e != nil {
-			return nil, e
+		var x FollowerEntry
+		if err := rows.Scan(&x.UserID, &x.Username, &x.FollowedAt); err != nil {
+			return nil, err
 		}
 		out = append(out, x)
 	}
 	return out, rows.Err()
+}
+
+func encodeProfileCursor(sort string, x PublicProfile) (string, error) {
+	c := profileCursor{Sort: sort, UserID: x.UserID}
+	if sort == "az" {
+		c.Username = strings.ToLower(x.Username)
+	} else {
+		c.CreatedAt = &x.CreatedAt
+	}
+	b, e := json.Marshal(c)
+	return base64.RawURLEncoding.EncodeToString(b), e
+}
+func decodeProfileCursor(v string) (profileCursor, error) {
+	var x profileCursor
+	b, e := base64.RawURLEncoding.DecodeString(v)
+	if e != nil {
+		return x, ErrValidation
+	}
+	e = json.Unmarshal(b, &x)
+	if e != nil || x.UserID == "" || (x.Sort == "az" && x.Username == "") || (x.Sort != "az" && x.CreatedAt == nil) {
+		return profileCursor{}, ErrValidation
+	}
+	return x, nil
 }
 
 func (s *Store) UpsertPublicProfile(ctx context.Context, userID string, in ProfileInput) (PublicProfile, error) {
@@ -141,7 +267,7 @@ func (s *Store) UpsertPublicProfile(ctx context.Context, userID string, in Profi
 	}
 	x, err := scanPublicProfile(s.db.QueryRow(ctx, `INSERT INTO public_profiles (user_id, username, username_lower, photo_url, first_name, last_name, bio, occupation, location, writing_interests, wallet_address, guestbook_policy)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username, username_lower=EXCLUDED.username_lower, photo_url=EXCLUDED.photo_url, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name, bio=EXCLUDED.bio, occupation=EXCLUDED.occupation, location=EXCLUDED.location, writing_interests=EXCLUDED.writing_interests, wallet_address=EXCLUDED.wallet_address, guestbook_policy=EXCLUDED.guestbook_policy, updated_at=now()
-RETURNING user_id, username, photo_url, first_name, last_name, bio, occupation, location, writing_interests, COALESCE(wallet_address,''), guestbook_policy, created_at, updated_at`, userID, username, strings.ToLower(username), photo, firstName, lastName, bio, occupation, location, writingInterests, emptyToNull(wallet), policy))
+RETURNING user_id, username, photo_url, first_name, last_name, bio, occupation, location, writing_interests, COALESCE(wallet_address,''), guestbook_policy, created_at, updated_at, `+profileStatsSelect, userID, username, strings.ToLower(username), photo, firstName, lastName, bio, occupation, location, writingInterests, emptyToNull(wallet), policy))
 	if isUniqueViolation(err) {
 		return PublicProfile{}, ErrUsernameTaken
 	}
@@ -187,11 +313,12 @@ func (s *Store) PatchPublicProfile(ctx context.Context, userID string, in Profil
 	return s.UpsertPublicProfile(ctx, userID, ProfileInput{Username: &username, PhotoURL: &photo, FirstName: &firstName, LastName: &lastName, Bio: &bio, Occupation: &occupation, Location: &location, WritingInterests: &writingInterests, WalletAddress: &wallet, GuestbookPolicy: &policy})
 }
 
-const profileSelect = `SELECT user_id, username, photo_url, first_name, last_name, bio, occupation, location, writing_interests, COALESCE(wallet_address,''), guestbook_policy, created_at, updated_at FROM public_profiles`
+const profileStatsSelect = `(SELECT count(*) FROM user_follows WHERE followed_id=user_id), EXISTS(SELECT 1 FROM stories WHERE owner_id=user_id AND is_published)`
+const profileSelect = `SELECT user_id, username, photo_url, first_name, last_name, bio, occupation, location, writing_interests, COALESCE(wallet_address,''), guestbook_policy, created_at, updated_at, ` + profileStatsSelect + ` FROM public_profiles`
 
 func scanPublicProfile(row pgx.Row) (PublicProfile, error) {
 	var x PublicProfile
-	err := row.Scan(&x.UserID, &x.Username, &x.PhotoURL, &x.FirstName, &x.LastName, &x.Bio, &x.Occupation, &x.Location, &x.WritingInterests, &x.WalletAddress, &x.GuestbookPolicy, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&x.UserID, &x.Username, &x.PhotoURL, &x.FirstName, &x.LastName, &x.Bio, &x.Occupation, &x.Location, &x.WritingInterests, &x.WalletAddress, &x.GuestbookPolicy, &x.CreatedAt, &x.UpdatedAt, &x.FollowerCount, &x.IsWriter)
 	return x, err
 }
 func value(v *string) string {
