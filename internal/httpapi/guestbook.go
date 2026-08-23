@@ -142,6 +142,24 @@ func (s *Server) guestbook(w http.ResponseWriter, r *http.Request) {
 	notFound(w)
 }
 
+func (s *Server) myWall(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		method(w)
+		return
+	}
+	limit, err := guestbookLimit(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "limit must be between 1 and 50")
+		return
+	}
+	x, err := s.store.ListPersonalWall(r.Context(), uid, r.URL.Query().Get("filter"), r.URL.Query().Get("cursor"), limit)
+	respond(w, x, err)
+}
+
 func (s *Server) myFollows(w http.ResponseWriter, r *http.Request) {
 	uid, ok := s.user(w, r)
 	if !ok {
