@@ -128,6 +128,42 @@ func TestBookClubValidationAndAuth(t *testing.T) {
 	get(t, "/v1/book-clubs", "").expect(http.StatusOK).list()
 }
 
+// Writes decode with DisallowUnknownFields, so a client that echoes back a
+// whole club object gets a 400 for the request rather than having the
+// server-assigned fields ignored. Pinned because the shape of the rejection
+// is what tells a client it must map to the input contract.
+func TestBookClubRejectsServerAssignedFields(t *testing.T) {
+	reset(t)
+
+	body := func(extra string, value any) map[string]any {
+		return map[string]any{
+			"name": "Echoed", "description": "d", "image": "", "category": "c",
+			"activity": "a", "meetUp": "", extra: value,
+		}
+	}
+	for _, field := range []struct {
+		name  string
+		value any
+	}{
+		{"id", "client-generated-uuid"},
+		{"creatorId", alice},
+		{"members", []string{alice}},
+	} {
+		call(t, "POST", "/v1/book-clubs", alice, body(field.name, field.value)).
+			expect(http.StatusBadRequest)
+	}
+
+	// The mapped body — exactly the declared input fields — is accepted, and
+	// the server fills in the identity the client was trying to send.
+	club := call(t, "POST", "/v1/book-clubs", alice, map[string]any{
+		"name": "Mapped", "description": "d", "image": "", "category": "c",
+		"activity": "a", "meetUp": "",
+	}).expect(http.StatusCreated).json()
+	if club["id"] == "" || club["id"] == nil {
+		t.Error("server should assign an id")
+	}
+}
+
 func TestBookClubSettings(t *testing.T) {
 	reset(t)
 	id := newClub(t, alice, "Settings")["id"].(string)

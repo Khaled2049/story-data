@@ -56,6 +56,43 @@ func TestStoryCreateAndList(t *testing.T) {
 	}
 }
 
+// The owner's shelf renders these aggregates; only the list endpoint carries
+// them, so a client reading them off a get/create response would see nothing.
+func TestStoryListCarriesShelfAggregates(t *testing.T) {
+	reset(t)
+
+	story := newStory(t, alice, "Counted")
+	id := story["id"].(string)
+	if _, ok := story["chapterCount"]; ok {
+		t.Errorf("create response should not carry chapterCount, got %v", story["chapterCount"])
+	}
+
+	// One auto-created chapter, plus two with real text.
+	for i, words := range []string{"one two three", "four five"} {
+		call(t, "POST", fmt.Sprintf("/v1/stories/%s/chapters", id), alice, map[string]any{
+			"title": fmt.Sprintf("Ch %d", i+2), "content": words, "position": i + 1,
+		}).expect(http.StatusCreated)
+	}
+
+	mine := get(t, "/v1/stories", alice).expect(http.StatusOK).list()
+	if len(mine) != 1 {
+		t.Fatalf("expected 1 story, got %d", len(mine))
+	}
+	listed := mine[0]
+	if listed["chapterCount"].(float64) != 3 {
+		t.Errorf("chapterCount = %v, want 3", listed["chapterCount"])
+	}
+	if listed["wordCount"].(float64) != 5 {
+		t.Errorf("wordCount = %v, want 5", listed["wordCount"])
+	}
+	if listed["views"].(float64) != 0 {
+		t.Errorf("views = %v, want 0", listed["views"])
+	}
+	if listed["ratingsCount"].(float64) != 0 {
+		t.Errorf("ratingsCount = %v, want 0", listed["ratingsCount"])
+	}
+}
+
 func TestStoryRequiresAuthAndTitle(t *testing.T) {
 	reset(t)
 

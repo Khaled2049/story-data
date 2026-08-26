@@ -47,6 +47,20 @@ type Story struct {
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
+// StoryListItem is a story plus the aggregates the owner's shelf renders.
+// The counts are derived per request rather than stored on `stories`, so they
+// are only populated by ListStories — a bare Story from Get/Create/Update
+// deliberately carries no stats rather than zeros that look like real ones.
+type StoryListItem struct {
+	Story
+	ChapterCount  int      `json:"chapterCount"`
+	WordCount     int      `json:"wordCount"`
+	Views         int64    `json:"views"`
+	LikeCount     int64    `json:"likeCount"`
+	AverageRating *float64 `json:"averageRating,omitempty"`
+	RatingsCount  int      `json:"ratingsCount"`
+}
+
 type Chapter struct {
 	ID        string    `json:"id"`
 	StoryID   string    `json:"storyId"`
@@ -141,18 +155,43 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, owner_id, title, d
 	return story, nil
 }
 
-func (s *Store) ListStories(ctx context.Context, owner string) ([]Story, error) {
-	rows, err := s.db.Query(ctx, `SELECT id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), revision, created_at, updated_at FROM stories WHERE owner_id=$1 ORDER BY updated_at DESC`, owner)
+func (s *Store) ListStories(ctx context.Context, owner string) ([]StoryListItem, error) {
+	// The aggregates are scalar subqueries rather than joins: joining chapters
+	// and story_tags in one statement multiplies the rows, which DISTINCT can
+	// hide for a count but silently inflates sum(word_count).
+	rows, err := s.db.Query(ctx, `SELECT s.id, s.owner_id, s.title, s.description, s.author_name, s.is_published,
+  COALESCE(s.category,''), COALESCE(s.target_audience,''), COALESCE(s.language,''), COALESCE(s.copyright,''),
+  COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''), s.revision, s.created_at, s.updated_at,
+  (SELECT count(*) FROM chapters c WHERE c.story_id=s.id),
+  (SELECT COALESCE(sum(c.word_count),0) FROM chapters c WHERE c.story_id=s.id),
+  s.views,
+  (SELECT count(*) FROM story_likes sl WHERE sl.story_id=s.id),
+  (SELECT round(avg(sr.rating)::numeric, 1) FROM story_ratings sr WHERE sr.story_id=s.id),
+  (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id)
+FROM stories s WHERE s.owner_id=$1 ORDER BY s.updated_at DESC`, owner)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	stories, err := collectStories(rows)
-	if err != nil {
+	// Non-nil so an empty result serializes as [] rather than null.
+	stories := []StoryListItem{}
+	for rows.Next() {
+		var x StoryListItem
+		var id uuid.UUID
+		if err := rows.Scan(&id, &x.OwnerID, &x.Title, &x.Description, &x.AuthorName, &x.Published,
+			&x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL,
+			&x.Revision, &x.CreatedAt, &x.UpdatedAt,
+			&x.ChapterCount, &x.WordCount, &x.Views, &x.LikeCount, &x.AverageRating, &x.RatingsCount); err != nil {
+			return nil, err
+		}
+		x.ID = id.String()
+		stories = append(stories, x)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	for i := range stories {
-		if err := s.hydrateTags(ctx, &stories[i]); err != nil {
+		if err := s.hydrateTags(ctx, &stories[i].Story); err != nil {
 			return nil, err
 		}
 	}
@@ -467,19 +506,6 @@ func scanChapterWithSummary(row pgx.Row) (Chapter, error) {
 	x.ID = id.String()
 	x.StoryID = sid.String()
 	return x, err
-}
-func collectStories(rows pgx.Rows) ([]Story, error) {
-	// Non-nil so an empty result serializes as [] rather than null; clients
-	// map over these directly.
-	out := []Story{}
-	for rows.Next() {
-		x, err := scanStory(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, x)
-	}
-	return out, rows.Err()
 }
 func collectChapters(rows pgx.Rows) ([]Chapter, error) {
 	out := []Chapter{}
