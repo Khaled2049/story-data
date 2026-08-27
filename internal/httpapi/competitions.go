@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -8,6 +9,22 @@ import (
 	"github.com/google/uuid"
 	"github.com/kh1011/novelsync-story-data/internal/store"
 )
+
+// sweepDuePhases applies any clock-driven phase transition before the request
+// reads or acts on a competition, standing in for the scheduled sweep the
+// service never had. Both competition handlers call it, which covers every
+// route: a stale `scheduled` is what made SubmitCompetition refuse entries.
+//
+// A failure is logged and swallowed rather than failing the request. The sweep
+// is maintenance the caller did not ask for, and the request's own query will
+// surface a genuinely broken database a moment later; refusing to serve a read
+// because a bookkeeping UPDATE hit a lock timeout trades a stale phase for an
+// outage.
+func (s *Server) sweepDuePhases(r *http.Request) {
+	if e := s.store.SweepDuePhases(r.Context()); e != nil {
+		slog.Error("competition phase sweep failed", "error", e)
+	}
+}
 
 func (s *Server) competitions(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/v1/competitions" {
@@ -22,6 +39,7 @@ func (s *Server) competitions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.sweepDuePhases(r)
 	page, e := s.store.ListCompetitions(r.Context(), s.optionalUser(r), r.URL.Query().Get("cursor"), limit)
 	if e != nil {
 		respond(w, nil, e)
@@ -63,6 +81,9 @@ func (s *Server) competition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := p[0]
+	// After the id is known to be well formed, so a scan for garbage paths
+	// cannot drive writes.
+	s.sweepDuePhases(r)
 	if len(p) == 1 {
 		if r.Method == http.MethodGet {
 			x, e := s.store.GetCompetition(r.Context(), id, s.optionalUser(r))

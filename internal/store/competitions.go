@@ -1050,6 +1050,31 @@ func (s *Store) CastBallot(ctx context.Context, id, user string, choices []strin
 	}
 	return tx.Commit(ctx)
 }
+// SweepDuePhases applies the phase transitions the clock already implies, for
+// every competition at once. It exists because AdvanceCompetition is
+// creator-or-admin gated and nothing ever called it on a timer, so a
+// competition sat in `scheduled` past its start date and SubmitCompetition —
+// which requires `open` — refused every entry.
+//
+// Only the two transitions AdvanceCompetition itself performs are applied, and
+// neither moves money: the prize is escrowed by PublishCompetition, refunded by
+// CancelCompetition, and paid out by SettleCompetition. `voting -> settled` is
+// excluded on purpose; it needs a tally and must stay with the settlement
+// transaction.
+//
+// Callers run this before serving a competition request, so it must stay cheap:
+// it is a single set-based statement that writes nothing when nothing is due,
+// and `phase` is re-evaluated at write time, so concurrent sweeps cannot
+// double-apply. A NULL start_at or deadline_at never matches, which mirrors the
+// nil checks in AdvanceCompetition.
+func (s *Store) SweepDuePhases(ctx context.Context) error {
+	_, e := s.db.Exec(ctx, `UPDATE competitions
+SET phase = CASE WHEN phase='scheduled' THEN 'open' ELSE 'voting' END, updated_at = now()
+WHERE (phase='scheduled' AND start_at <= now())
+   OR (phase='open' AND deadline_at < now())`)
+	return e
+}
+
 func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string, admin bool) (Competition, error) {
 	c, e := s.competition(ctx, id, user)
 	if e != nil {
@@ -1078,6 +1103,15 @@ func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string,
 	// already due. Asking for anything else is a request for a door this
 	// endpoint does not have.
 	if target != "" && target != next {
+		// Unless the competition is already there. SweepDuePhases applies the
+		// same clock-driven transitions on any competition request, so a manual
+		// advance now races it, and losing that race is not a failure — the
+		// caller asserted a phase the competition is in. This grants nothing:
+		// it only reports success for a state already reached, and a target
+		// that is neither due nor current is still refused.
+		if target == c.Phase {
+			return c, nil
+		}
 		return c, ErrValidation
 	}
 	if next == "" {

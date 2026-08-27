@@ -1363,6 +1363,85 @@ func TestAdvanceOnlyFollowsTheClock(t *testing.T) {
 	}
 }
 
+// scheduleCompetition publishes a competition that starts in the future, so it
+// lands in "scheduled" rather than "open".
+func scheduleCompetition(t *testing.T, uid, title string) string {
+	t.Helper()
+	grantInitial(t, uid)
+	now := time.Now().UTC()
+	draft := call(t, "POST", "/v1/competition-drafts", uid, map[string]any{
+		"title": title, "description": "d", "category": "flash-fiction",
+		"tags":        []string{"x"},
+		"startDate":   now.Add(time.Hour).Format(time.RFC3339),
+		"deadline":    now.Add(2 * time.Hour).Format(time.RFC3339),
+		"prizeAmount": tale(10), "creatorName": "Alice",
+		"votingDeadline": now.Add(3 * time.Hour).Format(time.RFC3339),
+	}).expect(http.StatusCreated).json()
+	id := draft["id"].(string)
+	published := call(t, "POST", "/v1/competition-publish", uid,
+		map[string]any{"competitionId": id}).expect(http.StatusOK).json()
+	if published["phase"] != "scheduled" {
+		t.Fatalf("a future start should publish as scheduled, got %v", published["phase"])
+	}
+	return id
+}
+
+// passTime moves a competition's clock into the past directly, standing in for
+// the start time or deadline arriving with nobody touching the service. Going
+// through PATCH would not reproduce the bug, because the request itself sweeps.
+func passTime(t *testing.T, id, column string) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE competitions SET `+column+`=now()-interval '1 minute' WHERE id=$1`, id); err != nil {
+		t.Fatalf("backdate %s: %v", column, err)
+	}
+}
+
+// The reported bug: a competition published ahead of its start date sat in
+// "scheduled" forever. Nothing advanced it — no scheduler existed, and
+// AdvanceCompetition is creator-or-admin gated — while SubmitCompetition
+// requires "open", so every entry was refused and the UI hid the button.
+// Reading the competition now carries it forward on its own.
+func TestScheduledCompetitionOpensWithoutAManualAdvance(t *testing.T) {
+	reset(t)
+	id := scheduleCompetition(t, alice, "Starts soon")
+	passTime(t, id, "start_at")
+
+	got := get(t, "/v1/competitions/"+id, bob).expect(http.StatusOK).json()
+	if got["phase"] != "open" {
+		t.Fatalf("a read should open a competition whose start has passed, got %v", got["phase"])
+	}
+
+	// The entry that used to be refused now lands, with no advance call.
+	enter(t, bob, id)
+
+	// The far side of the window closes on its own too.
+	passTime(t, id, "deadline_at")
+	if closed := get(t, "/v1/competitions/"+id, bob).expect(http.StatusOK).json(); closed["phase"] != "voting" {
+		t.Fatalf("a read past the deadline should move to voting, got %v", closed["phase"])
+	}
+}
+
+// The sweep must never open a draft. A draft holds no escrow — only publishing
+// escrows the prize — so opening one would let it take entry fees against a
+// prize that was never funded.
+func TestSweepLeavesUnpublishedDraftsAlone(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	id := newDraft(t, alice, "Never published", tale(10), tale(0))["id"].(string)
+	// newDraft already starts an hour ago; make the deadline stale as well so
+	// both arms of the sweep would match if phase were not checked.
+	passTime(t, id, "deadline_at")
+
+	// Any competition request runs the sweep.
+	get(t, "/v1/competitions", alice).expect(http.StatusOK).list()
+
+	drafts := get(t, "/v1/me/competitions/drafts", alice).expect(http.StatusOK).list()
+	if len(drafts) != 1 || drafts[0]["id"] != id {
+		t.Fatalf("the sweep moved an unpublished draft out of draft: %v", drafts)
+	}
+}
+
 // Defence in depth: even if a competition were opened without its prize in
 // escrow, it must not be able to take an entry fee it could never pay out
 // against.
