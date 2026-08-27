@@ -103,7 +103,11 @@ type PollInput struct {
 	EndDate  string       `json:"endDate"`
 }
 
-const clubSelect = `SELECT id,name,description,image,category,activity,owner_id,meetup,COALESCE(book_of_the_month,'null'::jsonb),COALESCE(reading_schedule,'null'::jsonb) FROM book_clubs`
+const clubBookSelect = `CASE WHEN book_of_the_month->>'source' = 'novelsync'
+  AND NOT EXISTS (SELECT 1 FROM stories st WHERE st.id::text = book_of_the_month->>'storyId' AND st.is_published)
+  THEN 'null'::jsonb ELSE COALESCE(book_of_the_month,'null'::jsonb) END`
+
+const clubSelect = `SELECT id,name,description,image,category,activity,owner_id,meetup,` + clubBookSelect + `,COALESCE(reading_schedule,'null'::jsonb) FROM book_clubs`
 
 func (s *Store) ListBookClubs(ctx context.Context, limit int) ([]BookClub, error) {
 	if limit <= 0 {
@@ -362,6 +366,12 @@ func (s *Store) UpdateBookClubSettings(ctx context.Context, id, user string, in 
 	if !jsonValue(in.BookOfTheMonth) || !jsonValue(in.ReadingSchedule) {
 		return BookClub{}, ErrValidation
 	}
+
+	if ok, e := s.clubBookIsPublic(ctx, in.BookOfTheMonth); e != nil {
+		return BookClub{}, e
+	} else if !ok {
+		return BookClub{}, ErrValidation
+	}
 	book, schedule := "null", "null"
 	if len(in.BookOfTheMonth) > 0 {
 		book = string(in.BookOfTheMonth)
@@ -378,6 +388,28 @@ func (s *Store) UpdateBookClubSettings(ctx context.Context, id, user string, in 
 	}
 	return s.GetBookClub(ctx, id)
 }
+
+func (s *Store) clubBookIsPublic(ctx context.Context, book json.RawMessage) (bool, error) {
+	if len(book) == 0 || string(book) == "null" {
+		return true, nil
+	}
+	var x struct {
+		Source  string `json:"source"`
+		StoryID string `json:"storyId"`
+	}
+	if e := json.Unmarshal(book, &x); e != nil {
+		// Not an object — jsonValue already accepted it as valid JSON, and a
+		// non-object carries no story to vouch for.
+		return true, nil
+	}
+	if x.Source != "novelsync" {
+		return true, nil
+	}
+	var published bool
+	e := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stories WHERE id::text=$1 AND is_published)`, x.StoryID).Scan(&published)
+	return published, e
+}
+
 func (s *Store) DeleteBookClub(ctx context.Context, id, user string) error {
 	cmd, e := s.db.Exec(ctx, `DELETE FROM book_clubs WHERE id=$1 AND owner_id=$2`, id, user)
 	if e != nil {

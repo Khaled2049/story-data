@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 const frank = "user-frank"
@@ -161,6 +163,152 @@ func TestBookClubRejectsServerAssignedFields(t *testing.T) {
 	}).expect(http.StatusCreated).json()
 	if club["id"] == "" || club["id"] == nil {
 		t.Error("server should assign an id")
+	}
+}
+
+// The nested club writes decode with DisallowUnknownFields, so echoing a whole
+// domain object back — the id, the author, the timestamp the server assigns —
+// fails the request outright rather than having the extras ignored. Pinned per
+// endpoint because each one was broken this way independently.
+func TestClubWritesRejectServerAssignedFields(t *testing.T) {
+	reset(t)
+	id := newClub(t, alice, "Contracts")["id"].(string)
+	promptID := newPrompt(t, alice, id, 1, "Q")["id"].(string)
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{"prompt createdAt", clubPath(id) + "/prompts", map[string]any{
+			"chapterNumber": 1, "question": "Q", "description": "",
+			"createdAt": "2026-08-26T00:00:00Z",
+		}},
+		{"prompt creatorId", clubPath(id) + "/prompts", map[string]any{
+			"chapterNumber": 1, "question": "Q", "description": "", "creatorId": alice,
+		}},
+		{"prompt responses", clubPath(id) + "/prompts", map[string]any{
+			"chapterNumber": 1, "question": "Q", "description": "",
+			"responses": []any{},
+		}},
+		{"response userId", clubPath(id) + "/prompts/" + promptID + "/responses",
+			map[string]any{"content": "c", "userId": alice}},
+		{"response createdAt", clubPath(id) + "/prompts/" + promptID + "/responses",
+			map[string]any{"content": "c", "createdAt": "2026-08-26T00:00:00Z"}},
+		{"poll votes", clubPath(id) + "/polls", map[string]any{
+			"type": "book-selection", "question": "Q", "endDate": "",
+			"options": []map[string]any{{"text": "One"}, {"text": "Two"}},
+			"votes":   map[string]any{},
+		}},
+		{"poll isActive", clubPath(id) + "/polls", map[string]any{
+			"type": "book-selection", "question": "Q", "endDate": "",
+			"options":  []map[string]any{{"text": "One"}, {"text": "Two"}},
+			"isActive": true,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			call(t, "POST", tc.path, alice, tc.body).expect(http.StatusBadRequest)
+		})
+	}
+
+	// The mapped bodies — exactly the declared input fields — are accepted, and
+	// the server fills in the identity and timestamps the client tried to send.
+	got := call(t, "POST", clubPath(id)+"/prompts/"+promptID+"/responses", alice,
+		map[string]any{"content": "mapped"}).expect(http.StatusCreated).json()
+	if got["userId"] != alice || got["createdAt"] == nil {
+		t.Errorf("server should assign userId and createdAt, got %v", got)
+	}
+}
+
+// novelsyncBook is the snapshot the client's storyToBook builds when an owner
+// picks a NovelSync story as the club's book.
+func novelsyncBook(storyID, title string) map[string]any {
+	return map[string]any{
+		"id": storyID, "source": "novelsync", "storyId": storyID,
+		"volumeInfo": map[string]any{"title": title, "authors": []string{"a"}},
+	}
+}
+
+func setClubBook(t *testing.T, uid, clubID string, book map[string]any, want int) {
+	t.Helper()
+	call(t, "PATCH", clubPath(clubID)+"/settings", uid,
+		map[string]any{"bookOfTheMonth": book}).expect(want)
+}
+
+// A club book is a snapshot, so it cannot vouch for itself. The picker only
+// offers published stories, but unpublishing afterwards used to leave the
+// club advertising a draft's title, author and cover to every member.
+func TestClubBookIsHiddenOnceItsStoryIsUnpublished(t *testing.T) {
+	reset(t)
+	story := newPublishedStory(t, bob, "Piranesi")
+	storyID := story["id"].(string)
+	id := newClub(t, alice, "Readers")["id"].(string)
+
+	setClubBook(t, alice, id, novelsyncBook(storyID, "Piranesi"), http.StatusOK)
+	if got := get(t, clubPath(id), alice).expect(http.StatusOK).json(); got["bookOfTheMonth"] == nil {
+		t.Fatal("a published story should be visible as the club book")
+	}
+
+	// The author takes it private again.
+	call(t, "PATCH", "/v1/stories/"+storyID, bob, map[string]any{
+		"title": "Piranesi", "description": "d", "authorName": "a",
+		"tags": []string{"x"}, "published": false,
+	}, ifMatch(int64(story["revision"].(float64)))).expect(http.StatusOK)
+
+	got := get(t, clubPath(id), alice).expect(http.StatusOK).json()
+	if got["bookOfTheMonth"] != nil {
+		t.Errorf("club still shows an unpublished story: %v", got["bookOfTheMonth"])
+	}
+	// The listing is the other read path and must agree.
+	for _, c := range get(t, "/v1/book-clubs", alice).expect(http.StatusOK).list() {
+		if c["id"] == id && c["bookOfTheMonth"] != nil {
+			t.Errorf("listing still shows an unpublished story: %v", c["bookOfTheMonth"])
+		}
+	}
+}
+
+// The client picker only lists published stories, so this closes the path
+// around it: PATCHing the settings endpoint directly.
+func TestClubBookRejectsAnUnpublishedStory(t *testing.T) {
+	reset(t)
+	// Alice's own draft — the case where she has every right to read it, but
+	// the club's members do not.
+	draft := newStory(t, alice, "Alice's draft")
+	id := newClub(t, alice, "Readers")["id"].(string)
+
+	setClubBook(t, alice, id, novelsyncBook(draft["id"].(string), "Alice's draft"),
+		http.StatusUnprocessableEntity)
+	setClubBook(t, alice, id, novelsyncBook(uuid.NewString(), "Ghost"),
+		http.StatusUnprocessableEntity)
+	// Malformed ids are a miss, not a query error.
+	setClubBook(t, alice, id, novelsyncBook("not-a-uuid", "Ghost"),
+		http.StatusUnprocessableEntity)
+
+	if got := get(t, clubPath(id), alice).expect(http.StatusOK).json(); got["bookOfTheMonth"] != nil {
+		t.Errorf("a refused book was stored anyway: %v", got["bookOfTheMonth"])
+	}
+}
+
+// Google books have no story to verify, and a legacy book with no source is
+// treated as Google. Neither may be swept up by the published check.
+func TestClubBookLeavesNonStoryBooksAlone(t *testing.T) {
+	reset(t)
+	id := newClub(t, alice, "Readers")["id"].(string)
+
+	google := map[string]any{
+		"id": "gbooks-1", "source": "google",
+		"volumeInfo": map[string]any{"title": "Dune"},
+	}
+	setClubBook(t, alice, id, google, http.StatusOK)
+	if got := get(t, clubPath(id), alice).expect(http.StatusOK).json(); got["bookOfTheMonth"] == nil {
+		t.Fatal("a Google book was hidden by the published check")
+	}
+
+	legacy := map[string]any{"id": "legacy-1", "volumeInfo": map[string]any{"title": "Old"}}
+	setClubBook(t, alice, id, legacy, http.StatusOK)
+	book, _ := get(t, clubPath(id), alice).expect(http.StatusOK).json()["bookOfTheMonth"].(map[string]any)
+	if book == nil || book["id"] != "legacy-1" {
+		t.Errorf("a sourceless legacy book was hidden: %v", book)
 	}
 }
 
