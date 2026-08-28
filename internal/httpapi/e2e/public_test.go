@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -258,6 +259,45 @@ func TestPublicListingFiltersByCategory(t *testing.T) {
 	if none := pageStories(t, publicPage(t, "?category=nonexistent")); len(none) != 0 {
 		t.Errorf("expected no matches, got %v", none)
 	}
+}
+
+func TestPublicListingSearchesTitleAndAuthor(t *testing.T) {
+	reset(t)
+	call(t, "POST", "/v1/stories", alice, map[string]any{
+		"title": "The Dragon's Egg", "description": "d", "authorName": "Ada Bell",
+		"tags": []string{"x"}, "published": true, "category": "fantasy",
+	}).expect(http.StatusCreated)
+	call(t, "POST", "/v1/stories", alice, map[string]any{
+		"title": "Quiet Harbour", "description": "d", "authorName": "Cyd Rowe",
+		"tags": []string{"x"}, "published": true, "category": "fantasy",
+	}).expect(http.StatusCreated)
+
+	// Matches mid-title, not just as a prefix.
+	if hits := pageStories(t, publicPage(t, "?q=dragon")); len(hits) != 1 ||
+		hits[0]["title"] != "The Dragon's Egg" {
+		t.Errorf("title search = %v", hits)
+	}
+	// The author name is searchable through the same term.
+	if hits := pageStories(t, publicPage(t, "?q=rowe")); len(hits) != 1 ||
+		hits[0]["title"] != "Quiet Harbour" {
+		t.Errorf("author search = %v", hits)
+	}
+	// Search composes with the category filter rather than replacing it.
+	if hits := pageStories(t, publicPage(t, "?q=dragon&category=horror")); len(hits) != 0 {
+		t.Errorf("expected no matches, got %v", hits)
+	}
+	// No match is an empty page, not an error.
+	if hits := pageStories(t, publicPage(t, "?q=zzzznope")); len(hits) != 0 {
+		t.Errorf("expected no matches, got %v", hits)
+	}
+	// LIKE wildcards in the term are literal characters, not patterns — "%"
+	// must not turn the search into "match everything".
+	if hits := pageStories(t, publicPage(t, "?q=%25")); len(hits) != 0 {
+		t.Errorf("wildcard leaked into the pattern: %v", hits)
+	}
+	// An overlong term is rejected before it reaches the database.
+	get(t, "/v1/public/stories?q="+strings.Repeat("a", 101), "").
+		expect(http.StatusBadRequest)
 }
 
 // ── ids ─────────────────────────────────────────────────────────────────────

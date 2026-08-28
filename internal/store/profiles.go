@@ -333,8 +333,18 @@ func validProfileText(v string, max int) bool { return len(v) <= max }
 // prefix. Underscore is both a legal username character and a LIKE wildcard, so
 // without escaping a search for "ada_b" would also match "adaXb".
 func likePrefix(v string) string {
+	return escapeLike(v) + "%"
+}
+
+// likeContains is likePrefix's substring counterpart, for searches that must
+// match mid-word (story titles, unlike usernames, are prose).
+func likeContains(v string) string {
+	return "%" + escapeLike(v) + "%"
+}
+
+func escapeLike(v string) string {
 	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(v) + "%"
+	return r.Replace(v)
 }
 func validGuestbookPolicy(v string) bool {
 	return v == "everyone" || v == "followers" || v == "following" || v == "mutuals" || v == "nobody"

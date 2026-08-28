@@ -65,7 +65,7 @@ type publicStoryCursor struct {
 	ID        string    `json:"id"`
 }
 
-func (s *Store) ListPublicStories(ctx context.Context, category, cursor string, pageSize int) (PublicStoryPage, error) {
+func (s *Store) ListPublicStories(ctx context.Context, category, search, cursor string, pageSize int) (PublicStoryPage, error) {
 	if pageSize <= 0 {
 		pageSize = defaultPublicStoryPageSize
 	}
@@ -86,6 +86,14 @@ func (s *Store) ListPublicStories(ctx context.Context, category, cursor string, 
 	if category = strings.TrimSpace(category); category != "" {
 		args = append(args, category)
 		where += fmt.Sprintf(" AND s.category=$%d", len(args))
+	}
+	// Matched against the same concatenation the trigram index is built on
+	// (migration 000018) so the index can actually serve it. A term shorter
+	// than a trigram falls back to a scan, which is why the caller keeps a
+	// minimum length rather than searching on every keystroke.
+	if search = strings.TrimSpace(search); search != "" {
+		args = append(args, likeContains(search))
+		where += fmt.Sprintf(" AND (s.title || ' ' || s.author_name) ILIKE $%d ESCAPE '\\'", len(args))
 	}
 	if after != nil {
 		args = append(args, after.UpdatedAt, mustUUID(after.ID))

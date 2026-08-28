@@ -26,6 +26,10 @@ func (s *Server) viewerKey(r *http.Request) string {
 	return "a:" + hex.EncodeToString(mac.Sum(nil)[:16])
 }
 
+// A discovery search term is a handful of words; anything longer is a pattern
+// nobody typed, so it is rejected rather than sent to the database.
+const maxPublicStorySearchLen = 100
+
 func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 	p := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/public/"), "/"), "/")
 	if len(p) == 1 && p[0] == "stories" {
@@ -38,7 +42,12 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
 			return
 		}
-		x, err := s.store.ListPublicStories(r.Context(), r.URL.Query().Get("category"), r.URL.Query().Get("cursor"), limit)
+		search := r.URL.Query().Get("q")
+		if len(search) > maxPublicStorySearchLen {
+			writeError(w, http.StatusBadRequest, "q must be at most 100 characters")
+			return
+		}
+		x, err := s.store.ListPublicStories(r.Context(), r.URL.Query().Get("category"), search, r.URL.Query().Get("cursor"), limit)
 		respond(w, x, err)
 		return
 	}
