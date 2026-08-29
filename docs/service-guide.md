@@ -258,6 +258,68 @@ available for retry. JSONB metadata must be JSON serializable; PostgreSQL
 numeric values can arrive in Python as `Decimal` values and must be converted
 by the worker before insertion.
 
+## The recommendations schema
+
+`taleTribe-recs` is a separate service, but its schema is not a separate
+database: `recommendations.*` lives here and is created by
+`migrations/000019_recommendations_schema.sql`. recs does not migrate anything,
+so schema changes for it are ordinary story-data migrations.
+
+The boundary that matters is which service reads what. recs pulls its catalog
+from `stories` — published stories are public data that `ListPublicStories`
+already serves to any caller — but it must **never** read `reading_progress`,
+which is strictly private per-user history. So story-data derives the reader
+signals instead:
+
+```bash
+story-data sync-recs      # or: go run ./cmd/api sync-recs
+```
+
+`internal/store/recommendations.go` rebuilds `recommendations.interactions`
+from `story_likes`, `story_ratings` and `reading_progress` in one transaction,
+and copies `stories.views` into `item_stats.views`. It is a full re-derivation
+each run rather than incremental, because these are current *state* rather than
+an event log — un-liking a story deletes the row, and an incremental pass has
+nothing to observe. Rows for `synth_`-prefixed users are left alone; those are
+generated readers recs writes itself.
+
+Two details are implemented here **and** in recs, because recs cannot compute
+them without reading the private table: the engagement weight per signal kind,
+and the completion rule (last chapter, scrolled past 0.9).
+`TestRecommendationSignalWeights` and
+`TestCompletionNeedsLastChapterAndDeepScroll` pin both to recs's Python values,
+so drift fails a test rather than silently re-ranking the catalog.
+
+Everything downstream of `interactions` belongs to recs and never leaves the
+schema. Migration `000020` grants a `recs_service` role usage on
+`recommendations` only — and on `public` solely so it can resolve the `vector`
+type, with no table grant. The grant is a no-op where that role does not exist,
+which is every local and test database.
+
+> **⚠ Open gap in `000020`, to resolve before that role is created.** recs's
+> catalog ingest reads `stories`, `story_tags`, `chapters` and
+> `chapter_summaries`, and its retirement pass runs
+> `UPDATE recommendations.items … FROM stories`. `000020` issues no `SELECT` on
+> any `public` table, so the first ingest run as `recs_service` fails with
+> `permission denied for table stories`. Nobody has hit it because the role does
+> not exist anywhere yet and local development runs as `postgres`. The fix is
+> either a new migration granting `SELECT` on those four tables (consistent with
+> "published stories are public data"), or a second role for the ingest job. It
+> has to be decided here, not in recs.
+
+### Documentation
+
+recs is documented in `repos/taleTribe-recs/recommendation_engine/docs/`, indexed
+by `README.md` there. The two most relevant from this side:
+
+- **`jobs.md`** — how `sync-recs` fits with recs's two jobs, why the order is
+  fixed (`sync-recs` joins `recommendations.items`, so a like on a story that has
+  not been ingested yet produces no row), and the `item_stats.views` column split
+  that lets both services write that table safely.
+- **`security-and-roles.md`** — the full privacy argument behind this section,
+  the threat table, and the pseudonymisation decision that must be made before
+  the first real sync.
+
 ## Local development
 
 The easiest integrated startup is from the workspace root:

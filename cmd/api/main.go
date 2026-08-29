@@ -25,8 +25,11 @@ import (
 const (
 	connectTimeout = 60 * time.Second
 	migrateTimeout = 5 * time.Minute
-	maxConns       = 10
-	migrateLockID  = 82104231
+	// A full re-derivation of the reader signals. Generous because it scans the
+	// social tables end to end, but bounded so a scheduled run cannot hang.
+	syncRecsTimeout = 10 * time.Minute
+	maxConns        = 10
+	migrateLockID   = 82104231
 
 	// Without these the server runs on a zero-value http.Server, where a
 	// client that opens a connection and dribbles headers holds a goroutine
@@ -76,6 +79,21 @@ func main() {
 		return
 	}
 	st := store.New(db)
+	// Rebuild the reader signals taleTribe-recs scores on, then exit. Run on a
+	// schedule (Cloud Scheduler → a Cloud Run job), not by the serving process:
+	// recommendation staleness of minutes is not a product problem, and this
+	// keeps a full scan of the social tables off the request path.
+	if len(os.Args) > 1 && os.Args[1] == "sync-recs" {
+		syncCtx, cancelSync := context.WithTimeout(context.Background(), syncRecsTimeout)
+		defer cancelSync()
+		stats, e := st.SyncRecommendationSignals(syncCtx)
+		if e != nil {
+			log.Fatal(e)
+		}
+		slog.Info("recommendation signals synced",
+			"interactions", stats.Interactions, "views", stats.Views)
+		return
+	}
 	if cfg.VoterMinProfileAge != nil {
 		st.VoterMinProfileAge = *cfg.VoterMinProfileAge
 	}
