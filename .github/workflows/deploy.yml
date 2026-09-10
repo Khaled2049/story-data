@@ -55,6 +55,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # Keep deployment tests equivalent to PR tests. The PostgreSQL service is
+      # ephemeral, so this cannot affect the production role.
+      - name: Create restricted recommendation role
+        run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE ROLE recs_service NOLOGIN'
+
       - run: go test ./... -count=1
 
   deploy:

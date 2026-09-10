@@ -90,6 +90,9 @@ Migration groups correspond to product domains:
 | `000004`–`000006` | Public reads, social interactions, and profiles |
 | `000007` | Reading progress/history |
 | `000008`–`000010` | Guestbooks, book clubs, and competitions/token ledger |
+| `000011`–`000018` | Competition repair, quotas, validation ceilings, profile names, and public search |
+| `000019`–`000021` | Recommendation schema, restricted service role, and catalog-read grant |
+| `000022`–`000023` | Per-user and platform-wide recommendation LLM budgets |
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an
@@ -258,6 +261,105 @@ available for retry. JSONB metadata must be JSON serializable; PostgreSQL
 numeric values can arrive in Python as `Decimal` values and must be converted
 by the worker before insertion.
 
+## The recommendations schema
+
+`taleTribe-recs` is a separate service, but its schema is not a separate
+database: `recommendations.*` lives here and is created by
+`migrations/000019_recommendations_schema.sql`. recs does not migrate anything,
+so schema changes for it are ordinary story-data migrations.
+
+The boundary that matters is which service reads what. recs pulls its catalog
+from `stories` — published stories are public data that `ListPublicStories`
+already serves to any caller — but it must **never** read `reading_progress`,
+which is strictly private per-user history. So story-data derives the reader
+signals instead:
+
+```bash
+story-data sync-recs      # or: go run ./cmd/api sync-recs
+```
+
+`internal/store/recommendations.go` rebuilds `recommendations.interactions`
+from `story_likes`, `story_ratings` and `reading_progress` in one transaction,
+and copies `stories.views` into `item_stats.views`. It is a full re-derivation
+each run rather than incremental, because these are current *state* rather than
+an event log — un-liking a story deletes the row, and an incremental pass has
+nothing to observe. Rows for `synth_`-prefixed users are left alone; those are
+generated readers recs writes itself.
+
+Two details are implemented here **and** in recs, because recs cannot compute
+them without reading the private table: the engagement weight per signal kind,
+and the completion rule (last chapter, scrolled past 0.9).
+`TestRecommendationSignalWeights` and
+`TestCompletionNeedsLastChapterAndDeepScroll` pin both to recs's Python values,
+so drift fails a test rather than silently re-ranking the catalog.
+
+Everything downstream of `interactions` belongs to recs and never leaves the
+schema. Migration `000020` grants a `recs_service` role usage on
+`recommendations` only — and on `public` solely so it can resolve the `vector`
+type, with no table grant. The grant is a no-op where that role does not exist,
+which is every local and test database.
+
+Catalog ingest also needs read-only access to `stories`, `story_tags`, `chapters`
+and `chapter_summaries`; migration `000021` grants exactly those four tables.
+This is broader than row-level public visibility—the role can technically read
+draft rows—but is the deliberately small deployment fix, and the ingest query
+still selects only published stories. It does not grant access to
+`story_likes`, `story_ratings` or `reading_progress`.
+
+The role grants are guarded because the production role is absent in ordinary
+local databases. Create `recs_service` **before** applying migrations `000020`
+through `000023`. Goose records a guarded migration as applied even when the
+role is absent, so creating the role afterward does not apply the grants
+retroactively. CI creates a `NOLOGIN` role in its ephemeral PostgreSQL cluster
+and asserts both the required grants and the prohibited private-table reads.
+
+### `recommendations.llm_usage` — the daily spend ceiling
+
+Migration `000022` adds `recommendations.llm_usage (user_id, day, kind,
+call_count)`, the same shape as `indexing_usage` (`000013`) and for the same
+reason. recs calls Gemini directly, so **creditProxy is not in that path**:
+neither `PLATFORM_DAILY_REQUEST_LIMIT` nor the per-user `MAX_AI_USAGE` bounds a
+HyDE search or an explanation. Its in-process token bucket bounds bursts but not
+spend — the real ceiling is `instances x limit`, and it resets on every deploy.
+
+recs owns the reads and writes (`recommendation_engine/usage.py`); story-data
+owns the table only because it owns every migration in this database. The two
+`kind` values are `search` and `explain`, budgeted separately so a reader
+clicking "Why this story?" cannot consume their search allowance. Defaults are
+10 searches and 30 explanations per user per UTC day.
+
+Migration `000023` adds `recommendations.llm_platform_usage (day, kind,
+call_count)` — the same counter with no user in the key. Per-user budgets
+multiply by the user count, so alone they bound nothing in total; this is the
+ceiling `PLATFORM_DAILY_REQUEST_LIMIT` would give these routes if creditProxy
+were in them. Defaults are 1000 searches and 1000 explanations per UTC day.
+
+Both counters move in **one statement**, and its ordering is load bearing: the
+platform insert selects `FROM charged_user`, so it increments nothing when the
+user's own guard already refused. The other order would let a single user who
+had spent their own allowance keep driving the platform counter with requests
+that are refused anyway — denying the feature to everyone else.
+
+Note this is the one place recs writes on the **primary** rather than its
+read-only compute: a counter has to be durable and shared across instances to
+mean anything. The write is one upsert per metered request, which the ceilings
+themselves bound. The platform row is a hot row by construction — one per kind
+per day — and deliberately so, since the contention is bounded by the ceiling
+that row enforces.
+
+### Documentation
+
+recs is documented in `repos/taleTribe-recs/recommendation_engine/docs/`, indexed
+by `README.md` there. The two most relevant from this side:
+
+- **`jobs.md`** — how `sync-recs` fits with recs's two jobs, why the order is
+  fixed (`sync-recs` joins `recommendations.items`, so a like on a story that has
+  not been ingested yet produces no row), and the `item_stats.views` column split
+  that lets both services write that table safely.
+- **`security-and-roles.md`** — the full privacy argument behind this section,
+  the threat table, and the pseudonymisation decision that must be made before
+  the first real sync.
+
 ## Local development
 
 The easiest integrated startup is from the workspace root:
@@ -316,3 +418,18 @@ secrets through the deployment environment, not source control. Terraform
 configuration lives in `terraform/`; inspect it before changing deployment
 resources. Apply migrations through the normal application startup/deployment
 path so the advisory lock protects concurrent instances.
+
+Terraform also deploys `novelsync-story-data-sync-recs`, a single-task Cloud Run
+Job using the API image and the owner database credential. The recommendations
+stack invokes it between its catalog-ingest and aggregate-refresh jobs; this
+repository deliberately owns no independent schedule because three separate
+cron triggers would not enforce that ordering. Operators can run it directly:
+
+```sh
+gcloud run jobs execute novelsync-story-data-sync-recs \
+  --project=story-6f89f --region=us-central1 --wait
+```
+
+The job performs a transactional full derivation and is safe to retry. Do not
+run overlapping executions: they do redundant full scans and contend while
+replacing the same interaction rows.
