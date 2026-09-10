@@ -52,6 +52,12 @@ jobs:
 
       - run: go mod download
 
+      # Role migrations are deliberately guarded in ordinary local databases.
+      # Create the production-shaped role in this ephemeral CI cluster so the
+      # e2e suite exercises the GRANT branches rather than only parsing them.
+      - name: Create restricted recommendation role
+        run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE ROLE recs_service NOLOGIN'
+
       - name: Check formatting
         run: |
           unformatted="$(gofmt -l cmd internal)"

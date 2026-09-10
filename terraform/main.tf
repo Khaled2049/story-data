@@ -106,4 +106,55 @@ resource "google_cloud_run_v2_service_iam_member" "public" {
   member   = "allUsers"
 }
 
+# Full recommendation-signal derivation. This is a job rather than part of the
+# API process because it scans the social and reading-progress tables end to
+# end. The recommendations stack owns the workflow that invokes it after the
+# catalog ingest and before the aggregate refresh.
+resource "google_cloud_run_v2_job" "sync_recs" {
+  name     = "novelsync-story-data-sync-recs"
+  location = var.region
+
+  template {
+    task_count  = 1
+    parallelism = 1
+
+    template {
+      service_account = data.google_service_account.runtime.email
+      max_retries     = 1
+      timeout         = "600s"
+
+      containers {
+        image = var.image
+        args  = ["sync-recs"]
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "512Mi"
+          }
+        }
+
+        env {
+          name = "DATABASE_URL"
+          value_source {
+            secret_key_ref {
+              secret  = data.google_secret_manager_secret.database_url.secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.run,
+    google_secret_manager_secret_iam_member.database_url,
+  ]
+}
+
 output "service_url" { value = google_cloud_run_v2_service.api.uri }
+
+output "sync_recs_job_name" {
+  value = google_cloud_run_v2_job.sync_recs.name
+}

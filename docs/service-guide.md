@@ -90,6 +90,9 @@ Migration groups correspond to product domains:
 | `000004`–`000006` | Public reads, social interactions, and profiles |
 | `000007` | Reading progress/history |
 | `000008`–`000010` | Guestbooks, book clubs, and competitions/token ledger |
+| `000011`–`000018` | Competition repair, quotas, validation ceilings, profile names, and public search |
+| `000019`–`000021` | Recommendation schema, restricted service role, and catalog-read grant |
+| `000022`–`000023` | Per-user and platform-wide recommendation LLM budgets |
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an
@@ -296,16 +299,53 @@ schema. Migration `000020` grants a `recs_service` role usage on
 type, with no table grant. The grant is a no-op where that role does not exist,
 which is every local and test database.
 
-> **⚠ Open gap in `000020`, to resolve before that role is created.** recs's
-> catalog ingest reads `stories`, `story_tags`, `chapters` and
-> `chapter_summaries`, and its retirement pass runs
-> `UPDATE recommendations.items … FROM stories`. `000020` issues no `SELECT` on
-> any `public` table, so the first ingest run as `recs_service` fails with
-> `permission denied for table stories`. Nobody has hit it because the role does
-> not exist anywhere yet and local development runs as `postgres`. The fix is
-> either a new migration granting `SELECT` on those four tables (consistent with
-> "published stories are public data"), or a second role for the ingest job. It
-> has to be decided here, not in recs.
+Catalog ingest also needs read-only access to `stories`, `story_tags`, `chapters`
+and `chapter_summaries`; migration `000021` grants exactly those four tables.
+This is broader than row-level public visibility—the role can technically read
+draft rows—but is the deliberately small deployment fix, and the ingest query
+still selects only published stories. It does not grant access to
+`story_likes`, `story_ratings` or `reading_progress`.
+
+The role grants are guarded because the production role is absent in ordinary
+local databases. Create `recs_service` **before** applying migrations `000020`
+through `000023`. Goose records a guarded migration as applied even when the
+role is absent, so creating the role afterward does not apply the grants
+retroactively. CI creates a `NOLOGIN` role in its ephemeral PostgreSQL cluster
+and asserts both the required grants and the prohibited private-table reads.
+
+### `recommendations.llm_usage` — the daily spend ceiling
+
+Migration `000022` adds `recommendations.llm_usage (user_id, day, kind,
+call_count)`, the same shape as `indexing_usage` (`000013`) and for the same
+reason. recs calls Gemini directly, so **creditProxy is not in that path**:
+neither `PLATFORM_DAILY_REQUEST_LIMIT` nor the per-user `MAX_AI_USAGE` bounds a
+HyDE search or an explanation. Its in-process token bucket bounds bursts but not
+spend — the real ceiling is `instances x limit`, and it resets on every deploy.
+
+recs owns the reads and writes (`recommendation_engine/usage.py`); story-data
+owns the table only because it owns every migration in this database. The two
+`kind` values are `search` and `explain`, budgeted separately so a reader
+clicking "Why this story?" cannot consume their search allowance. Defaults are
+10 searches and 30 explanations per user per UTC day.
+
+Migration `000023` adds `recommendations.llm_platform_usage (day, kind,
+call_count)` — the same counter with no user in the key. Per-user budgets
+multiply by the user count, so alone they bound nothing in total; this is the
+ceiling `PLATFORM_DAILY_REQUEST_LIMIT` would give these routes if creditProxy
+were in them. Defaults are 1000 searches and 1000 explanations per UTC day.
+
+Both counters move in **one statement**, and its ordering is load bearing: the
+platform insert selects `FROM charged_user`, so it increments nothing when the
+user's own guard already refused. The other order would let a single user who
+had spent their own allowance keep driving the platform counter with requests
+that are refused anyway — denying the feature to everyone else.
+
+Note this is the one place recs writes on the **primary** rather than its
+read-only compute: a counter has to be durable and shared across instances to
+mean anything. The write is one upsert per metered request, which the ceilings
+themselves bound. The platform row is a hot row by construction — one per kind
+per day — and deliberately so, since the contention is bounded by the ceiling
+that row enforces.
 
 ### Documentation
 
@@ -378,3 +418,18 @@ secrets through the deployment environment, not source control. Terraform
 configuration lives in `terraform/`; inspect it before changing deployment
 resources. Apply migrations through the normal application startup/deployment
 path so the advisory lock protects concurrent instances.
+
+Terraform also deploys `novelsync-story-data-sync-recs`, a single-task Cloud Run
+Job using the API image and the owner database credential. The recommendations
+stack invokes it between its catalog-ingest and aggregate-refresh jobs; this
+repository deliberately owns no independent schedule because three separate
+cron triggers would not enforce that ordering. Operators can run it directly:
+
+```sh
+gcloud run jobs execute novelsync-story-data-sync-recs \
+  --project=story-6f89f --region=us-central1 --wait
+```
+
+The job performs a transactional full derivation and is safe to retry. Do not
+run overlapping executions: they do redundant full scans and contend while
+replacing the same interaction rows.

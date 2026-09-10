@@ -47,6 +47,7 @@ type Story struct {
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
+
 // StoryListItem is a story plus the aggregates the owner's shelf renders.
 // The counts are derived per request rather than stored on `stories`, so they
 // are only populated by ListStories — a bare Story from Get/Create/Update

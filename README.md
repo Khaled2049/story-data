@@ -31,6 +31,11 @@ uses Firebase ID tokens in `Authorization: Bearer <token>` and requires
 Run migrations with `go run ./cmd/api migrate`. The API also runs outstanding
 migrations at startup, under a PostgreSQL advisory lock.
 
+`go run ./cmd/api sync-recs` rebuilds the derived signals consumed by
+`taleTribe-recs`. Production runs the same command as the
+`novelsync-story-data-sync-recs` Cloud Run Job; it is invoked by the ordered
+recommendations workflow rather than by the API process.
+
 For pgvector local development, use `docker compose up --build`; the bundled
 database image includes the `vector` extension. Then run agents with
 `STORY_DATA_DATABASE_URL=postgres://postgres:postgres@localhost:5433/story_data`

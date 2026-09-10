@@ -1050,6 +1050,7 @@ func (s *Store) CastBallot(ctx context.Context, id, user string, choices []strin
 	}
 	return tx.Commit(ctx)
 }
+
 // SweepDuePhases applies the phase transitions the clock already implies, for
 // every competition at once. It exists because AdvanceCompetition is
 // creator-or-admin gated and nothing ever called it on a timer, so a

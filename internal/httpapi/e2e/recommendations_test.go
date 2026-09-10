@@ -308,3 +308,47 @@ func TestSyncIgnoresStoriesOutsideTheCatalog(t *testing.T) {
 		t.Fatalf("derived %d interactions for an uncatalogued story, want 0", stats.Interactions)
 	}
 }
+
+func TestRecommendationRolePrivileges(t *testing.T) {
+	ctx := context.Background()
+	var roleExists bool
+	if err := testPool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='recs_service')`).Scan(&roleExists); err != nil {
+		t.Fatal(err)
+	}
+	if !roleExists {
+		t.Skip("recs_service is created by CI to exercise guarded production grants")
+	}
+
+	for _, tc := range []struct {
+		table     string
+		privilege string
+		want      bool
+	}{
+		// The catalog ingest reads exactly these public source tables.
+		{"public.stories", "SELECT", true},
+		{"public.story_tags", "SELECT", true},
+		{"public.chapters", "SELECT", true},
+		{"public.chapter_summaries", "SELECT", true},
+
+		// Reader-level source data stays behind the story-data boundary.
+		{"public.story_likes", "SELECT", false},
+		{"public.story_ratings", "SELECT", false},
+		{"public.reading_progress", "SELECT", false},
+
+		// Recs owns its derived schema, including both durable LLM budgets.
+		{"recommendations.items", "SELECT", true},
+		{"recommendations.items", "INSERT", true},
+		{"recommendations.llm_usage", "UPDATE", true},
+		{"recommendations.llm_platform_usage", "UPDATE", true},
+	} {
+		var got bool
+		if err := testPool.QueryRow(ctx,
+			`SELECT has_table_privilege('recs_service', $1, $2)`, tc.table, tc.privilege).Scan(&got); err != nil {
+			t.Fatalf("%s %s: %v", tc.privilege, tc.table, err)
+		}
+		if got != tc.want {
+			t.Errorf("recs_service %s on %s = %v, want %v", tc.privilege, tc.table, got, tc.want)
+		}
+	}
+}
