@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,9 +16,31 @@ var ErrNotFound = errors.New("not found")
 var ErrForbidden = errors.New("forbidden")
 var ErrConflict = errors.New("revision conflict")
 var ErrUsernameTaken = errors.New("username already taken")
-var ErrLimit = errors.New("story limit exceeded")
+
+var ErrLimit = errors.New("limit exceeded")
 var ErrRateLimit = errors.New("rate limit exceeded")
 var ErrValidation = errors.New("invalid input")
+
+type sentinelError struct {
+	sentinel error
+	msg      string
+}
+
+func (e sentinelError) Error() string { return e.msg }
+
+func (e sentinelError) Is(target error) bool { return target == e.sentinel }
+
+func sentinelErrf(sentinel error, format string, a ...any) error {
+	return sentinelError{sentinel: sentinel, msg: fmt.Sprintf(format, a...)}
+}
+
+func limitErrf(format string, a ...any) error {
+	return sentinelErrf(ErrLimit, format, a...)
+}
+
+func conflictErrf(format string, a ...any) error {
+	return sentinelErrf(ErrConflict, format, a...)
+}
 
 const chapterLimit = 50
 const wordLimit = 5000
@@ -134,7 +157,7 @@ func (s *Store) CreateStory(ctx context.Context, owner string, in StoryInput) (S
 		return Story{}, err
 	}
 	if owned >= storyLimit {
-		return Story{}, ErrLimit
+		return Story{}, limitErrf("you have reached the limit of %d stories", storyLimit)
 	}
 	row := tx.QueryRow(ctx, `INSERT INTO stories (id, owner_id, title, description, author_name, is_published, category, target_audience, language, copyright, cover_image_url, thumbnail_url)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), revision, created_at, updated_at`, id, owner, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL))
@@ -344,14 +367,14 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 		return Chapter{}, ErrForbidden
 	}
 	if wordCount(in.Content) > wordLimit {
-		return Chapter{}, ErrLimit
+		return Chapter{}, limitErrf("a chapter can hold at most %d words; split this into another chapter to keep writing", wordLimit)
 	}
 	var count int
 	if err := s.db.QueryRow(ctx, `SELECT count(*) FROM chapters WHERE story_id=$1`, storyID).Scan(&count); err != nil {
 		return Chapter{}, err
 	}
 	if count >= chapterLimit {
-		return Chapter{}, ErrLimit
+		return Chapter{}, limitErrf("this story has reached the limit of %d chapters", chapterLimit)
 	}
 	id := uuid.New()
 	words := wordCount(in.Content)
@@ -363,11 +386,9 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 	row := tx.QueryRow(ctx, `INSERT INTO chapters (id, story_id, title, content, position, word_count) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, story_id, title, content, position, word_count, revision, created_at, updated_at`, id, storyID, in.Title, in.Content, in.Position, words)
 	chapter, err := scanChapter(row)
 	if err != nil {
-		// chapters is UNIQUE (story_id, position), so reusing a position is a
-		// caller mistake rather than a server fault.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return Chapter{}, ErrConflict
+			return Chapter{}, conflictErrf("a chapter already occupies position %v in this story", in.Position)
 		}
 		return Chapter{}, err
 	}
@@ -383,7 +404,7 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 
 func (s *Store) UpdateChapter(ctx context.Context, storyID, id, owner string, rev int64, in ChapterInput) (Chapter, error) {
 	if wordCount(in.Content) > wordLimit {
-		return Chapter{}, ErrLimit
+		return Chapter{}, limitErrf("a chapter can hold at most %d words; split this into another chapter to keep writing", wordLimit)
 	}
 	tx, err := s.db.Begin(ctx)
 	if err != nil {

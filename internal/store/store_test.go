@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -56,5 +57,31 @@ func TestProfileValidation(t *testing.T) {
 	}
 	if _, ok := normalizeWallet("not-a-wallet"); ok {
 		t.Fatal("expected invalid wallet")
+	}
+}
+
+func TestLimitErrfMatchesErrLimit(t *testing.T) {
+	err := limitErrf("a chapter can hold at most %d words", wordLimit)
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("limitErrf() does not match ErrLimit; httpapi would return 500 instead of 422")
+	}
+	if got := err.Error(); got != "a chapter can hold at most 5000 words" {
+		t.Fatalf("limitErrf() = %q, want the formatted message alone", got)
+	}
+	if errors.Is(err, ErrValidation) {
+		t.Fatal("limitErrf() must not match unrelated sentinels")
+	}
+}
+
+func TestConflictErrfMatchesErrConflict(t *testing.T) {
+	err := conflictErrf("a chapter already occupies position %v in this story", float64(2))
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflictErrf() does not match ErrConflict; httpapi would return 500 instead of 409")
+	}
+	if got := err.Error(); got != "a chapter already occupies position 2 in this story" {
+		t.Fatalf("conflictErrf() = %q, want the formatted message alone", got)
+	}
+	if errors.Is(err, ErrLimit) {
+		t.Fatal("conflictErrf() must not match unrelated sentinels")
 	}
 }
