@@ -173,6 +173,10 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 		s.worldbuilding(w, r, uid, p[0], p)
 		return
 	}
+	if p[1] == "assistant-threads" {
+		s.assistantThreads(w, r, uid, p[0], p)
+		return
+	}
 	if p[1] == "chapters" && len(p) >= 4 && p[3] == "comments" {
 		// Guarded here rather than inside `comments`: this branch returns
 		// before the uuidPath checks further down, and every route below puts

@@ -150,8 +150,13 @@ func (s *Store) CreateStory(ctx context.Context, owner string, in StoryInput) (S
 		return Story{}, err
 	}
 	defer tx.Rollback(ctx)
-	// Counted inside the transaction rather than before it, so a caller cannot
-	// widen the ceiling by firing creates concurrently.
+	// There is no owner row to lock when a user has no stories yet, so serialize
+	// the count-and-insert section with a transaction-scoped advisory lock. The
+	// key is namespaced to this invariant; unrelated users still create in
+	// parallel, while concurrent creates for one owner cannot both observe 99.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "story-limit:"+owner); err != nil {
+		return Story{}, err
+	}
 	var owned int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM stories WHERE owner_id=$1`, owner).Scan(&owned); err != nil {
 		return Story{}, err
@@ -359,22 +364,8 @@ func (s *Store) PutChapterSummary(ctx context.Context, storyID, id, owner string
 }
 
 func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in ChapterInput) (Chapter, error) {
-	story, err := s.GetStory(ctx, storyID, owner)
-	if err != nil {
-		return Chapter{}, err
-	}
-	if story.OwnerID != owner {
-		return Chapter{}, ErrForbidden
-	}
 	if wordCount(in.Content) > wordLimit {
 		return Chapter{}, limitErrf("a chapter can hold at most %d words; split this into another chapter to keep writing", wordLimit)
-	}
-	var count int
-	if err := s.db.QueryRow(ctx, `SELECT count(*) FROM chapters WHERE story_id=$1`, storyID).Scan(&count); err != nil {
-		return Chapter{}, err
-	}
-	if count >= chapterLimit {
-		return Chapter{}, limitErrf("this story has reached the limit of %d chapters", chapterLimit)
 	}
 	id := uuid.New()
 	words := wordCount(in.Content)
@@ -383,6 +374,19 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 		return Chapter{}, err
 	}
 	defer tx.Rollback(ctx)
+	// Locking the parent serializes the count-and-insert section for this story.
+	// A count outside the transaction lets two concurrent creates at 49 both
+	// pass and leave 51 chapters.
+	if err = lockOwnedStory(ctx, tx, storyID, owner); err != nil {
+		return Chapter{}, err
+	}
+	var count int
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM chapters WHERE story_id=$1`, storyID).Scan(&count); err != nil {
+		return Chapter{}, err
+	}
+	if count >= chapterLimit {
+		return Chapter{}, limitErrf("this story has reached the limit of %d chapters", chapterLimit)
+	}
 	row := tx.QueryRow(ctx, `INSERT INTO chapters (id, story_id, title, content, position, word_count) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, story_id, title, content, position, word_count, revision, created_at, updated_at`, id, storyID, in.Title, in.Content, in.Position, words)
 	chapter, err := scanChapter(row)
 	if err != nil {
@@ -394,6 +398,9 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO indexing_outbox (id, aggregate_type, aggregate_id, story_id, operation, revision) VALUES ($1,'chapter',$2,$3,'upsert',$4)`, uuid.New(), id, storyID, chapter.Revision)
 	if err != nil {
+		return Chapter{}, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE stories SET updated_at=now() WHERE id=$1`, storyID); err != nil {
 		return Chapter{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -411,6 +418,9 @@ func (s *Store) UpdateChapter(ctx context.Context, storyID, id, owner string, re
 		return Chapter{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err = lockOwnedStory(ctx, tx, storyID, owner); err != nil {
+		return Chapter{}, err
+	}
 	row := tx.QueryRow(ctx, `UPDATE chapters c SET title=$1, content=$2, position=$3, word_count=$4, revision=c.revision+1, updated_at=now() FROM stories s WHERE c.id=$5 AND c.story_id=$6 AND c.story_id=s.id AND s.owner_id=$7 AND c.revision=$8 RETURNING c.id, c.story_id, c.title, c.content, c.position, c.word_count, c.revision, c.created_at, c.updated_at`, in.Title, in.Content, in.Position, wordCount(in.Content), id, storyID, owner, rev)
 	chapter, err := scanChapter(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -421,6 +431,9 @@ func (s *Store) UpdateChapter(ctx context.Context, storyID, id, owner string, re
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO indexing_outbox (id, aggregate_type, aggregate_id, story_id, operation, revision) VALUES ($1,'chapter',$2,$3,'upsert',$4)`, uuid.New(), id, storyID, chapter.Revision)
 	if err != nil {
+		return Chapter{}, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE stories SET updated_at=now() WHERE id=$1`, storyID); err != nil {
 		return Chapter{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -435,6 +448,9 @@ func (s *Store) DeleteChapter(ctx context.Context, storyID, id, owner string, re
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err = lockOwnedStory(ctx, tx, storyID, owner); err != nil {
+		return err
+	}
 	row := tx.QueryRow(ctx, `DELETE FROM chapters c USING stories s WHERE c.id=$1 AND c.story_id=$2 AND c.story_id=s.id AND s.owner_id=$3 AND c.revision=$4 RETURNING c.id`, id, storyID, owner, rev)
 	var deleted string
 	if err := row.Scan(&deleted); errors.Is(err, pgx.ErrNoRows) {
@@ -446,7 +462,28 @@ func (s *Store) DeleteChapter(ctx context.Context, storyID, id, owner string, re
 	if err != nil {
 		return err
 	}
+	if _, err = tx.Exec(ctx, `UPDATE stories SET updated_at=now() WHERE id=$1`, storyID); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
+}
+
+// lockOwnedStory is the common first lock for chapter mutations. Besides
+// enforcing ownership without exposing a private story, the row lock gives
+// CreateChapter a per-story serialization point for its hard chapter limit.
+func lockOwnedStory(ctx context.Context, tx pgx.Tx, storyID, owner string) error {
+	var actualOwner string
+	err := tx.QueryRow(ctx, `SELECT owner_id FROM stories WHERE id=$1 FOR UPDATE`, storyID).Scan(&actualOwner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if actualOwner != owner {
+		return ErrForbidden
+	}
+	return nil
 }
 
 func (s *Store) StoryContext(ctx context.Context, id, caller string) (Context, error) {

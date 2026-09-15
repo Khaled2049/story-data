@@ -52,6 +52,7 @@ and `INDEXING_WORKER_ENABLED=true`.
 - `GET, PATCH, DELETE /v1/stories/{storyId}`
 - `GET, POST /v1/stories/{storyId}/chapters`
 - `GET, PATCH, DELETE /v1/stories/{storyId}/chapters/{chapterId}`
+- Durable assistant threads and rich messages under `/v1/stories/{storyId}/assistant-threads`
 - `GET /v1/stories/{storyId}/context` (internal AI context endpoint)
 
 Mutating story and chapter requests require `If-Match: <revision>` when
