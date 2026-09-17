@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -190,6 +191,44 @@ func TestStoryLimitIsEnforced(t *testing.T) {
 	call(t, "POST", "/v1/stories", bob, map[string]any{"title": "Fine"}).expect(http.StatusCreated)
 }
 
+func TestStoryLimitSerializesConcurrentCreates(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO stories (id, owner_id, title)
+		SELECT gen_random_uuid(), $1, 'Filler ' || g FROM generate_series(1,99) g`, alice); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the same per-owner lock CreateStory takes. The HTTP request must wait;
+	// while it does, add the hundredth row. Once released it must observe the new
+	// count and reject instead of becoming row 101.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "story-limit:"+alice); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan response, 1)
+	go func() {
+		done <- call(t, http.MethodPost, "/v1/stories", alice, map[string]any{"title": "Racing"})
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("create did not wait for the per-owner limit lock: status %d", got.Status)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO stories (id,owner_id,title) VALUES(gen_random_uuid(),$1,'Hundred')`, alice); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	(<-done).expect(http.StatusUnprocessableEntity)
+}
+
 // ── chapters ────────────────────────────────────────────────────────────────
 
 func TestChapterCRUD(t *testing.T) {
@@ -228,6 +267,90 @@ func TestChapterCRUD(t *testing.T) {
 	newRev := int64(updated["revision"].(float64))
 	call(t, "DELETE", base+"/"+chapterID, alice, nil, ifMatch(newRev)).expect(http.StatusNoContent)
 	get(t, base+"/"+chapterID, alice).expect(http.StatusNotFound)
+}
+
+func TestChapterMutationsTouchTheParentStory(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	story := newStory(t, alice, "Active")
+	id := story["id"].(string)
+	base := "/v1/stories/" + id + "/chapters"
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	touchWasRecorded := func(action string) {
+		t.Helper()
+		var updated time.Time
+		if err := testPool.QueryRow(ctx, `SELECT updated_at FROM stories WHERE id=$1`, id).Scan(&updated); err != nil {
+			t.Fatal(err)
+		}
+		if !updated.After(old) {
+			t.Errorf("%s left parent story updated_at at %v", action, updated)
+		}
+	}
+	resetTimestamp := func() {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, `UPDATE stories SET updated_at=$1 WHERE id=$2`, old, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resetTimestamp()
+	created := call(t, http.MethodPost, base, alice, map[string]any{
+		"title": "Added", "content": "one", "position": 1,
+	}).expect(http.StatusCreated).json()
+	touchWasRecorded("chapter create")
+
+	resetTimestamp()
+	rev := int64(created["revision"].(float64))
+	updated := call(t, http.MethodPatch, base+"/"+created["id"].(string), alice, map[string]any{
+		"title": "Edited", "content": "two", "position": 1,
+	}, ifMatch(rev)).expect(http.StatusOK).json()
+	touchWasRecorded("chapter update")
+
+	resetTimestamp()
+	call(t, http.MethodDelete, base+"/"+created["id"].(string), alice, nil,
+		ifMatch(int64(updated["revision"].(float64)))).expect(http.StatusNoContent)
+	touchWasRecorded("chapter delete")
+}
+
+func TestChapterLimitSerializesConcurrentCreates(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	story := newStory(t, alice, "Nearly Full")
+	id := story["id"].(string)
+	// The story already has its position-0 starter chapter; add 48 more.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO chapters (id,story_id,title,position)
+		SELECT gen_random_uuid(),$1,'Filler ' || g,g FROM generate_series(1,48) g`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var owner string
+	if err = tx.QueryRow(ctx, `SELECT owner_id FROM stories WHERE id=$1 FOR UPDATE`, id).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan response, 1)
+	go func() {
+		done <- call(t, http.MethodPost, "/v1/stories/"+id+"/chapters", alice, map[string]any{
+			"title": "Racing", "content": "x", "position": 50,
+		})
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("create did not wait for the parent-story lock: status %d", got.Status)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO chapters (id,story_id,title,position) VALUES(gen_random_uuid(),$1,'Fiftieth',49)`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	(<-done).expect(http.StatusUnprocessableEntity)
 }
 
 func TestChapterOrdering(t *testing.T) {
