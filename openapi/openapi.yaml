@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: NovelSync Story Data API
+  title: TheTaleTribe Story Data API
   version: 0.1.0
   description: PostgreSQL system-of-record API. Browser requests use Firebase ID tokens.
 servers:
