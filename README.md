@@ -1,6 +1,6 @@
 # story-data
 
-The PostgreSQL-backed system of record for NovelSync's relational product data.
+The PostgreSQL-backed system of record for TheTaleTribe's relational product data.
 Firebase Authentication remains the identity provider; clients authenticate to
 this API and never receive a Neon connection string. Firestore remains in use
 for legacy jobs, Brain memory, MCP OAuth state, and encrypted BYOK settings.

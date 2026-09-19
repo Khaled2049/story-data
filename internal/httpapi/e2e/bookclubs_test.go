@@ -220,9 +220,9 @@ func TestClubWritesRejectServerAssignedFields(t *testing.T) {
 	}
 }
 
-// novelsyncBook is the snapshot the client's storyToBook builds when an owner
-// picks a NovelSync story as the club's book.
-func novelsyncBook(storyID, title string) map[string]any {
+// platformBook is the snapshot the client's storyToBook builds when an owner
+// picks a TheTaleTribe story as the club's book.
+func platformBook(storyID, title string) map[string]any {
 	return map[string]any{
 		"id": storyID, "source": "novelsync", "storyId": storyID,
 		"volumeInfo": map[string]any{"title": title, "authors": []string{"a"}},
@@ -244,7 +244,7 @@ func TestClubBookIsHiddenOnceItsStoryIsUnpublished(t *testing.T) {
 	storyID := story["id"].(string)
 	id := newClub(t, alice, "Readers")["id"].(string)
 
-	setClubBook(t, alice, id, novelsyncBook(storyID, "Piranesi"), http.StatusOK)
+	setClubBook(t, alice, id, platformBook(storyID, "Piranesi"), http.StatusOK)
 	if got := get(t, clubPath(id), alice).expect(http.StatusOK).json(); got["bookOfTheMonth"] == nil {
 		t.Fatal("a published story should be visible as the club book")
 	}
@@ -276,12 +276,12 @@ func TestClubBookRejectsAnUnpublishedStory(t *testing.T) {
 	draft := newStory(t, alice, "Alice's draft")
 	id := newClub(t, alice, "Readers")["id"].(string)
 
-	setClubBook(t, alice, id, novelsyncBook(draft["id"].(string), "Alice's draft"),
+	setClubBook(t, alice, id, platformBook(draft["id"].(string), "Alice's draft"),
 		http.StatusUnprocessableEntity)
-	setClubBook(t, alice, id, novelsyncBook(uuid.NewString(), "Ghost"),
+	setClubBook(t, alice, id, platformBook(uuid.NewString(), "Ghost"),
 		http.StatusUnprocessableEntity)
 	// Malformed ids are a miss, not a query error.
-	setClubBook(t, alice, id, novelsyncBook("not-a-uuid", "Ghost"),
+	setClubBook(t, alice, id, platformBook("not-a-uuid", "Ghost"),
 		http.StatusUnprocessableEntity)
 
 	if got := get(t, clubPath(id), alice).expect(http.StatusOK).json(); got["bookOfTheMonth"] != nil {

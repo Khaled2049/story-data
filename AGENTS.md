@@ -1,6 +1,6 @@
 # Repository Guidelines — story-data
 
-`story-data` is the PostgreSQL-backed system of record for migrated NovelSync
+`story-data` is the PostgreSQL-backed system of record for migrated TheTaleTribe
 data. It exposes the API consumed by the frontend and agents; it is not a
 Firebase replacement for identity or legacy-only features.
 

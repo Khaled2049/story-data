@@ -213,7 +213,7 @@ CREATE TABLE recommendations.normalization_cache (
 );
 
 -- `cmu_backfill` is deliberately absent: the bootstrap corpus is gone and the
--- catalog is TaleTribe stories only.
+-- catalog is TheTaleTribe stories only.
 CREATE TABLE recommendations.ingest_runs (
   id          BIGSERIAL PRIMARY KEY,
   kind        TEXT NOT NULL CHECK (kind IN ('platform_sync', 'stats_refresh', 'cooc_rebuild')),

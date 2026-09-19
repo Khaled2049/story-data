@@ -1,6 +1,6 @@
 # story-data service guide
 
-`story-data` is NovelSync's PostgreSQL-backed HTTP service for product data
+`story-data` is TheTaleTribe's PostgreSQL-backed HTTP service for product data
 that benefits from relational integrity, transactions, public reads, and vector
 search. It is the system of record for the domains migrated from Firestore.
 
