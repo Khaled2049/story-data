@@ -289,14 +289,27 @@ func (s *Store) UpdateStory(ctx context.Context, id, owner string, rev int64, in
 }
 
 func (s *Store) DeleteStory(ctx context.Context, id, owner string, rev int64) error {
-	cmd, err := s.db.Exec(ctx, `DELETE FROM stories WHERE id=$1 AND owner_id=$2 AND revision=$3`, id, owner, rev)
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var live string
+	err = tx.QueryRow(ctx, `SELECT c.title FROM competition_submissions s JOIN competitions c ON c.id=s.competition_id WHERE s.story_id=$1 AND s.status='submitted' AND c.phase IN ('draft','scheduled','open','voting','settling') LIMIT 1`, id).Scan(&live)
+	if err == nil {
+		return sentinelErrf(ErrConflict, "this story is entered in %q; withdraw the entry before deleting it", live)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	cmd, err := tx.Exec(ctx, `DELETE FROM stories WHERE id=$1 AND owner_id=$2 AND revision=$3`, id, owner, rev)
 	if err != nil {
 		return err
 	}
 	if cmd.RowsAffected() == 0 {
 		return s.classifyWrite(ctx, "stories", id, owner)
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ListChapters(ctx context.Context, storyID, caller string) ([]Chapter, error) {
