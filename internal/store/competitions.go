@@ -906,7 +906,7 @@ type querier interface {
 }
 
 func listSubmissions(ctx context.Context, q querier, id string) ([]CompetitionSubmission, error) {
-	rows, e := q.Query(ctx, `SELECT user_id,story_id,story_title,story_author_name,cover_image_url,status,submitted_at FROM competition_submissions WHERE competition_id=$1 AND status='submitted' ORDER BY submitted_at`, id)
+	rows, e := q.Query(ctx, `SELECT user_id,COALESCE(story_id::text,''),story_title,story_author_name,cover_image_url,status,submitted_at FROM competition_submissions WHERE competition_id=$1 AND status='submitted' ORDER BY submitted_at`, id)
 	if e != nil {
 		return nil, e
 	}
@@ -914,12 +914,10 @@ func listSubmissions(ctx context.Context, q querier, id string) ([]CompetitionSu
 	x := []CompetitionSubmission{}
 	for rows.Next() {
 		var v CompetitionSubmission
-		var sid uuid.UUID
-		if e = rows.Scan(&v.UserID, &sid, &v.StoryTitle, &v.StoryAuthorName, &v.CoverImageURL, &v.Status, &v.SubmittedAt); e != nil {
+		if e = rows.Scan(&v.UserID, &v.StoryID, &v.StoryTitle, &v.StoryAuthorName, &v.CoverImageURL, &v.Status, &v.SubmittedAt); e != nil {
 			return nil, e
 		}
 		v.ID = v.UserID
-		v.StoryID = sid.String()
 		x = append(x, v)
 	}
 	return x, rows.Err()
