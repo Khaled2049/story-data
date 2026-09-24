@@ -11,10 +11,9 @@ concurrency:
 
 permissions:
   contents: read
-
 jobs:
   test:
-    name: Test & validate
+    name: story-data / go-validation
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -43,9 +42,8 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
         with:
           go-version-file: go.mod
           cache: true
@@ -68,10 +66,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Build
+        run: go build ./...
       - name: Test
         run: go test ./... -race -count=1
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd  # v3
         with:
           terraform_version: 1.14.4
           terraform_wrapper: false
@@ -84,3 +84,16 @@ jobs:
           terraform fmt -check -recursive
           terraform init -backend=false
           terraform validate
+  migrations-immutable:
+    name: story-data / migrations-immutable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+      - name: Reject edits to existing migrations
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/check_migrations.py

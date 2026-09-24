@@ -5,3 +5,6 @@ coverage.out
 terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.*
+
+# Temporary Workload Identity Federation credentials
+gha-creds-*.json
