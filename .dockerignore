@@ -3,3 +3,14 @@
 terraform/.terraform
 terraform/*.tfstate*
 coverage.out
+
+# Never send local or WIF credentials to Docker builders.
+**/.env*
+!**/.env.example
+**/gha-creds-*.json
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*

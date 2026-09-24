@@ -1514,3 +1514,126 @@ func TestCompetitionUnknownAndMalformedIDs(t *testing.T) {
 	get(t, "/v1/competitions/11111111-1111-1111-1111-111111111111/submissions", alice).
 		expect(http.StatusNotFound)
 }
+
+func TestCompetitionFullLifecycle(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice, bob, carol, dave)
+	now := time.Now().UTC()
+
+	expectPhase := func(step string, got map[string]any, want string) {
+		t.Helper()
+		if got["phase"] != want {
+			t.Fatalf("%s: phase = %v, want %s", step, got["phase"], want)
+		}
+	}
+
+	draft := call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
+		"title": "Lifecycle", "description": "d", "category": "flash-fiction",
+		"tags":           []string{"x"},
+		"startDate":      now.Add(time.Hour).Format(time.RFC3339),
+		"deadline":       now.Add(2 * time.Hour).Format(time.RFC3339),
+		"votingDeadline": now.Add(3 * time.Hour).Format(time.RFC3339),
+		"prizeAmount":    tale(100),
+		"entryFee":       tale(10),
+		"creatorName":    "Alice",
+	}).expect(http.StatusCreated).json()
+	id := draft["id"].(string)
+	path := "/v1/competitions/" + id
+	expectPhase("draft", draft, "draft")
+	get(t, path, bob).expect(http.StatusNotFound)
+	assertBalance(t, userAccount(alice), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), "0")
+
+	published := call(t, "POST", "/v1/competition-publish", alice,
+		map[string]any{"competitionId": id}).expect(http.StatusOK).json()
+	expectPhase("publish", published, "scheduled")
+	expectPhase("scheduled read", get(t, path, bob).expect(http.StatusOK).json(), "scheduled")
+	assertBalance(t, userAccount(alice), tale(initialGrantTale-100))
+	assertBalance(t, escrowAccount(id), tale(100))
+
+	early := newStory(t, bob, "Too early")
+	call(t, "PUT", path+"/join", bob, nil).expect(http.StatusNoContent)
+	call(t, "POST", path+"/submissions/me", bob,
+		map[string]any{"storyId": early["id"]}).expect(http.StatusForbidden)
+	assertBalance(t, userAccount(bob), tale(initialGrantTale))
+
+	passTime(t, id, "start_at")
+	expectPhase("open", get(t, path, bob).expect(http.StatusOK).json(), "open")
+
+	enter(t, bob, id)
+	enter(t, carol, id)
+	registerVoter(t, dave, id)
+	agedProfile(t, bob)
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
+	assertBalance(t, userAccount(carol), tale(initialGrantTale-10))
+	assertBalance(t, escrowAccount(id), tale(120))
+
+	ballot := path + "/ballots/me"
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{carol}}).
+		expect(http.StatusUnprocessableEntity)
+	call(t, "POST", path+"/settle", alice, nil).expect(http.StatusUnprocessableEntity)
+
+	open := get(t, path, alice).expect(http.StatusOK).json()
+	if open["submissionCount"].(float64) != 2 || open["entryFeesHeld"] != tale(20) {
+		t.Errorf("open competition = submissions %v, fees held %v; want 2 and %s",
+			open["submissionCount"], open["entryFeesHeld"], tale(20))
+	}
+
+	passTime(t, id, "deadline_at")
+	expectPhase("voting", get(t, path, bob).expect(http.StatusOK).json(), "voting")
+
+	late := newStory(t, dave, "Too late")
+	call(t, "POST", path+"/submissions/me", dave,
+		map[string]any{"storyId": late["id"]}).expect(http.StatusForbidden)
+
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{carol}}).
+		expect(http.StatusNoContent)
+	call(t, "PUT", ballot, bob, map[string]any{"submissionIds": []string{carol}}).
+		expect(http.StatusNoContent)
+	voting := get(t, path, alice).expect(http.StatusOK).json()
+	if voting["ballotCount"].(float64) != 2 {
+		t.Errorf("ballotCount = %v, want 2", voting["ballotCount"])
+	}
+	assertBalance(t, escrowAccount(id), tale(120))
+
+	settled := call(t, "POST", path+"/settle", alice, nil).expect(http.StatusOK).json()
+	expectPhase("settle", settled, "settled")
+	if settled["resultsDigest"] == "" || settled["resultsDigest"] == nil {
+		t.Errorf("settlement must record a results digest")
+	}
+	results := settled["results"].([]any)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 ranked results, got %d", len(results))
+	}
+	if top := results[0].(map[string]any); top["userId"] != carol ||
+		top["rank"].(float64) != 1 || top["amount"] != tale(100) {
+		t.Errorf("winner row = %v", top)
+	}
+	if runner := results[1].(map[string]any); runner["userId"] != bob || runner["amount"] != "0" {
+		t.Errorf("runner-up row = %v", runner)
+	}
+
+	assertBalance(t, userAccount(carol), tale(initialGrantTale-10+100))
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
+	assertBalance(t, userAccount(dave), tale(initialGrantTale))
+	assertBalance(t, userAccount(alice), tale(initialGrantTale-100+18))
+	assertBalance(t, platformAccount(), tale(2))
+	assertBalance(t, escrowAccount(id), "0")
+
+	final := get(t, path, bob).expect(http.StatusOK).json()
+	expectPhase("settled read", final, "settled")
+	if final["entryFeesHeld"] != "0" {
+		t.Errorf("entryFeesHeld after settlement = %v", final["entryFeesHeld"])
+	}
+
+	again := call(t, "POST", path+"/settle", alice, nil).expect(http.StatusOK).json()
+	expectPhase("second settle", again, "settled")
+	call(t, "POST", path+"/cancel", alice,
+		map[string]any{"reason": "too late"}).expect(http.StatusUnprocessableEntity)
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusUnprocessableEntity)
+	assertBalance(t, userAccount(carol), tale(initialGrantTale-10+100))
+	assertBalance(t, escrowAccount(id), "0")
+
+	assertLedgerIntact(t)
+}
