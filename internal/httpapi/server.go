@@ -69,21 +69,21 @@ func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.
 	m.HandleFunc("/v1/profiles/", x.profileAction)
 	m.HandleFunc("/v1/stories", x.stories)
 	m.HandleFunc("/v1/stories/", x.story)
-	// Logging is outermost so that a request rejected by the rate limiter is
-	// logged too — during an attack those rejections are the signal. Rate
-	// limiting then sits inside CORS, so a throttled caller still gets the
-	// headers their browser needs to read the 429, and outside everything
-	// else, so a throttled request costs no database work.
-	return x.withLogging(x.withCORS(x.withRateLimit(x.withJSON(m))))
+	// Logging is outermost after compression so that a request rejected by the
+	// rate limiter is logged too — during an attack those rejections are the
+	// signal. Rate limiting then sits inside CORS, so a throttled caller still
+	// gets the headers their browser needs to read the 429, and outside
+	// everything else, so a throttled request costs no database work.
+	return x.withGzip(x.withLogging(x.withCORS(x.withRateLimit(x.withJSON(m)))))
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		o := r.Header.Get("Origin")
 		allowed := o != "" && s.origins[o]
+		w.Header().Add("Vary", "Origin")
 		if allowed {
 			w.Header().Set("Access-Control-Allow-Origin", o)
-			w.Header().Add("Vary", "Origin")
 		}
 		if allowed && r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")

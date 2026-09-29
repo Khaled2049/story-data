@@ -60,6 +60,19 @@ type PublicStoryPage struct {
 	NextCursor string        `json:"nextCursor,omitempty"`
 }
 
+const publicStorySelect = `SELECT s.id, s.owner_id, s.title, s.description, COALESCE(p.username, s.author_name),
+  COALESCE(s.category,''), COALESCE(s.target_audience,''), COALESCE(s.language,''),
+  COALESCE(s.copyright,''), COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''),
+  s.views, s.created_at, s.updated_at,
+  (SELECT count(*) FROM story_likes sl WHERE sl.story_id=s.id),
+  (SELECT round(avg(sr.rating)::numeric, 1) FROM story_ratings sr WHERE sr.story_id=s.id),
+  (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id),
+  COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM story_tags st WHERE st.story_id=s.id), '{}'),
+  (SELECT count(*) FROM chapters c WHERE c.story_id=s.id)
+FROM stories s
+LEFT JOIN public_profiles p ON p.user_id=s.owner_id
+`
+
 type publicStoryCursor struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 	ID        string    `json:"id"`
@@ -100,20 +113,7 @@ func (s *Store) ListPublicStories(ctx context.Context, category, search, cursor 
 		where += fmt.Sprintf(" AND (s.updated_at, s.id) < ($%d, $%d)", len(args)-1, len(args))
 	}
 	args = append(args, pageSize+1)
-	query := `SELECT s.id, s.owner_id, s.title, s.description, s.author_name,
-  COALESCE(s.category,''), COALESCE(s.target_audience,''), COALESCE(s.language,''),
-  COALESCE(s.copyright,''), COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''),
-  s.views, s.created_at, s.updated_at,
-  (SELECT count(*) FROM story_likes sl WHERE sl.story_id=s.id),
-  (SELECT round(avg(sr.rating)::numeric, 1) FROM story_ratings sr WHERE sr.story_id=s.id),
-  (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id),
-  COALESCE(array_agg(DISTINCT st.tag ORDER BY st.tag) FILTER (WHERE st.tag IS NOT NULL), '{}'),
-  COUNT(DISTINCT c.id)
-FROM stories s
-LEFT JOIN story_tags st ON st.story_id=s.id
-LEFT JOIN chapters c ON c.story_id=s.id
-` + where + `
-GROUP BY s.id
+	query := publicStorySelect + where + `
 ORDER BY s.updated_at DESC, s.id DESC
 LIMIT $` + fmt.Sprint(len(args))
 	rows, err := s.db.Query(ctx, query, args...)
@@ -213,20 +213,7 @@ VALUES($1,$2,current_date) ON CONFLICT DO NOTHING`, storyID, viewerKey)
 }
 
 func (s *Store) publicStory(ctx context.Context, storyID string) (PublicStory, error) {
-	row := s.db.QueryRow(ctx, `SELECT s.id, s.owner_id, s.title, s.description, s.author_name,
-  COALESCE(s.category,''), COALESCE(s.target_audience,''), COALESCE(s.language,''),
-  COALESCE(s.copyright,''), COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''),
-  s.views, s.created_at, s.updated_at,
-  (SELECT count(*) FROM story_likes sl WHERE sl.story_id=s.id),
-  (SELECT round(avg(sr.rating)::numeric, 1) FROM story_ratings sr WHERE sr.story_id=s.id),
-  (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id),
-  COALESCE(array_agg(DISTINCT st.tag ORDER BY st.tag) FILTER (WHERE st.tag IS NOT NULL), '{}'),
-  COUNT(DISTINCT c.id)
-FROM stories s
-LEFT JOIN story_tags st ON st.story_id=s.id
-LEFT JOIN chapters c ON c.story_id=s.id
-WHERE s.id=$1 AND s.is_published
-GROUP BY s.id`, storyID)
+	row := s.db.QueryRow(ctx, publicStorySelect+`WHERE s.id=$1 AND s.is_published`, storyID)
 	story, err := scanPublicStory(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return PublicStory{}, ErrNotFound
