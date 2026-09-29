@@ -320,3 +320,43 @@ func TestPublicRejectsMalformedIDs(t *testing.T) {
 		t.Errorf("expected an empty listing, got %v", s)
 	}
 }
+
+func TestPublicStoryShowsTheAuthorsCurrentUsername(t *testing.T) {
+	reset(t)
+	id := newPublishedStory(t, alice, "Whose Name Is This")["id"].(string)
+
+	if got := pageStories(t, publicPage(t, ""))[0]["authorName"]; got != "a" {
+		t.Fatalf("without a profile, authorName = %v, want the stored name", got)
+	}
+
+	putProfile(t, alice, map[string]any{"username": "alice_first"}).expect(http.StatusCreated)
+	if got := pageStories(t, publicPage(t, ""))[0]["authorName"]; got != "alice_first" {
+		t.Fatalf("listing authorName = %v, want alice_first", got)
+	}
+
+	call(t, "PATCH", "/v1/profiles/me", alice, map[string]any{"username": "alice_later"}).
+		expect(http.StatusOK)
+	if got := pageStories(t, publicPage(t, ""))[0]["authorName"]; got != "alice_later" {
+		t.Fatalf("listing authorName after rename = %v, want alice_later", got)
+	}
+	detail := get(t, publicStoryPath(id), "").expect(http.StatusOK).json()
+	if got := detail["story"].(map[string]any)["authorName"]; got != "alice_later" {
+		t.Fatalf("detail authorName after rename = %v, want alice_later", got)
+	}
+}
+
+func TestPublicListingIsCacheableOnlyBySharedCaches(t *testing.T) {
+	reset(t)
+	id := newPublishedStory(t, alice, "Cached Somewhere")["id"].(string)
+
+	listing := get(t, "/v1/public/stories", "").expect(http.StatusOK)
+	want := "public, max-age=0, s-maxage=30, stale-while-revalidate=300"
+	if got := listing.Header.Get("Cache-Control"); got != want {
+		t.Fatalf("listing Cache-Control = %q, want %q", got, want)
+	}
+
+	detail := get(t, publicStoryPath(id), "").expect(http.StatusOK)
+	if got := detail.Header.Get("Cache-Control"); got != "" {
+		t.Fatalf("detail Cache-Control = %q, want none", got)
+	}
+}

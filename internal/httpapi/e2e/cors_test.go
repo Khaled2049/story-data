@@ -53,7 +53,7 @@ func TestPreflightFromAllowedOriginSucceedsWithoutAuth(t *testing.T) {
 				res.Header.Get("Access-Control-Allow-Headers"), h)
 		}
 	}
-	if got := res.Header.Get("Vary"); !headerLists(got, "Origin") {
+	if got := strings.Join(res.Header.Values("Vary"), ","); !headerLists(got, "Origin") {
 		t.Errorf("Vary = %q, want it to list Origin", got)
 	}
 }
