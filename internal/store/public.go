@@ -50,9 +50,16 @@ type PublicChapter struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
+type PublicStoryAuthor struct {
+	Bio           string `json:"bio,omitempty"`
+	PhotoURL      string `json:"photoUrl,omitempty"`
+	WalletAddress string `json:"walletAddress,omitempty"`
+}
+
 type PublicStoryDetail struct {
-	Story    PublicStory     `json:"story"`
-	Chapters []PublicChapter `json:"chapters"`
+	Story    PublicStory       `json:"story"`
+	Author   PublicStoryAuthor `json:"author"`
+	Chapters []PublicChapter   `json:"chapters"`
 }
 
 type PublicStoryPage struct {
@@ -60,7 +67,7 @@ type PublicStoryPage struct {
 	NextCursor string        `json:"nextCursor,omitempty"`
 }
 
-const publicStorySelect = `SELECT s.id, s.owner_id, s.title, s.description, COALESCE(p.username, s.author_name),
+const publicStoryColumns = `s.id, s.owner_id, s.title, s.description, COALESCE(p.username, s.author_name),
   COALESCE(s.category,''), COALESCE(s.target_audience,''), COALESCE(s.language,''),
   COALESCE(s.copyright,''), COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''),
   s.views, s.created_at, s.updated_at,
@@ -68,10 +75,17 @@ const publicStorySelect = `SELECT s.id, s.owner_id, s.title, s.description, COAL
   (SELECT round(avg(sr.rating)::numeric, 1) FROM story_ratings sr WHERE sr.story_id=s.id),
   (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id),
   COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM story_tags st WHERE st.story_id=s.id), '{}'),
-  (SELECT count(*) FROM chapters c WHERE c.story_id=s.id)
+  (SELECT count(*) FROM chapters c WHERE c.story_id=s.id)`
+
+const publicStoryFrom = `
 FROM stories s
 LEFT JOIN public_profiles p ON p.user_id=s.owner_id
 `
+
+const publicStorySelect = `SELECT ` + publicStoryColumns + publicStoryFrom
+
+const publicStoryDetailSelect = `SELECT ` + publicStoryColumns + `,
+  COALESCE(p.bio,''), COALESCE(p.photo_url,''), COALESCE(p.wallet_address,'')` + publicStoryFrom
 
 type publicStoryCursor struct {
 	UpdatedAt time.Time `json:"updatedAt"`
@@ -142,7 +156,7 @@ LIMIT $` + fmt.Sprint(len(args))
 }
 
 func (s *Store) GetPublicStory(ctx context.Context, storyID string) (PublicStoryDetail, error) {
-	story, err := s.publicStory(ctx, storyID)
+	story, author, err := s.publicStory(ctx, storyID)
 	if err != nil {
 		return PublicStoryDetail{}, err
 	}
@@ -150,7 +164,7 @@ func (s *Store) GetPublicStory(ctx context.Context, storyID string) (PublicStory
 	if err != nil {
 		return PublicStoryDetail{}, err
 	}
-	return PublicStoryDetail{Story: story, Chapters: chapters}, nil
+	return PublicStoryDetail{Story: story, Author: author, Chapters: chapters}, nil
 }
 
 func (s *Store) GetPublicChapter(ctx context.Context, storyID, chapterID string) (PublicChapter, error) {
@@ -212,13 +226,14 @@ VALUES($1,$2,current_date) ON CONFLICT DO NOTHING`, storyID, viewerKey)
 	return tx.Commit(ctx)
 }
 
-func (s *Store) publicStory(ctx context.Context, storyID string) (PublicStory, error) {
-	row := s.db.QueryRow(ctx, publicStorySelect+`WHERE s.id=$1 AND s.is_published`, storyID)
-	story, err := scanPublicStory(row)
+func (s *Store) publicStory(ctx context.Context, storyID string) (PublicStory, PublicStoryAuthor, error) {
+	var author PublicStoryAuthor
+	row := s.db.QueryRow(ctx, publicStoryDetailSelect+`WHERE s.id=$1 AND s.is_published`, storyID)
+	story, err := scanPublicStory(row, &author.Bio, &author.PhotoURL, &author.WalletAddress)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return PublicStory{}, ErrNotFound
+		return PublicStory{}, PublicStoryAuthor{}, ErrNotFound
 	}
-	return story, err
+	return story, author, err
 }
 
 func (s *Store) publicChapters(ctx context.Context, storyID string, content bool) ([]PublicChapter, error) {
@@ -242,10 +257,11 @@ func (s *Store) publicChapters(ctx context.Context, storyID string, content bool
 	return chapters, rows.Err()
 }
 
-func scanPublicStory(row pgx.Row) (PublicStory, error) {
+func scanPublicStory(row pgx.Row, extra ...any) (PublicStory, error) {
 	var x PublicStory
 	var id uuid.UUID
-	err := row.Scan(&id, &x.AuthorID, &x.Title, &x.Description, &x.AuthorName, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Views, &x.CreatedAt, &x.UpdatedAt, &x.LikeCount, &x.AverageRating, &x.RatingsCount, &x.Tags, &x.ChapterCount)
+	dest := []any{&id, &x.AuthorID, &x.Title, &x.Description, &x.AuthorName, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Views, &x.CreatedAt, &x.UpdatedAt, &x.LikeCount, &x.AverageRating, &x.RatingsCount, &x.Tags, &x.ChapterCount}
+	err := row.Scan(append(dest, extra...)...)
 	x.ID = id.String()
 	return x, err
 }

@@ -409,3 +409,38 @@ func TestPublicChapterRevalidatesWithETag(t *testing.T) {
 		t.Errorf("revalidated body is stale: %s", changed.Body)
 	}
 }
+
+func TestPublicStoryDetailCarriesAuthorProfile(t *testing.T) {
+	reset(t)
+	id := newPublishedStory(t, alice, "With An Author")["id"].(string)
+
+	bare := get(t, publicStoryPath(id), "").expect(http.StatusOK).json()
+	if author, ok := bare["author"].(map[string]any); !ok || len(author) != 0 {
+		t.Fatalf("author without a profile = %v, want an empty object", bare["author"])
+	}
+
+	wallet := "0x" + strings.Repeat("b", 40)
+	putProfile(t, alice, map[string]any{
+		"username": "alice_writes", "bio": "Writes about the sea.",
+		"photoUrl": "https://example.test/alice.png", "walletAddress": wallet,
+	}).expect(http.StatusCreated)
+
+	detail := get(t, publicStoryPath(id), "").expect(http.StatusOK).json()
+	want := map[string]any{
+		"bio": "Writes about the sea.", "photoUrl": "https://example.test/alice.png", "walletAddress": wallet,
+	}
+	author := detail["author"].(map[string]any)
+	for k, v := range want {
+		if author[k] != v {
+			t.Errorf("author[%q] = %v, want %v", k, author[k], v)
+		}
+	}
+	if got := detail["story"].(map[string]any)["authorName"]; got != "alice_writes" {
+		t.Errorf("authorName = %v, want alice_writes", got)
+	}
+
+	listed := get(t, "/v1/public/stories", "").expect(http.StatusOK).json()
+	if _, ok := listed["stories"].([]any)[0].(map[string]any)["bio"]; ok {
+		t.Error("the list should not carry author profile fields")
+	}
+}
