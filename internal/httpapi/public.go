@@ -30,6 +30,8 @@ func (s *Server) viewerKey(r *http.Request) string {
 // nobody typed, so it is rejected rather than sent to the database.
 const maxPublicStorySearchLen = 100
 
+const publicStoryListCacheControl = "public, max-age=0, s-maxage=30, stale-while-revalidate=300"
+
 func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 	p := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/public/"), "/"), "/")
 	if len(p) == 1 && p[0] == "stories" {
@@ -48,6 +50,9 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		x, err := s.store.ListPublicStories(r.Context(), r.URL.Query().Get("category"), search, r.URL.Query().Get("cursor"), limit)
+		if err == nil {
+			w.Header().Set("Cache-Control", publicStoryListCacheControl)
+		}
 		respond(w, x, err)
 		return
 	}
