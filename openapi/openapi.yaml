@@ -24,7 +24,7 @@ paths:
         - { name: category, in: query, schema: { type: string } }
         - { name: cursor, in: query, schema: { type: string } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 24 } }
-      responses: { '200': { description: Cursor-paginated public story summaries } }
+      responses: { '200': { description: Cursor-paginated public story summaries, with ETag }, '304': { description: Matches If-None-Match } }
   /v1/public/profiles:
     get:
       summary: Search, list recent, or batch-read public member profiles
@@ -69,14 +69,14 @@ paths:
     parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
     get:
       summary: Read a published story and its chapter manifest
-      responses: { '200': { description: Public story and ordered chapter metadata }, '404': { description: Story is unavailable } }
+      responses: { '200': { description: Public story and ordered chapter metadata, with ETag }, '304': { description: Matches If-None-Match }, '404': { description: Story is unavailable } }
   /v1/public/stories/{storyId}/chapters/{chapterId}:
     parameters:
       - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
       - { name: chapterId, in: path, required: true, schema: { type: string, format: uuid } }
     get:
       summary: Read a chapter from a published story
-      responses: { '200': { description: Public chapter text }, '404': { description: Story or chapter is unavailable } }
+      responses: { '200': { description: Public chapter text, with ETag }, '304': { description: Matches If-None-Match }, '404': { description: Story or chapter is unavailable } }
   /v1/public/stories/{storyId}/views:
     parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
     post:

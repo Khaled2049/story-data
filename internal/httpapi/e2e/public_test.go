@@ -345,18 +345,67 @@ func TestPublicStoryShowsTheAuthorsCurrentUsername(t *testing.T) {
 	}
 }
 
-func TestPublicListingIsCacheableOnlyBySharedCaches(t *testing.T) {
+func TestPublicReadsAreCacheableOnlyBySharedCaches(t *testing.T) {
 	reset(t)
 	id := newPublishedStory(t, alice, "Cached Somewhere")["id"].(string)
+	chapterID := newChapter(t, alice, id, "Chapter One", 1)["id"].(string)
 
-	listing := get(t, "/v1/public/stories", "").expect(http.StatusOK)
-	want := "public, max-age=0, s-maxage=30, stale-while-revalidate=300"
-	if got := listing.Header.Get("Cache-Control"); got != want {
-		t.Fatalf("listing Cache-Control = %q, want %q", got, want)
+	listCache := "public, max-age=0, s-maxage=30, stale-while-revalidate=300"
+	detailCache := "public, max-age=0, s-maxage=30"
+	chapterCache := "public, max-age=0, s-maxage=60, stale-while-revalidate=600"
+	for path, want := range map[string]string{
+		"/v1/public/stories":                           listCache,
+		publicStoryPath(id):                            detailCache,
+		publicStoryPath(id) + "/chapters/" + chapterID: chapterCache,
+	} {
+		res := get(t, path, "").expect(http.StatusOK)
+		if got := res.Header.Get("Cache-Control"); got != want {
+			t.Errorf("%s Cache-Control = %q, want %q", path, got, want)
+		}
+		if etag := res.Header.Get("ETag"); !strings.HasPrefix(etag, `W/"`) {
+			t.Errorf("%s ETag = %q, want a weak validator", path, etag)
+		}
 	}
 
-	detail := get(t, publicStoryPath(id), "").expect(http.StatusOK)
-	if got := detail.Header.Get("Cache-Control"); got != "" {
-		t.Fatalf("detail Cache-Control = %q, want none", got)
+	comments := get(t, publicStoryPath(id)+"/comments", "").expect(http.StatusOK)
+	if got := comments.Header.Get("Cache-Control"); got != "" {
+		t.Errorf("comments vary by viewer but carry Cache-Control %q", got)
+	}
+	missing := get(t, publicStoryPath("11111111-1111-1111-1111-111111111111"), "").
+		expect(http.StatusNotFound)
+	if missing.Header.Get("Cache-Control") != "" || missing.Header.Get("ETag") != "" {
+		t.Errorf("a 404 was made cacheable: %v", missing.Header)
+	}
+}
+
+func TestPublicChapterRevalidatesWithETag(t *testing.T) {
+	reset(t)
+	id := newPublishedStory(t, alice, "Revalidated")["id"].(string)
+	chapter := newChapter(t, alice, id, "Chapter One", 1)
+	path := publicStoryPath(id) + "/chapters/" + chapter["id"].(string)
+
+	first := get(t, path, "").expect(http.StatusOK)
+	etag := first.Header.Get("ETag")
+
+	unchanged := get(t, path, "", map[string]string{"If-None-Match": etag}).
+		expect(http.StatusNotModified)
+	if len(unchanged.Body) != 0 {
+		t.Errorf("304 carried a body: %q", unchanged.Body)
+	}
+	if unchanged.Header.Get("ETag") != etag {
+		t.Errorf("304 ETag = %q, want %q", unchanged.Header.Get("ETag"), etag)
+	}
+
+	call(t, "PATCH", "/v1/stories/"+id+"/chapters/"+chapter["id"].(string), alice,
+		map[string]any{"title": "Chapter One", "content": "<p>rewritten</p>", "position": 1},
+		ifMatch(rev(t, chapter))).expect(http.StatusOK)
+
+	changed := get(t, path, "", map[string]string{"If-None-Match": etag}).
+		expect(http.StatusOK)
+	if changed.Header.Get("ETag") == etag {
+		t.Error("editing the chapter did not change its ETag")
+	}
+	if !strings.Contains(string(changed.Body), "rewritten") {
+		t.Errorf("revalidated body is stale: %s", changed.Body)
 	}
 }
