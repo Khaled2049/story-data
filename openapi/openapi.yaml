@@ -130,13 +130,12 @@ paths:
         '200': { description: Submissions }
         '401': { description: Unauthenticated }
         '404': { description: Competition is unavailable }
-  /v1/public/stories/{storyId}/chapters/{chapterId}/comments:
+  /v1/public/stories/{storyId}/comments:
     parameters:
       - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
-      - { name: chapterId, in: path, required: true, schema: { type: string, format: uuid } }
     get:
-      summary: List public chapter comments in chronological order
-      responses: { '200': { description: Flattened public comment thread }, '404': { description: Story or chapter is unavailable } }
+      summary: List a published story's comments in chronological order
+      responses: { '200': { description: Flattened public comment thread }, '404': { description: Story is unavailable } }
   /v1/stories/{storyId}:
     parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
     get:
@@ -201,17 +200,25 @@ paths:
     post:
       security: [{ firebaseBearer: [] }]
       responses: { '201': { description: Rating created }, '409': { description: User already rated } }
-  /v1/stories/{storyId}/chapters/{chapterId}/comments:
+  /v1/stories/{storyId}/comments:
     parameters:
       - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
-      - { name: chapterId, in: path, required: true, schema: { type: string, format: uuid } }
     post:
       security: [{ firebaseBearer: [] }]
       responses: { '201': { description: Comment created } }
-  /v1/stories/{storyId}/chapters/{chapterId}/comments/{commentId}:
+  /v1/stories/{storyId}/comments/{commentId}/likes:
     parameters:
       - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
-      - { name: chapterId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: commentId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Comment liked (idempotent) } }
+    delete:
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Comment unliked (idempotent) } }
+  /v1/stories/{storyId}/comments/{commentId}:
+    parameters:
+      - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
       - { name: commentId, in: path, required: true, schema: { type: string, format: uuid } }
     patch:
       security: [{ firebaseBearer: [] }]

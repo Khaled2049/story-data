@@ -1,9 +1,9 @@
 package e2e
 
-// Social: story likes, ratings, chapter comments and comment likes.
+// Social: story likes, ratings, story comments and comment likes.
 //
-// Everything here hangs off a *published* story — `publicStoryExists` and
-// `publicChapterExists` gate every method — so the fixtures publish first and
+// Everything here hangs off a *published* story — `publicStoryExists` gates
+// every method — so the fixtures publish first and
 // the visibility tests lean on that. Comment threading is returned flat with a
 // `parentId`, so the tests assert the parent link rather than any nesting.
 
@@ -43,20 +43,20 @@ func socialFixture(t *testing.T) (storyID, chapterID string) {
 	return storyID, newChapter(t, alice, storyID, "Chapter One", 1)["id"].(string)
 }
 
-func commentsPath(storyID, chapterID string) string {
-	return "/v1/stories/" + storyID + "/chapters/" + chapterID + "/comments"
+func commentsPath(storyID string) string {
+	return "/v1/stories/" + storyID + "/comments"
 }
-func publicCommentsPath(storyID, chapterID string) string {
-	return "/v1/public/stories/" + storyID + "/chapters/" + chapterID + "/comments"
+func publicCommentsPath(storyID string) string {
+	return "/v1/public/stories/" + storyID + "/comments"
 }
 
-func newComment(t *testing.T, uid, storyID, chapterID, message, parentID string) map[string]any {
+func newComment(t *testing.T, uid, storyID, message, parentID string) map[string]any {
 	t.Helper()
 	body := map[string]any{"message": message}
 	if parentID != "" {
 		body["parentId"] = parentID
 	}
-	return call(t, "POST", commentsPath(storyID, chapterID), uid, body).
+	return call(t, "POST", commentsPath(storyID), uid, body).
 		expect(http.StatusCreated).json()
 }
 
@@ -102,7 +102,6 @@ func TestSocialUnpublishedStoryIsNotSociallyReachable(t *testing.T) {
 	reset(t)
 	story := newStory(t, alice, "Still A Draft")
 	id := story["id"].(string)
-	chapter := newChapter(t, alice, id, "Draft chapter", 1)["id"].(string)
 
 	// Every social endpoint gates on the story being published — including for
 	// the owner, who has no way to like their own unpublished draft.
@@ -110,9 +109,9 @@ func TestSocialUnpublishedStoryIsNotSociallyReachable(t *testing.T) {
 	call(t, "POST", "/v1/stories/"+id+"/ratings", bob,
 		map[string]any{"rating": 5}).expect(http.StatusNotFound)
 	get(t, "/v1/stories/"+id+"/social/me", alice).expect(http.StatusNotFound)
-	call(t, "POST", commentsPath(id, chapter), alice,
+	call(t, "POST", commentsPath(id), alice,
 		map[string]any{"message": "hi"}).expect(http.StatusNotFound)
-	get(t, publicCommentsPath(id, chapter), "").expect(http.StatusNotFound)
+	get(t, publicCommentsPath(id), "").expect(http.StatusNotFound)
 }
 
 // ── ratings ─────────────────────────────────────────────────────────────────
@@ -164,13 +163,13 @@ func TestSocialRatings(t *testing.T) {
 
 func TestSocialCommentLifecycle(t *testing.T) {
 	reset(t)
-	storyID, chapterID := socialFixture(t)
+	storyID, _ := socialFixture(t)
 
-	created := newComment(t, bob, storyID, chapterID, "  A first thought.  ", "")
+	created := newComment(t, bob, storyID, "  A first thought.  ", "")
 	if created["message"] != "A first thought." {
 		t.Errorf("message was not trimmed: %q", created["message"])
 	}
-	if created["userId"] != bob || created["chapterId"] != chapterID {
+	if created["userId"] != bob || created["storyId"] != storyID {
 		t.Errorf("comment = %v", created)
 	}
 	if created["parentId"] != nil {
@@ -182,7 +181,7 @@ func TestSocialCommentLifecycle(t *testing.T) {
 	id := created["id"].(string)
 
 	// The thread is public, including to an anonymous reader.
-	listed := get(t, publicCommentsPath(storyID, chapterID), "").
+	listed := get(t, publicCommentsPath(storyID), "").
 		expect(http.StatusOK).list()
 	if len(listed) != 1 {
 		t.Fatalf("expected 1 comment, got %d", len(listed))
@@ -191,23 +190,23 @@ func TestSocialCommentLifecycle(t *testing.T) {
 		t.Errorf("an anonymous reader should never be likedByMe: %v", listed[0])
 	}
 
-	updated := call(t, "PATCH", commentsPath(storyID, chapterID)+"/"+id, bob,
+	updated := call(t, "PATCH", commentsPath(storyID)+"/"+id, bob,
 		map[string]any{"message": "A revised thought."}).expect(http.StatusOK).json()
 	if updated["message"] != "A revised thought." {
 		t.Errorf("message = %v", updated["message"])
 	}
 
-	call(t, "DELETE", commentsPath(storyID, chapterID)+"/"+id, bob, nil).
+	call(t, "DELETE", commentsPath(storyID)+"/"+id, bob, nil).
 		expect(http.StatusNoContent)
-	if left := get(t, publicCommentsPath(storyID, chapterID), "").expect(http.StatusOK).list(); len(left) != 0 {
+	if left := get(t, publicCommentsPath(storyID), "").expect(http.StatusOK).list(); len(left) != 0 {
 		t.Errorf("comment survived deletion: %v", left)
 	}
 }
 
 func TestSocialCommentValidationAndAuth(t *testing.T) {
 	reset(t)
-	storyID, chapterID := socialFixture(t)
-	base := commentsPath(storyID, chapterID)
+	storyID, _ := socialFixture(t)
+	base := commentsPath(storyID)
 
 	call(t, "POST", base, bob, map[string]any{"message": "   "}).
 		expect(http.StatusUnprocessableEntity)
@@ -216,7 +215,7 @@ func TestSocialCommentValidationAndAuth(t *testing.T) {
 	call(t, "POST", base, "", map[string]any{"message": "anon"}).
 		expect(http.StatusUnauthorized)
 
-	comment := newComment(t, bob, storyID, chapterID, "Bob's", "")
+	comment := newComment(t, bob, storyID, "Bob's", "")
 	id := comment["id"].(string)
 
 	// Editing and deleting are author-only — not the story's owner, not a
@@ -235,40 +234,40 @@ func TestSocialCommentValidationAndAuth(t *testing.T) {
 
 func TestSocialCommentReplies(t *testing.T) {
 	reset(t)
-	storyID, chapterID := socialFixture(t)
+	storyID, _ := socialFixture(t)
 
-	parent := newComment(t, bob, storyID, chapterID, "The parent.", "")
+	parent := newComment(t, bob, storyID, "The parent.", "")
 	parentID := parent["id"].(string)
-	reply := newComment(t, carol, storyID, chapterID, "The reply.", parentID)
+	reply := newComment(t, carol, storyID, "The reply.", parentID)
 	if reply["parentId"] != parentID {
 		t.Errorf("parentId = %v, want %v", reply["parentId"], parentID)
 	}
 
 	// Threads come back flat, in creation order, for the client to reassemble.
-	listed := get(t, publicCommentsPath(storyID, chapterID), "").
+	listed := get(t, publicCommentsPath(storyID), "").
 		expect(http.StatusOK).list()
 	if len(listed) != 2 {
 		t.Fatalf("expected 2 comments, got %d", len(listed))
 	}
 
-	// A parent from a different chapter is not a valid parent.
-	otherChapter := newChapter(t, alice, storyID, "Chapter Two", 2)["id"].(string)
-	call(t, "POST", commentsPath(storyID, otherChapter), carol,
+	// A parent from a different story is not a valid parent.
+	otherStory := newPublishedStory(t, alice, "Another Work")["id"].(string)
+	call(t, "POST", commentsPath(otherStory), carol,
 		map[string]any{"message": "x", "parentId": parentID}).
 		expect(http.StatusNotFound)
 	// Nor is a parent that does not exist, or a malformed one.
-	call(t, "POST", commentsPath(storyID, chapterID), carol,
+	call(t, "POST", commentsPath(storyID), carol,
 		map[string]any{"message": "x", "parentId": "11111111-1111-1111-1111-111111111111"}).
 		expect(http.StatusNotFound)
-	call(t, "POST", commentsPath(storyID, chapterID), carol,
+	call(t, "POST", commentsPath(storyID), carol,
 		map[string]any{"message": "x", "parentId": "not-a-uuid"}).
 		expect(http.StatusNotFound)
 
 	// Deleting a parent takes its replies with it, silently — the reply's
 	// author is given no warning and the response carries no count.
-	call(t, "DELETE", commentsPath(storyID, chapterID)+"/"+parentID, bob, nil).
+	call(t, "DELETE", commentsPath(storyID)+"/"+parentID, bob, nil).
 		expect(http.StatusNoContent)
-	after := get(t, publicCommentsPath(storyID, chapterID), "").
+	after := get(t, publicCommentsPath(storyID), "").
 		expect(http.StatusOK).list()
 	if len(after) != 0 {
 		t.Errorf("expected the reply to cascade with its parent, got %v", after)
@@ -279,9 +278,9 @@ func TestSocialCommentReplies(t *testing.T) {
 
 func TestSocialCommentLikes(t *testing.T) {
 	reset(t)
-	storyID, chapterID := socialFixture(t)
-	comment := newComment(t, bob, storyID, chapterID, "Like me.", "")
-	likes := commentsPath(storyID, chapterID) + "/" + comment["id"].(string) + "/likes"
+	storyID, _ := socialFixture(t)
+	comment := newComment(t, bob, storyID, "Like me.", "")
+	likes := commentsPath(storyID) + "/" + comment["id"].(string) + "/likes"
 
 	liked := call(t, "PUT", likes, carol, nil).expect(http.StatusOK).json()
 	if liked["likeCount"].(float64) != 1 || liked["likedByMe"] != true {
@@ -296,12 +295,12 @@ func TestSocialCommentLikes(t *testing.T) {
 	call(t, "PUT", likes, dave, nil).expect(http.StatusOK)
 
 	// likedByMe is per viewer; the count is shared.
-	seen := get(t, publicCommentsPath(storyID, chapterID), carol).
+	seen := get(t, publicCommentsPath(storyID), carol).
 		expect(http.StatusOK).list()[0]
 	if seen["likeCount"].(float64) != 2 || seen["likedByMe"] != true {
 		t.Errorf("carol's view = %v", seen)
 	}
-	if mine := get(t, publicCommentsPath(storyID, chapterID), bob).expect(http.StatusOK).list()[0]; mine["likedByMe"] != false {
+	if mine := get(t, publicCommentsPath(storyID), bob).expect(http.StatusOK).list()[0]; mine["likedByMe"] != false {
 		t.Errorf("bob has not liked but sees likedByMe true: %v", mine)
 	}
 
@@ -313,7 +312,7 @@ func TestSocialCommentLikes(t *testing.T) {
 
 	call(t, "PUT", likes, "", nil).expect(http.StatusUnauthorized)
 	// A comment that does not exist is a 404, not a 500.
-	call(t, "PUT", commentsPath(storyID, chapterID)+
+	call(t, "PUT", commentsPath(storyID)+
 		"/11111111-1111-1111-1111-111111111111/likes", carol, nil).
 		expect(http.StatusNotFound)
 }
@@ -325,44 +324,44 @@ func TestSocialCommentLikes(t *testing.T) {
 // is really a bad URL.
 func TestSocialRejectsMalformedIDs(t *testing.T) {
 	reset(t)
-	storyID, chapterID := socialFixture(t)
-	comment := newComment(t, bob, storyID, chapterID, "Real.", "")["id"].(string)
+	storyID, _ := socialFixture(t)
+	comment := newComment(t, bob, storyID, "Real.", "")["id"].(string)
 	absent := "11111111-1111-1111-1111-111111111111"
 
-	// Malformed chapter id, on all four comment routes.
-	call(t, "POST", commentsPath(storyID, "not-a-uuid"), bob,
+	// Malformed story id, on all four comment routes.
+	call(t, "POST", commentsPath("not-a-uuid"), bob,
 		map[string]any{"message": "x"}).expect(http.StatusNotFound)
-	call(t, "PATCH", commentsPath(storyID, "not-a-uuid")+"/"+comment, bob,
+	call(t, "PATCH", commentsPath("not-a-uuid")+"/"+comment, bob,
 		map[string]any{"message": "x"}).expect(http.StatusNotFound)
-	call(t, "DELETE", commentsPath(storyID, "not-a-uuid")+"/"+comment, bob, nil).
+	call(t, "DELETE", commentsPath("not-a-uuid")+"/"+comment, bob, nil).
 		expect(http.StatusNotFound)
-	call(t, "PUT", commentsPath(storyID, "not-a-uuid")+"/"+comment+"/likes", bob, nil).
+	call(t, "PUT", commentsPath("not-a-uuid")+"/"+comment+"/likes", bob, nil).
 		expect(http.StatusNotFound)
 
 	// Malformed comment id, on the routes that take one.
-	call(t, "PATCH", commentsPath(storyID, chapterID)+"/not-a-uuid", bob,
+	call(t, "PATCH", commentsPath(storyID)+"/not-a-uuid", bob,
 		map[string]any{"message": "x"}).expect(http.StatusNotFound)
-	call(t, "DELETE", commentsPath(storyID, chapterID)+"/not-a-uuid", bob, nil).
+	call(t, "DELETE", commentsPath(storyID)+"/not-a-uuid", bob, nil).
 		expect(http.StatusNotFound)
-	call(t, "PUT", commentsPath(storyID, chapterID)+"/not-a-uuid/likes", bob, nil).
+	call(t, "PUT", commentsPath(storyID)+"/not-a-uuid/likes", bob, nil).
 		expect(http.StatusNotFound)
 
 	// Well-formed but absent ids are 404 too.
-	call(t, "POST", commentsPath(storyID, absent), bob,
+	call(t, "POST", commentsPath(absent), bob,
 		map[string]any{"message": "x"}).expect(http.StatusNotFound)
-	call(t, "PATCH", commentsPath(storyID, chapterID)+"/"+absent, bob,
+	call(t, "PATCH", commentsPath(storyID)+"/"+absent, bob,
 		map[string]any{"message": "x"}).expect(http.StatusNotFound)
-	call(t, "DELETE", commentsPath(storyID, chapterID)+"/"+absent, bob, nil).
+	call(t, "DELETE", commentsPath(storyID)+"/"+absent, bob, nil).
 		expect(http.StatusNotFound)
 
 	// And on the story segment, plus the public read.
 	call(t, "PUT", "/v1/stories/not-a-uuid/likes/me", bob, nil).expect(http.StatusNotFound)
-	get(t, publicCommentsPath(storyID, "not-a-uuid"), "").expect(http.StatusNotFound)
-	get(t, publicCommentsPath(absent, chapterID), "").expect(http.StatusNotFound)
+	get(t, "/v1/public/stories/not-a-uuid/comments", "").expect(http.StatusNotFound)
+	get(t, publicCommentsPath(absent), "").expect(http.StatusNotFound)
 
 	// Empty threads serialize as [], never null.
-	empty := newChapter(t, alice, storyID, "Quiet", 3)["id"].(string)
-	get(t, publicCommentsPath(storyID, empty), "").expect(http.StatusOK).list()
+	empty := newPublishedStory(t, alice, "Quiet")["id"].(string)
+	get(t, publicCommentsPath(empty), "").expect(http.StatusOK).list()
 }
 
 // ── author names ────────────────────────────────────────────────────────────
@@ -372,15 +371,15 @@ func TestSocialRejectsMalformedIDs(t *testing.T) {
 // resolves each author with its own request.
 func TestSocialCommentsCarryAuthorUsername(t *testing.T) {
 	reset(t)
-	storyID, chapterID := socialFixture(t)
+	storyID, _ := socialFixture(t)
 	newProfile(t, bob, "bob_writes", "everyone")
 
-	created := newComment(t, bob, storyID, chapterID, "With a name.", "")
+	created := newComment(t, bob, storyID, "With a name.", "")
 	if created["authorUsername"] != "bob_writes" {
 		t.Errorf("authorUsername on create = %v, want bob_writes", created["authorUsername"])
 	}
 
-	listed := get(t, publicCommentsPath(storyID, chapterID), "").
+	listed := get(t, publicCommentsPath(storyID), "").
 		expect(http.StatusOK).list()
 	if listed[0]["authorUsername"] != "bob_writes" {
 		t.Errorf("authorUsername in the thread = %v", listed[0]["authorUsername"])
@@ -388,9 +387,9 @@ func TestSocialCommentsCarryAuthorUsername(t *testing.T) {
 
 	// An author with no profile yet still round-trips, with an empty name
 	// rather than a missing row.
-	newComment(t, carol, storyID, chapterID, "No profile.", "")
+	newComment(t, carol, storyID, "No profile.", "")
 	var found bool
-	for _, c := range get(t, publicCommentsPath(storyID, chapterID), "").expect(http.StatusOK).list() {
+	for _, c := range get(t, publicCommentsPath(storyID), "").expect(http.StatusOK).list() {
 		if c["userId"] == carol {
 			found = true
 			if c["authorUsername"] != "" && c["authorUsername"] != nil {
@@ -403,64 +402,68 @@ func TestSocialCommentsCarryAuthorUsername(t *testing.T) {
 	}
 }
 
-func TestSocialCommentCascadesWithItsChapter(t *testing.T) {
+func TestSocialCommentsFollowTheStory(t *testing.T) {
 	reset(t)
 	storyID, chapterID := socialFixture(t)
-	newComment(t, bob, storyID, chapterID, "Doomed.", "")
+	newComment(t, bob, storyID, "Survives.", "")
 
-	story := get(t, "/v1/stories/"+storyID, alice).expect(http.StatusOK).json()
 	chapter := get(t, "/v1/stories/"+storyID+"/chapters/"+chapterID, alice).
 		expect(http.StatusOK).json()
-	_ = story
 	call(t, "DELETE", "/v1/stories/"+storyID+"/chapters/"+chapterID, alice, nil,
 		ifMatch(rev(t, chapter))).expect(http.StatusNoContent)
+	if left := get(t, publicCommentsPath(storyID), "").expect(http.StatusOK).list(); len(left) != 1 {
+		t.Errorf("deleting a chapter changed the story's thread: %v", left)
+	}
 
+	story := get(t, "/v1/stories/"+storyID, alice).expect(http.StatusOK).json()
+	call(t, "DELETE", "/v1/stories/"+storyID, alice, nil,
+		ifMatch(rev(t, story))).expect(http.StatusNoContent)
 	var remaining int
 	if err := testPool.QueryRow(context.Background(),
-		`SELECT count(*) FROM chapter_comments WHERE chapter_id=$1`, chapterID).
+		`SELECT count(*) FROM story_comments WHERE story_id=$1`, storyID).
 		Scan(&remaining); err != nil {
 		t.Fatal(err)
 	}
 	if remaining != 0 {
-		t.Errorf("expected comments to cascade with the chapter, %d remain", remaining)
+		t.Errorf("expected comments to cascade with the story, %d remain", remaining)
 	}
 }
 
 // ── daily budgets ───────────────────────────────────────────────────────────
 
 // Comments were unmetered: one account could post without limit on any
-// chapter, which is the cheapest way to make a shared surface unusable. The
+// story, which is the cheapest way to make a shared surface unusable. The
 // budget is per user per day and lives in the database, so it survives a
 // restart and holds across instances — the in-process rate limiter only
 // bounds bursts.
 func TestCommentRateLimit(t *testing.T) {
 	reset(t)
-	storyID, chapterID := socialFixture(t)
+	storyID, _ := socialFixture(t)
 
 	for i := 0; i < 100; i++ {
-		call(t, "POST", commentsPath(storyID, chapterID), bob,
+		call(t, "POST", commentsPath(storyID), bob,
 			map[string]any{"message": fmt.Sprintf("comment %d", i)}).
 			expect(http.StatusCreated)
 	}
-	call(t, "POST", commentsPath(storyID, chapterID), bob,
+	call(t, "POST", commentsPath(storyID), bob,
 		map[string]any{"message": "one too many"}).
 		expect(http.StatusTooManyRequests)
 
-	// The budget is per account, not per chapter or per story.
-	second := newChapter(t, alice, storyID, "Chapter Two", 2)["id"].(string)
-	call(t, "POST", commentsPath(storyID, second), bob,
-		map[string]any{"message": "different chapter"}).
+	// The budget is per account, not per story.
+	second := newPublishedStory(t, alice, "Another Work")["id"].(string)
+	call(t, "POST", commentsPath(second), bob,
+		map[string]any{"message": "different story"}).
 		expect(http.StatusTooManyRequests)
 
 	// And it is one user's budget, not everyone's.
-	call(t, "POST", commentsPath(storyID, chapterID), carol,
+	call(t, "POST", commentsPath(storyID), carol,
 		map[string]any{"message": "unaffected"}).expect(http.StatusCreated)
 
 	// A rejected comment must not be stored.
-	listed := get(t, publicCommentsPath(storyID, chapterID), "").
+	listed := get(t, publicCommentsPath(storyID), "").
 		expect(http.StatusOK).list()
 	if len(listed) != 101 {
-		t.Errorf("chapter holds %d comments, want 101", len(listed))
+		t.Errorf("story holds %d comments, want 101", len(listed))
 	}
 }
 

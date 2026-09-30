@@ -74,12 +74,8 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, s.store.IncrementPublicStoryViews(r.Context(), storyID, s.viewerKey(r)))
 		return
 	}
-	if len(p) == 5 && p[2] == "chapters" && p[4] == "comments" && r.Method == http.MethodGet {
-		if _, err := uuid.Parse(p[3]); err != nil {
-			notFound(w)
-			return
-		}
-		x, err := s.store.ListPublicComments(r.Context(), storyID, p[3], s.optionalUser(r))
+	if len(p) == 3 && p[2] == "comments" && r.Method == http.MethodGet {
+		x, err := s.store.ListPublicComments(r.Context(), storyID, s.optionalUser(r))
 		respond(w, x, err)
 		return
 	}
