@@ -30,8 +30,6 @@ func (s *Server) viewerKey(r *http.Request) string {
 // nobody typed, so it is rejected rather than sent to the database.
 const maxPublicStorySearchLen = 100
 
-const publicStoryListCacheControl = "public, max-age=0, s-maxage=30, stale-while-revalidate=300"
-
 func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 	p := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/public/"), "/"), "/")
 	if len(p) == 1 && p[0] == "stories" {
@@ -50,10 +48,7 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		x, err := s.store.ListPublicStories(r.Context(), r.URL.Query().Get("category"), search, r.URL.Query().Get("cursor"), limit)
-		if err == nil {
-			w.Header().Set("Cache-Control", publicStoryListCacheControl)
-		}
-		respond(w, x, err)
+		respondCacheable(w, r, x, err, publicStoryListCacheControl)
 		return
 	}
 	if len(p) < 2 || p[0] != "stories" || p[1] == "" {
@@ -67,19 +62,15 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(p) == 2 && r.Method == http.MethodGet {
 		x, err := s.store.GetPublicStory(r.Context(), storyID)
-		respond(w, x, err)
+		respondCacheable(w, r, x, err, publicStoryDetailCacheControl)
 		return
 	}
 	if len(p) == 3 && p[2] == "views" && r.Method == http.MethodPost {
 		respond(w, nil, s.store.IncrementPublicStoryViews(r.Context(), storyID, s.viewerKey(r)))
 		return
 	}
-	if len(p) == 5 && p[2] == "chapters" && p[4] == "comments" && r.Method == http.MethodGet {
-		if _, err := uuid.Parse(p[3]); err != nil {
-			notFound(w)
-			return
-		}
-		x, err := s.store.ListPublicComments(r.Context(), storyID, p[3], s.optionalUser(r))
+	if len(p) == 3 && p[2] == "comments" && r.Method == http.MethodGet {
+		x, err := s.store.ListPublicComments(r.Context(), storyID, s.optionalUser(r))
 		respond(w, x, err)
 		return
 	}
@@ -89,7 +80,7 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		x, err := s.store.GetPublicChapter(r.Context(), storyID, p[3])
-		respond(w, x, err)
+		respondCacheable(w, r, x, err, publicChapterCacheControl)
 		return
 	}
 	notFound(w)

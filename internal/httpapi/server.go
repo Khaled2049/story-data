@@ -177,14 +177,8 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 		s.assistantThreads(w, r, uid, p[0], p)
 		return
 	}
-	if p[1] == "chapters" && len(p) >= 4 && p[3] == "comments" {
-		// Guarded here rather than inside `comments`: this branch returns
-		// before the uuidPath checks further down, and every route below puts
-		// these segments straight into a query against a uuid column.
-		if !uuidPath(w, p[2]) {
-			return
-		}
-		if len(p) >= 5 && !uuidPath(w, p[4]) {
+	if p[1] == "comments" {
+		if len(p) >= 3 && !uuidPath(w, p[2]) {
 			return
 		}
 		s.comments(w, r, uid, p[0], p)
@@ -238,8 +232,7 @@ func (s *Server) storyLike(w http.ResponseWriter, r *http.Request, uid, storyID 
 	respond(w, x, e)
 }
 func (s *Server) comments(w http.ResponseWriter, r *http.Request, uid, storyID string, p []string) {
-	chapterID := p[2]
-	if len(p) == 4 {
+	if len(p) == 2 {
 		if r.Method != http.MethodPost {
 			method(w)
 			return
@@ -248,7 +241,7 @@ func (s *Server) comments(w http.ResponseWriter, r *http.Request, uid, storyID s
 		if !decode(w, r, &in) {
 			return
 		}
-		x, e := s.store.CreateComment(r.Context(), storyID, chapterID, uid, in)
+		x, e := s.store.CreateComment(r.Context(), storyID, uid, in)
 		if e == nil {
 			write(w, http.StatusCreated, x)
 		} else {
@@ -256,20 +249,20 @@ func (s *Server) comments(w http.ResponseWriter, r *http.Request, uid, storyID s
 		}
 		return
 	}
-	if len(p) == 6 && p[5] == "likes" {
+	if len(p) == 4 && p[3] == "likes" {
 		if r.Method != http.MethodPut && r.Method != http.MethodDelete {
 			method(w)
 			return
 		}
-		x, e := s.store.SetCommentLike(r.Context(), storyID, chapterID, p[4], uid, r.Method == http.MethodPut)
+		x, e := s.store.SetCommentLike(r.Context(), storyID, p[2], uid, r.Method == http.MethodPut)
 		respond(w, x, e)
 		return
 	}
-	if len(p) != 5 {
+	if len(p) != 3 {
 		notFound(w)
 		return
 	}
-	commentID := p[4]
+	commentID := p[2]
 	switch r.Method {
 	case http.MethodPatch:
 		var in struct {
@@ -278,10 +271,10 @@ func (s *Server) comments(w http.ResponseWriter, r *http.Request, uid, storyID s
 		if !decode(w, r, &in) {
 			return
 		}
-		x, e := s.store.UpdateComment(r.Context(), storyID, chapterID, commentID, uid, in.Message)
+		x, e := s.store.UpdateComment(r.Context(), storyID, commentID, uid, in.Message)
 		respond(w, x, e)
 	case http.MethodDelete:
-		respond(w, nil, s.store.DeleteComment(r.Context(), storyID, chapterID, commentID, uid))
+		respond(w, nil, s.store.DeleteComment(r.Context(), storyID, commentID, uid))
 	default:
 		method(w)
 	}
