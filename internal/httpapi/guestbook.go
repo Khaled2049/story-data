@@ -30,7 +30,19 @@ func (s *Server) publicGuestbook(w http.ResponseWriter, r *http.Request) {
 			notFound(w)
 			return
 		}
-		x, err := s.store.ListGuestbookReplies(r.Context(), p[0], p[2], viewer)
+		// A bare array of the whole thread is the response clients already
+		// deployed expect. Asking for a limit opts in to the paged shape.
+		if r.URL.Query().Get("limit") == "" {
+			x, err := s.store.ListGuestbookReplies(r.Context(), p[0], p[2], viewer)
+			respond(w, x, err)
+			return
+		}
+		limit, err := guestbookLimit(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 50")
+			return
+		}
+		x, err := s.store.ListGuestbookReplyPage(r.Context(), p[0], p[2], viewer, r.URL.Query().Get("cursor"), limit)
 		respond(w, x, err)
 		return
 	}

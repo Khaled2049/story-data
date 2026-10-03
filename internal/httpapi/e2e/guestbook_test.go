@@ -684,3 +684,178 @@ func TestWallPagination(t *testing.T) {
 		t.Errorf("pagination covered %d of %d entries", len(seen), total)
 	}
 }
+
+// The all filter is assembled from three separately limited branches, and an
+// entry can sit in more than one of them: alice writing on her own wall is in
+// both "her wall" and "her authorship". Paging has to return every entry once,
+// in feed order, whichever branch each page happens to draw from.
+func TestWallAllPagesAcrossBranchesWithoutDuplicates(t *testing.T) {
+	reset(t)
+	seedWallFixture(t)
+	want := []string{}
+	for i := 0; i < 3; i++ {
+		for _, e := range []map[string]any{
+			postEntry(t, alice, alice, fmt.Sprintf("alice on her own wall %d", i)),
+			postEntry(t, bob, bob, fmt.Sprintf("bob on his own wall %d", i)),
+			postEntry(t, alice, carol, fmt.Sprintf("alice on carol's wall %d", i)),
+			postEntry(t, dave, alice, fmt.Sprintf("a stranger on alice's wall %d", i)),
+		} {
+			want = append(want, e["id"].(string))
+		}
+		postEntry(t, dave, carol, fmt.Sprintf("invisible to alice %d", i))
+	}
+
+	got := []string{}
+	seen := map[string]bool{}
+	cursor := ""
+	for pages := 0; pages < 20; pages++ {
+		url := "/v1/me/wall?filter=all&limit=3"
+		if cursor != "" {
+			url += "&cursor=" + cursor
+		}
+		page := get(t, url, alice).expect(http.StatusOK).json()
+		for _, raw := range page["entries"].([]any) {
+			id := raw.(map[string]any)["id"].(string)
+			if seen[id] {
+				t.Errorf("entry %s appeared twice", id)
+			}
+			seen[id] = true
+			got = append(got, id)
+		}
+		next, _ := page["nextCursor"].(string)
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	// The fixture contributes four visible entries, all older than these.
+	if len(got) != len(want)+4 {
+		t.Fatalf("paged through %d entries, want %d", len(got), len(want)+4)
+	}
+	for i, id := range got[:len(want)] {
+		if newest := want[len(want)-1-i]; id != newest {
+			t.Fatalf("position %d is %s, want %s: the feed is not newest-first", i, id, newest)
+		}
+	}
+}
+
+func replyPage(t *testing.T, owner, entryID, viewer, query string) map[string]any {
+	t.Helper()
+	return get(t, publicWallOf(owner)+"/"+entryID+"/replies?"+query, viewer).
+		expect(http.StatusOK).json()
+}
+
+// A page of a thread is a set of whole subtrees: paging by the flat list would
+// hand the client a reply whose parent is on a page it has not loaded.
+func TestGuestbookReplyPagesAreWholeSubtrees(t *testing.T) {
+	reset(t)
+	newProfile(t, bob, "bob_w", "everyone")
+	id := postEntry(t, bob, alice, "Top level.")["id"].(string)
+
+	const roots = 5
+	total := 0
+	oldestChild := ""
+	for i := 0; i < roots; i++ {
+		// Two authors: a member may post ten replies a day.
+		root := postReply(t, alice, alice, id, "", fmt.Sprintf("root %d", i))["id"].(string)
+		child := postReply(t, bob, alice, id, root, "child")["id"].(string)
+		total += 2
+		if i == 0 {
+			oldestChild = child
+		}
+	}
+	// The oldest thread gets the newest reply, so a page cut across the flat
+	// list would put it on page one and its ancestors on the last.
+	postReply(t, alice, alice, id, oldestChild, "a late reply deep in the oldest thread")
+	total++
+
+	seen := map[string]bool{}
+	topLevel := 0
+	cursor := ""
+	pages := 0
+	for ; pages < 10; pages++ {
+		query := "limit=2"
+		if cursor != "" {
+			query += "&cursor=" + cursor
+		}
+		page := replyPage(t, alice, id, "", query)
+		if int(page["totalCount"].(float64)) != total {
+			t.Errorf("totalCount = %v, want %d", page["totalCount"], total)
+		}
+		onPage := map[string]bool{}
+		rows := page["replies"].([]any)
+		for _, raw := range rows {
+			onPage[raw.(map[string]any)["id"].(string)] = true
+		}
+		pageRoots := 0
+		for _, raw := range rows {
+			r := raw.(map[string]any)
+			rid := r["id"].(string)
+			if seen[rid] {
+				t.Errorf("reply %s appeared on two pages", rid)
+			}
+			seen[rid] = true
+			if r["parentId"] == nil {
+				pageRoots++
+			} else if !onPage[r["parentId"].(string)] {
+				t.Errorf("reply %s arrived without its parent", rid)
+			}
+		}
+		if pageRoots > 2 {
+			t.Errorf("page holds %d top-level replies, limit was 2", pageRoots)
+		}
+		topLevel += pageRoots
+		next, _ := page["nextCursor"].(string)
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if len(seen) != total || topLevel != roots {
+		t.Errorf("paged through %d replies and %d threads, want %d and %d", len(seen), topLevel, total, roots)
+	}
+	if pages != 2 {
+		t.Errorf("five threads at two a page took %d pages, want 3", pages+1)
+	}
+}
+
+func TestGuestbookReplyPageContract(t *testing.T) {
+	reset(t)
+	newProfile(t, bob, "bob_w", "everyone")
+	id := postEntry(t, bob, alice, "Top level.")["id"].(string)
+	base := publicWallOf(alice) + "/" + id + "/replies"
+
+	// An empty thread is an empty list, never null, and has no cursor.
+	empty := replyPage(t, alice, id, "", "limit=10")
+	if rows, ok := empty["replies"].([]any); !ok || len(rows) != 0 {
+		t.Errorf("replies = %v, want []", empty["replies"])
+	}
+	if _, has := empty["nextCursor"]; has {
+		t.Errorf("an empty thread should carry no cursor: %v", empty)
+	}
+
+	reply := postReply(t, bob, alice, id, "", "Hello.")
+	call(t, "PUT", guestbookOf(alice)+"/"+id+"/replies/"+reply["id"].(string)+"/votes", carol,
+		map[string]any{"vote": "up"}).expect(http.StatusNoContent)
+
+	// The viewer's own vote rides along, as it does on the unpaged read.
+	mine := replyPage(t, alice, id, carol, "limit=10")["replies"].([]any)[0].(map[string]any)
+	if userVote(mine) != "up" || mine["upvoteCount"].(float64) != 1 {
+		t.Errorf("paged reply lost the vote: %v", mine)
+	}
+	if mine["authorUsername"] != "bob_w" {
+		t.Errorf("authorUsername = %v, want bob_w", mine["authorUsername"])
+	}
+
+	// Without a limit the response is still the bare array old clients read.
+	if all := replies(t, alice, id, ""); len(all) != 1 {
+		t.Errorf("unpaged read returned %d replies, want 1", len(all))
+	}
+
+	for _, bad := range []string{"limit=0", "limit=51", "limit=abc"} {
+		get(t, base+"?"+bad, alice).expect(http.StatusBadRequest)
+	}
+	get(t, base+"?limit=5&cursor=not-a-cursor", alice).expect(http.StatusUnprocessableEntity)
+	// The entry is still checked against the wall it is addressed through.
+	get(t, publicWallOf(bob)+"/"+id+"/replies?limit=5", alice).expect(http.StatusNotFound)
+}
