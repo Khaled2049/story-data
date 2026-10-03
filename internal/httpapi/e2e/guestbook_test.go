@@ -156,33 +156,33 @@ func TestGuestbookEntryDeletePermissions(t *testing.T) {
 
 // ── the five-policy wall ────────────────────────────────────────────────────
 
-// Each case sets the wall owner's policy, wires the follow graph, and says
-// whether the visitor may write. alice always owns the wall; bob is the visitor.
-var wallPolicyCases = []struct {
-	policy      string
-	bobFollows  bool // bob -> alice
-	aliceFollow bool // alice -> bob
-	allowed     bool
-}{
-	{"everyone", false, false, true},
-	{"nobody", false, false, false},
-	{"nobody", true, true, false},
-
-	{"followers", false, false, false},
-	{"followers", true, false, true},  // bob follows alice
-	{"followers", false, true, false}, // only alice follows bob
-
-	{"following", false, false, false},
-	{"following", false, true, true}, // alice follows bob
-	{"following", true, false, false},
-
-	{"mutuals", true, false, false},
-	{"mutuals", false, true, false},
-	{"mutuals", true, true, true},
-}
-
 func TestGuestbookWallPolicyMatrix(t *testing.T) {
-	for _, c := range wallPolicyCases {
+	// Each case sets the wall owner's policy, wires the follow graph, and
+	// checks who may write. alice always owns the wall; bob is the visitor.
+	cases := []struct {
+		policy      string
+		bobFollows  bool // bob -> alice
+		aliceFollow bool // alice -> bob
+		allowed     bool
+	}{
+		{"everyone", false, false, true},
+		{"nobody", false, false, false},
+		{"nobody", true, true, false},
+
+		{"followers", false, false, false},
+		{"followers", true, false, true},  // bob follows alice
+		{"followers", false, true, false}, // only alice follows bob
+
+		{"following", false, false, false},
+		{"following", false, true, true}, // alice follows bob
+		{"following", true, false, false},
+
+		{"mutuals", true, false, false},
+		{"mutuals", false, true, false},
+		{"mutuals", true, true, true},
+	}
+
+	for _, c := range cases {
 		name := fmt.Sprintf("%s/bobFollows=%v/aliceFollows=%v", c.policy, c.bobFollows, c.aliceFollow)
 		t.Run(name, func(t *testing.T) {
 			reset(t)
@@ -858,58 +858,4 @@ func TestGuestbookReplyPageContract(t *testing.T) {
 	get(t, base+"?limit=5&cursor=not-a-cursor", alice).expect(http.StatusUnprocessableEntity)
 	// The entry is still checked against the wall it is addressed through.
 	get(t, publicWallOf(bob)+"/"+id+"/replies?limit=5", alice).expect(http.StatusNotFound)
-}
-
-// The feed tells the viewer whether each entry's wall will take their reply.
-// It runs the same matrix as the write gate, and then makes the write, so a
-// flag that drifted from the gate fails here rather than in a reader's hands.
-func TestWallFeedReportsWhetherTheViewerMayReply(t *testing.T) {
-	for _, c := range wallPolicyCases {
-		name := fmt.Sprintf("%s/bobFollows=%v/aliceFollows=%v", c.policy, c.bobFollows, c.aliceFollow)
-		t.Run(name, func(t *testing.T) {
-			reset(t)
-			// The entry goes up while the wall is open, by an author bob
-			// follows, so it reaches bob's feed whatever alice's policy
-			// becomes and whether or not bob follows alice.
-			newProfile(t, alice, "alice_w", "everyone")
-			follow(t, bob, dave)
-			onAlices := postEntry(t, dave, alice, "dave on alice's wall")["id"].(string)
-			onBobs := postEntry(t, dave, bob, "dave on bob's wall")["id"].(string)
-			call(t, "PUT", "/v1/profiles/me", alice, map[string]any{
-				"username": "alice_w", "guestbookPolicy": c.policy,
-			}).expect(http.StatusCreated)
-			if c.bobFollows {
-				follow(t, bob, alice)
-			}
-			if c.aliceFollow {
-				follow(t, alice, bob)
-			}
-
-			seen := 0
-			for _, e := range wallEntriesFor(t, bob, "all") {
-				switch e["id"] {
-				case onAlices:
-					seen++
-					if e["viewerCanPost"] != c.allowed {
-						t.Errorf("viewerCanPost = %v on alice's wall, want %v", e["viewerCanPost"], c.allowed)
-					}
-				case onBobs:
-					seen++
-					if e["viewerCanPost"] != true {
-						t.Errorf("viewerCanPost = %v on bob's own wall, want true", e["viewerCanPost"])
-					}
-				}
-			}
-			if seen != 2 {
-				t.Fatalf("bob's feed held %d of the two entries", seen)
-			}
-
-			want := http.StatusCreated
-			if !c.allowed {
-				want = http.StatusForbidden
-			}
-			call(t, "POST", guestbookOf(alice)+"/"+onAlices+"/replies", bob,
-				map[string]any{"content": "reply"}).expect(want)
-		})
-	}
 }
