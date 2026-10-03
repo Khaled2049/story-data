@@ -55,6 +55,7 @@ func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.
 	m.HandleFunc("/v1/guestbooks/", x.guestbook)
 	m.HandleFunc("/v1/book-clubs", x.bookClubs)
 	m.HandleFunc("/v1/book-clubs/", x.bookClub)
+	m.HandleFunc("/v1/me/book-clubs", x.myBookClubs)
 	m.HandleFunc("/v1/competitions", x.competitions)
 	m.HandleFunc("/v1/competitions/", x.competition)
 	m.HandleFunc("/v1/me/competitions/drafts", x.myCompetitions)

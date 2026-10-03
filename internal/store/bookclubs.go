@@ -141,6 +141,72 @@ func (s *Store) ListBookClubs(ctx context.Context, limit int) ([]BookClub, error
 	}
 	return x, nil
 }
+
+// BookClubSummary is one row of the club directory. It carries nothing whose
+// size grows with a club's activity — no member ids, prompts, responses, polls
+// or votes — so the list costs the same however busy its clubs are, and does
+// not publish who belongs to or voted in each one.
+//
+// MeetUp is here for the edit form, not the row: PATCH replaces a whole
+// BookClubInput, so a client editing from a summary must be able to send the
+// current value back.
+type BookClubSummary struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Image       string `json:"image"`
+	Category    string `json:"category"`
+	Activity    string `json:"activity"`
+	CreatorID   string `json:"creatorId"`
+	MemberCount int    `json:"memberCount"`
+	MeetUp      string `json:"meetUp,omitempty"`
+}
+
+func (s *Store) ListBookClubSummaries(ctx context.Context, limit int) ([]BookClubSummary, error) {
+	if limit <= 0 {
+		limit = defaultClubPageSize
+	}
+	if limit > maxClubPageSize {
+		limit = maxClubPageSize
+	}
+	rows, err := s.db.Query(ctx, `SELECT c.id,c.name,c.description,c.image,c.category,c.activity,c.owner_id,c.meetup,(SELECT count(*) FROM book_club_members m WHERE m.club_id=c.id) FROM book_clubs c ORDER BY c.updated_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	x := []BookClubSummary{}
+	for rows.Next() {
+		var c BookClubSummary
+		var id uuid.UUID
+		if err = rows.Scan(&id, &c.Name, &c.Description, &c.Image, &c.Category, &c.Activity, &c.CreatorID, &c.MeetUp, &c.MemberCount); err != nil {
+			return nil, err
+		}
+		c.ID = id.String()
+		x = append(x, c)
+	}
+	return x, rows.Err()
+}
+
+// ListMyBookClubIDs is the viewer's half of the directory: which clubs they
+// belong to. Kept apart from the summaries so that list is the same for every
+// caller.
+func (s *Store) ListMyBookClubIDs(ctx context.Context, user string) ([]string, error) {
+	rows, err := s.db.Query(ctx, `SELECT club_id FROM book_club_members WHERE user_id=$1 ORDER BY joined_at`, user)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	x := []string{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		x = append(x, id.String())
+	}
+	return x, rows.Err()
+}
+
 func (s *Store) GetBookClub(ctx context.Context, id string) (BookClub, error) {
 	if _, e := uuid.Parse(id); e != nil {
 		return BookClub{}, ErrNotFound

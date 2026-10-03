@@ -20,8 +20,18 @@ func (s *Server) bookClubs(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "limit must be between 1 and 100")
 			return
 		}
-		x, e := s.store.ListBookClubs(r.Context(), limit)
-		respond(w, x, e)
+		// The full representation stays the default so a client deployed
+		// before the summary existed keeps getting the shape it reads.
+		switch r.URL.Query().Get("view") {
+		case "":
+			x, e := s.store.ListBookClubs(r.Context(), limit)
+			respond(w, x, e)
+		case "summary":
+			x, e := s.store.ListBookClubSummaries(r.Context(), limit)
+			respond(w, x, e)
+		default:
+			writeError(w, http.StatusBadRequest, "view must be summary")
+		}
 		return
 	}
 	uid, ok := s.user(w, r)
@@ -42,6 +52,19 @@ func (s *Server) bookClubs(w http.ResponseWriter, r *http.Request) {
 	} else {
 		respond(w, nil, e)
 	}
+}
+
+func (s *Server) myBookClubs(w http.ResponseWriter, r *http.Request) {
+	uid, ok := s.user(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		method(w)
+		return
+	}
+	x, e := s.store.ListMyBookClubIDs(r.Context(), uid)
+	respond(w, x, e)
 }
 
 // clubLimit mirrors profileLimit and guestbookLimit: absent means the store's
