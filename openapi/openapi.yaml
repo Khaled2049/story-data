@@ -11,8 +11,16 @@ paths:
       responses: { '200': { description: Healthy } }
   /v1/stories:
     get:
+      description: >-
+        Without pagination parameters, returns the legacy array of all owner
+        stories. With limit or cursor, returns {stories,nextCursor}; pass the
+        cursor back to read the next page. Pages are ordered by updatedAt and
+        id descending and contain owner-only drafts.
       security: [{ firebaseBearer: [] }]
-      responses: { '200': { description: Owner stories } }
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 24 } }
+      responses: { '200': { description: Owner stories or paginated owner story page }, '400': { description: limit is not a positive integer }, '422': { description: cursor is malformed } }
     post:
       security: [{ firebaseBearer: [] }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/StoryInput' } } } }
