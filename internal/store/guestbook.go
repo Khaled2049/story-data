@@ -53,6 +53,10 @@ type GuestbookReplyPage struct {
 type GuestbookActivityEntry struct {
 	GuestbookEntry
 	OwnerUsername string `json:"ownerUsername"`
+	// Whether the viewer may reply on the wall this entry sits on. The feed
+	// mixes walls with different policies, and "following" depends on the
+	// owner's follow list, which a client cannot read.
+	ViewerCanPost bool `json:"viewerCanPost"`
 }
 type GuestbookActivityPage struct {
 	Entries    []GuestbookActivityEntry `json:"entries"`
@@ -164,7 +168,8 @@ func (s *Store) ListPersonalWall(ctx context.Context, viewerID, filter, cursor s
  (SELECT count(*) FROM guestbook_replies r WHERE r.entry_id=e.id),
  (SELECT count(*) FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.vote='up'),
  (SELECT count(*) FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.vote='down'),
- COALESCE((SELECT v.vote FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.user_id=$1),'')
+ COALESCE((SELECT v.vote FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.user_id=$1),''),
+ `+guestbookCanPostSQL("e.owner_id", "$1")+`
  FROM page JOIN guestbook_entries e ON e.id=page.id
  LEFT JOIN public_profiles po ON po.user_id=e.owner_id
  LEFT JOIN public_profiles pa ON pa.user_id=e.author_id
@@ -458,30 +463,31 @@ func (s *Store) ListFollowers(ctx context.Context, user string) ([]string, error
 	return out, rows.Err()
 }
 
+// guestbookCanPostSQL is the wall policy as a boolean SQL expression over an
+// owner and a caller, each given as a column or a parameter. It is the only
+// copy of the matrix: the write gate and the feed's viewerCanPost flag both
+// evaluate it, so the flag cannot promise a reply the gate would refuse.
+// A profile that predates the setting has no row and reads as 'everyone'.
+func guestbookCanPostSQL(owner, caller string) string {
+	followsOwner := `EXISTS(SELECT 1 FROM user_follows WHERE follower_id=` + caller + ` AND followed_id=` + owner + `)`
+	ownerFollows := `EXISTS(SELECT 1 FROM user_follows WHERE follower_id=` + owner + ` AND followed_id=` + caller + `)`
+	return `(` + owner + `=` + caller + ` OR CASE COALESCE((SELECT guestbook_policy FROM public_profiles WHERE user_id=` + owner + `),'everyone')
+  WHEN 'everyone' THEN true
+  WHEN 'followers' THEN ` + followsOwner + `
+  WHEN 'following' THEN ` + ownerFollows + `
+  WHEN 'mutuals' THEN ` + followsOwner + ` AND ` + ownerFollows + `
+  ELSE false END)`
+}
+
 func (s *Store) canPostGuestbook(ctx context.Context, owner, caller string) error {
-	if owner == caller {
-		return nil
-	}
-	var policy string
-	if e := s.db.QueryRow(ctx, `SELECT guestbook_policy FROM public_profiles WHERE user_id=$1`, owner).Scan(&policy); errors.Is(e, pgx.ErrNoRows) {
-		policy = "everyone"
-	} else if e != nil {
+	var allowed bool
+	if e := s.db.QueryRow(ctx, `SELECT `+guestbookCanPostSQL("$1::text", "$2::text"), owner, caller).Scan(&allowed); e != nil {
 		return e
 	}
-	if policy == "everyone" {
-		return nil
-	}
-	if policy == "nobody" {
+	if !allowed {
 		return ErrForbidden
 	}
-	var followsOwner, ownerFollows bool
-	if e := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND followed_id=$2),EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$2 AND followed_id=$1)`, caller, owner).Scan(&followsOwner, &ownerFollows); e != nil {
-		return e
-	}
-	if (policy == "followers" && followsOwner) || (policy == "following" && ownerFollows) || (policy == "mutuals" && followsOwner && ownerFollows) {
-		return nil
-	}
-	return ErrForbidden
+	return nil
 }
 func (s *Store) consumeGuestbookQuota(ctx context.Context, tx pgx.Tx, user, column string, max int) error {
 	q := `INSERT INTO guestbook_daily_usage(user_id,day,` + column + `) VALUES($1,current_date,1) ON CONFLICT(user_id,day) DO UPDATE SET ` + column + `=guestbook_daily_usage.` + column + `+1 WHERE guestbook_daily_usage.` + column + ` < $2 RETURNING ` + column
@@ -549,7 +555,7 @@ func scanGuestbookEntry(row pgx.Row) (GuestbookEntry, error) {
 func scanGuestbookActivityEntry(row pgx.Row) (GuestbookActivityEntry, error) {
 	var x GuestbookActivityEntry
 	var id uuid.UUID
-	e := row.Scan(&id, &x.OwnerID, &x.OwnerUsername, &x.AuthorID, &x.AuthorUsername, &x.Content, &x.CreatedAt, &x.CommentCount, &x.UpvoteCount, &x.DownvoteCount, &x.UserVote)
+	e := row.Scan(&id, &x.OwnerID, &x.OwnerUsername, &x.AuthorID, &x.AuthorUsername, &x.Content, &x.CreatedAt, &x.CommentCount, &x.UpvoteCount, &x.DownvoteCount, &x.UserVote, &x.ViewerCanPost)
 	x.ID = id.String()
 	return x, e
 }

@@ -260,6 +260,11 @@ entry, and with one it walks past every entry that is not the viewer's, which
 for an account with a quiet feed is the whole table. Cost scales with the
 viewer's follow count, not with the number of entries.
 
+Each feed entry carries `viewerCanPost`: whether the viewer may reply on the
+wall that entry sits on. The wall policy exists once, as the SQL expression
+`guestbookCanPostSQL`; `canPostGuestbook` (the write gate) and this flag both
+evaluate it. Change the policy there, never in one caller.
+
 `GET /v1/public/guestbooks/{owner}/entries/{id}/replies` returns the whole
 thread as a bare array, which is what already-deployed clients read. With
 `?limit=` (1–50) it returns `{ replies, nextCursor, totalCount }` instead,
