@@ -94,10 +94,13 @@ func TestOwnerStoryPagesPreserveTagsAndScope(t *testing.T) {
 			t.Fatalf("unexpected or duplicated story %s", id)
 		}
 		delete(ids, id)
-		tags := story["tags"].([]any)
-		if len(tags) != 1 || tags[0] != "x" {
-			t.Errorf("story %s tags = %v", id, tags)
+		if _, hasTags := story["tags"]; hasTags {
+			t.Errorf("shelf page included edit-only tags for %s", id)
 		}
+	}
+	legacy := get(t, "/v1/stories", alice).expect(http.StatusOK).list()
+	if tags := legacy[0]["tags"].([]any); len(tags) != 1 || tags[0] != "x" {
+		t.Errorf("legacy owner list tags = %v", tags)
 	}
 	get(t, "/v1/stories?limit=0", alice).expect(http.StatusBadRequest)
 	get(t, "/v1/stories?limit=2&cursor=invalid", alice).expect(http.StatusUnprocessableEntity)

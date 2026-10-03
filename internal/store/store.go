@@ -86,9 +86,31 @@ type StoryListItem struct {
 }
 
 type StoryListPage struct {
-	Stories    []StoryListItem  `json:"stories"`
+	Stories    []StoryShelfItem `json:"stories"`
 	Summary    StoryListSummary `json:"summary"`
 	NextCursor string           `json:"nextCursor,omitempty"`
+}
+
+// StoryShelfItem contains fields used before opening a shelf action. Editing
+// reads the full story by id, including tags, revision, and optional metadata.
+type StoryShelfItem struct {
+	ID            string    `json:"id"`
+	OwnerID       string    `json:"ownerId"`
+	Title         string    `json:"title"`
+	Description   string    `json:"description"`
+	AuthorName    string    `json:"authorName"`
+	Published     bool      `json:"published"`
+	Category      string    `json:"category"`
+	CoverImageURL string    `json:"coverImageUrl"`
+	ThumbnailURL  string    `json:"thumbnailUrl"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+	ChapterCount  int       `json:"chapterCount"`
+	WordCount     int       `json:"wordCount"`
+	Views         int64     `json:"views"`
+	LikeCount     int64     `json:"likeCount"`
+	AverageRating *float64  `json:"averageRating,omitempty"`
+	RatingsCount  int       `json:"ratingsCount"`
 }
 
 type StoryListSummary struct {
@@ -197,7 +219,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, owner_id, title, d
 }
 
 func (s *Store) ListStories(ctx context.Context, owner string) ([]StoryListItem, error) {
-	return s.listStories(ctx, owner, "", 0)
+	return s.listStories(ctx, owner, "", 0, true)
 }
 
 // ListStoriesPage bounds the owner's shelf response. A stable (updated_at,id)
@@ -209,24 +231,36 @@ func (s *Store) ListStoriesPage(ctx context.Context, owner, cursor string, pageS
 	if pageSize > 50 {
 		pageSize = 50
 	}
-	stories, err := s.listStories(ctx, owner, cursor, pageSize+1)
+	stories, err := s.listStories(ctx, owner, cursor, pageSize+1, false)
 	if err != nil {
 		return StoryListPage{}, err
 	}
-	page := StoryListPage{Stories: stories}
+	page := StoryListPage{Stories: []StoryShelfItem{}}
 	if err := s.db.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE is_published), COALESCE(sum(views),0) FROM stories WHERE owner_id=$1`, owner).
 		Scan(&page.Summary.TotalStories, &page.Summary.PublishedCount, &page.Summary.TotalViews); err != nil {
 		return StoryListPage{}, err
 	}
 	if len(stories) > pageSize {
-		page.Stories = stories[:pageSize]
-		last := page.Stories[len(page.Stories)-1]
+		last := stories[pageSize-1]
 		page.NextCursor, err = encodeStoryListCursor(last.UpdatedAt, last.ID)
+		stories = stories[:pageSize]
+	}
+	for _, story := range stories {
+		page.Stories = append(page.Stories, StoryShelfItem{
+			ID: story.ID, OwnerID: story.OwnerID, Title: story.Title,
+			Description: story.Description, AuthorName: story.AuthorName,
+			Published: story.Published, Category: story.Category,
+			CoverImageURL: story.CoverImageURL, ThumbnailURL: story.ThumbnailURL,
+			CreatedAt: story.CreatedAt, UpdatedAt: story.UpdatedAt,
+			ChapterCount: story.ChapterCount, WordCount: story.WordCount,
+			Views: story.Views, LikeCount: story.LikeCount,
+			AverageRating: story.AverageRating, RatingsCount: story.RatingsCount,
+		})
 	}
 	return page, err
 }
 
-func (s *Store) listStories(ctx context.Context, owner, cursor string, limit int) ([]StoryListItem, error) {
+func (s *Store) listStories(ctx context.Context, owner, cursor string, limit int, includeTags bool) ([]StoryListItem, error) {
 	var after *publicStoryCursor
 	if cursor != "" {
 		parsed, err := decodePublicStoryCursor(cursor)
@@ -281,7 +315,7 @@ FROM stories s WHERE s.owner_id=$1`
 		return nil, err
 	}
 	rows.Close()
-	if len(stories) == 0 {
+	if !includeTags || len(stories) == 0 {
 		return stories, nil
 	}
 	ids := make([]uuid.UUID, len(stories))

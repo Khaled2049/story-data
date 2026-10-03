@@ -15,7 +15,8 @@ paths:
         Without pagination parameters, returns the legacy array of all owner
         stories. With limit or cursor, returns {stories,nextCursor}; pass the
         cursor back to read the next page. Pages are ordered by updatedAt and
-        id descending and contain owner-only drafts.
+        id descending and contain owner-only drafts. Paged rows contain shelf
+        fields only; fetch an individual story before opening its metadata editor.
       security: [{ firebaseBearer: [] }]
       parameters:
         - { name: cursor, in: query, schema: { type: string } }
