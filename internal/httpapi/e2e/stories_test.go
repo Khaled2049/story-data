@@ -57,6 +57,55 @@ func TestStoryCreateAndList(t *testing.T) {
 	}
 }
 
+func TestOwnerStoryPagesPreserveTagsAndScope(t *testing.T) {
+	reset(t)
+	ids := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		story := newStory(t, alice, fmt.Sprintf("Shelf %d", i))
+		ids[story["id"].(string)] = true
+	}
+	_ = newStory(t, bob, "Someone else's draft")
+
+	first := get(t, "/v1/stories?limit=2", alice).expect(http.StatusOK).json()
+	summary := first["summary"].(map[string]any)
+	if summary["totalStories"] != float64(3) || summary["publishedCount"] != float64(0) {
+		t.Fatalf("wrong shelf summary: %v", summary)
+	}
+	items := first["stories"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("first page has %d stories, want 2", len(items))
+	}
+	cursor, ok := first["nextCursor"].(string)
+	if !ok || cursor == "" {
+		t.Fatal("first page is missing nextCursor")
+	}
+	second := get(t, "/v1/stories?limit=2&cursor="+cursor, alice).expect(http.StatusOK).json()
+	items = append(items, second["stories"].([]any)...)
+	if len(items) != 3 {
+		t.Fatalf("combined pages have %d stories, want 3", len(items))
+	}
+	if _, ok := second["nextCursor"]; ok {
+		t.Fatal("final page unexpectedly has nextCursor")
+	}
+	for _, raw := range items {
+		story := raw.(map[string]any)
+		id := story["id"].(string)
+		if !ids[id] {
+			t.Fatalf("unexpected or duplicated story %s", id)
+		}
+		delete(ids, id)
+		if _, hasTags := story["tags"]; hasTags {
+			t.Errorf("shelf page included edit-only tags for %s", id)
+		}
+	}
+	legacy := get(t, "/v1/stories", alice).expect(http.StatusOK).list()
+	if tags := legacy[0]["tags"].([]any); len(tags) != 1 || tags[0] != "x" {
+		t.Errorf("legacy owner list tags = %v", tags)
+	}
+	get(t, "/v1/stories?limit=0", alice).expect(http.StatusBadRequest)
+	get(t, "/v1/stories?limit=2&cursor=invalid", alice).expect(http.StatusUnprocessableEntity)
+}
+
 // The owner's shelf renders these aggregates; only the list endpoint carries
 // them, so a client reading them off a get/create response would see nothing.
 func TestStoryListCarriesShelfAggregates(t *testing.T) {

@@ -85,6 +85,40 @@ type StoryListItem struct {
 	RatingsCount  int      `json:"ratingsCount"`
 }
 
+type StoryListPage struct {
+	Stories    []StoryShelfItem `json:"stories"`
+	Summary    StoryListSummary `json:"summary"`
+	NextCursor string           `json:"nextCursor,omitempty"`
+}
+
+// StoryShelfItem contains fields used before opening a shelf action. Editing
+// reads the full story by id, including tags, revision, and optional metadata.
+type StoryShelfItem struct {
+	ID            string    `json:"id"`
+	OwnerID       string    `json:"ownerId"`
+	Title         string    `json:"title"`
+	Description   string    `json:"description"`
+	AuthorName    string    `json:"authorName"`
+	Published     bool      `json:"published"`
+	Category      string    `json:"category"`
+	CoverImageURL string    `json:"coverImageUrl"`
+	ThumbnailURL  string    `json:"thumbnailUrl"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+	ChapterCount  int       `json:"chapterCount"`
+	WordCount     int       `json:"wordCount"`
+	Views         int64     `json:"views"`
+	LikeCount     int64     `json:"likeCount"`
+	AverageRating *float64  `json:"averageRating,omitempty"`
+	RatingsCount  int       `json:"ratingsCount"`
+}
+
+type StoryListSummary struct {
+	TotalStories   int   `json:"totalStories"`
+	PublishedCount int   `json:"publishedCount"`
+	TotalViews     int64 `json:"totalViews"`
+}
+
 type Chapter struct {
 	ID        string    `json:"id"`
 	StoryID   string    `json:"storyId"`
@@ -185,10 +219,60 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, owner_id, title, d
 }
 
 func (s *Store) ListStories(ctx context.Context, owner string) ([]StoryListItem, error) {
+	return s.listStories(ctx, owner, "", 0, true)
+}
+
+// ListStoriesPage bounds the owner's shelf response. A stable (updated_at,id)
+// cursor keeps stories with identical timestamps from being skipped.
+func (s *Store) ListStoriesPage(ctx context.Context, owner, cursor string, pageSize int) (StoryListPage, error) {
+	if pageSize <= 0 {
+		pageSize = 24
+	}
+	if pageSize > 50 {
+		pageSize = 50
+	}
+	stories, err := s.listStories(ctx, owner, cursor, pageSize+1, false)
+	if err != nil {
+		return StoryListPage{}, err
+	}
+	page := StoryListPage{Stories: []StoryShelfItem{}}
+	if err := s.db.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE is_published), COALESCE(sum(views),0) FROM stories WHERE owner_id=$1`, owner).
+		Scan(&page.Summary.TotalStories, &page.Summary.PublishedCount, &page.Summary.TotalViews); err != nil {
+		return StoryListPage{}, err
+	}
+	if len(stories) > pageSize {
+		last := stories[pageSize-1]
+		page.NextCursor, err = encodeStoryListCursor(last.UpdatedAt, last.ID)
+		stories = stories[:pageSize]
+	}
+	for _, story := range stories {
+		page.Stories = append(page.Stories, StoryShelfItem{
+			ID: story.ID, OwnerID: story.OwnerID, Title: story.Title,
+			Description: story.Description, AuthorName: story.AuthorName,
+			Published: story.Published, Category: story.Category,
+			CoverImageURL: story.CoverImageURL, ThumbnailURL: story.ThumbnailURL,
+			CreatedAt: story.CreatedAt, UpdatedAt: story.UpdatedAt,
+			ChapterCount: story.ChapterCount, WordCount: story.WordCount,
+			Views: story.Views, LikeCount: story.LikeCount,
+			AverageRating: story.AverageRating, RatingsCount: story.RatingsCount,
+		})
+	}
+	return page, err
+}
+
+func (s *Store) listStories(ctx context.Context, owner, cursor string, limit int, includeTags bool) ([]StoryListItem, error) {
+	var after *publicStoryCursor
+	if cursor != "" {
+		parsed, err := decodePublicStoryCursor(cursor)
+		if err != nil {
+			return nil, ErrValidation
+		}
+		after = &parsed
+	}
 	// The aggregates are scalar subqueries rather than joins: joining chapters
 	// and story_tags in one statement multiplies the rows, which DISTINCT can
 	// hide for a count but silently inflates sum(word_count).
-	rows, err := s.db.Query(ctx, `SELECT s.id, s.owner_id, s.title, s.description, s.author_name, s.is_published,
+	query := `SELECT s.id, s.owner_id, s.title, s.description, s.author_name, s.is_published,
   COALESCE(s.category,''), COALESCE(s.target_audience,''), COALESCE(s.language,''), COALESCE(s.copyright,''),
   COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''), s.revision, s.created_at, s.updated_at,
   (SELECT count(*) FROM chapters c WHERE c.story_id=s.id),
@@ -197,7 +281,18 @@ func (s *Store) ListStories(ctx context.Context, owner string) ([]StoryListItem,
   (SELECT count(*) FROM story_likes sl WHERE sl.story_id=s.id),
   (SELECT round(avg(sr.rating)::numeric, 1) FROM story_ratings sr WHERE sr.story_id=s.id),
   (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id)
-FROM stories s WHERE s.owner_id=$1 ORDER BY s.updated_at DESC`, owner)
+FROM stories s WHERE s.owner_id=$1`
+	args := []any{owner}
+	if after != nil {
+		query += ` AND (s.updated_at, s.id) < ($2, $3)`
+		args = append(args, after.UpdatedAt, mustUUID(after.ID))
+	}
+	query += ` ORDER BY s.updated_at DESC, s.id DESC`
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d", len(args)+1)
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -219,12 +314,31 @@ FROM stories s WHERE s.owner_id=$1 ORDER BY s.updated_at DESC`, owner)
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	rows.Close()
+	if !includeTags || len(stories) == 0 {
+		return stories, nil
+	}
+	ids := make([]uuid.UUID, len(stories))
+	byID := make(map[string]int, len(stories))
 	for i := range stories {
-		if err := s.hydrateTags(ctx, &stories[i].Story); err != nil {
+		ids[i] = mustUUID(stories[i].ID)
+		byID[stories[i].ID] = i
+		stories[i].Tags = []string{}
+	}
+	tags, err := s.db.Query(ctx, `SELECT story_id, tag FROM story_tags WHERE story_id = ANY($1::uuid[]) ORDER BY story_id, tag`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer tags.Close()
+	for tags.Next() {
+		var id uuid.UUID
+		var tag string
+		if err := tags.Scan(&id, &tag); err != nil {
 			return nil, err
 		}
+		stories[byID[id.String()]].Tags = append(stories[byID[id.String()]].Tags, tag)
 	}
-	return stories, nil
+	return stories, tags.Err()
 }
 
 func (s *Store) GetStory(ctx context.Context, id, caller string) (Story, error) {

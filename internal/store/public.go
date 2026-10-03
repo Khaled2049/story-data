@@ -278,7 +278,11 @@ func scanPublicChapter(row pgx.Row, includeContent bool) (PublicChapter, error) 
 }
 
 func encodePublicStoryCursor(story PublicStory) (string, error) {
-	bytes, err := json.Marshal(publicStoryCursor{UpdatedAt: story.UpdatedAt, ID: story.ID})
+	return encodeStoryListCursor(story.UpdatedAt, story.ID)
+}
+
+func encodeStoryListCursor(updatedAt time.Time, id string) (string, error) {
+	bytes, err := json.Marshal(publicStoryCursor{UpdatedAt: updatedAt, ID: id})
 	return base64.RawURLEncoding.EncodeToString(bytes), err
 }
 

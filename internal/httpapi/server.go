@@ -106,6 +106,15 @@ func (s *Server) stories(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
+		if _, paged := r.URL.Query()["limit"]; paged || r.URL.Query().Has("cursor") {
+			limit, ok := pageLimit(w, r)
+			if !ok {
+				return
+			}
+			x, e := s.store.ListStoriesPage(r.Context(), uid, r.URL.Query().Get("cursor"), limit)
+			respond(w, x, e)
+			return
+		}
 		x, e := s.store.ListStories(r.Context(), uid)
 		respond(w, x, e)
 	case http.MethodPost:
