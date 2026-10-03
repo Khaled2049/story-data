@@ -93,6 +93,8 @@ Migration groups correspond to product domains:
 | `000011`–`000018` | Competition repair, quotas, validation ceilings, profile names, and public search |
 | `000019`–`000021` | Recommendation schema, restricted service role, and catalog-read grant |
 | `000022`–`000023` | Per-user and platform-wide recommendation LLM budgets |
+| `000024`–`000026` | Assistant threads, optional submission story, and story comments |
+| `000027` | Guestbook author-feed and reply-parent indexes |
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an
@@ -246,6 +248,29 @@ have today.
   require authentication.
 - Handlers return consistent JSON errors; do not leak database or internal
   implementation details.
+
+### Guestbook feed and reply pages
+
+`GET /v1/me/wall` (`ListPersonalWall`) builds its page from up to three
+branches — the viewer's wall, the viewer's authorship, and one bounded probe
+per followed author — each read newest-first through an index and limited
+before they are merged. Do not collapse them back into one scan filtered by
+`owner OR author OR author IN (follows)`: without a time index that reads every
+entry, and with one it walks past every entry that is not the viewer's, which
+for an account with a quiet feed is the whole table. Cost scales with the
+viewer's follow count, not with the number of entries.
+
+Each feed entry carries `viewerCanPost`: whether the viewer may reply on the
+wall that entry sits on. The wall policy exists once, as the SQL expression
+`guestbookCanPostSQL`; `canPostGuestbook` (the write gate) and this flag both
+evaluate it. Change the policy there, never in one caller.
+
+`GET /v1/public/guestbooks/{owner}/entries/{id}/replies` returns the whole
+thread as a bare array, which is what already-deployed clients read. With
+`?limit=` (1–50) it returns `{ replies, nextCursor, totalCount }` instead,
+paged by **top-level** reply and carrying every descendant of the replies on
+the page, so a reply never arrives without its parent. `limit` bounds the
+top-level replies, not the rows.
 
 ## AI context and pgvector
 

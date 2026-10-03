@@ -45,9 +45,18 @@ type GuestbookPage struct {
 	NextCursor string           `json:"nextCursor,omitempty"`
 	TotalCount int              `json:"totalCount"`
 }
+type GuestbookReplyPage struct {
+	Replies    []GuestbookReply `json:"replies"`
+	NextCursor string           `json:"nextCursor,omitempty"`
+	TotalCount int              `json:"totalCount"`
+}
 type GuestbookActivityEntry struct {
 	GuestbookEntry
 	OwnerUsername string `json:"ownerUsername"`
+	// Whether the viewer may reply on the wall this entry sits on. The feed
+	// mixes walls with different policies, and "following" depends on the
+	// owner's follow list, which a client cannot read.
+	ViewerCanPost bool `json:"viewerCanPost"`
 }
 type GuestbookActivityPage struct {
 	Entries    []GuestbookActivityEntry `json:"entries"`
@@ -115,37 +124,56 @@ func (s *Store) ListPersonalWall(ctx context.Context, viewerID, filter, cursor s
 	if limit > 50 {
 		limit = 50
 	}
-	var scope string
-	switch filter {
-	case "", "all":
-		scope = "(e.owner_id=$1 OR e.author_id=$1 OR e.author_id IN (SELECT followed_id FROM user_follows WHERE follower_id=$1))"
-	case "following":
-		scope = "e.author_id IN (SELECT followed_id FROM user_follows WHERE follower_id=$1)"
-	case "mine":
-		scope = "e.owner_id=$1"
-	default:
-		return GuestbookActivityPage{}, ErrValidation
-	}
 	args := []any{viewerID}
-	where := ""
+	before := ""
 	if cursor != "" {
 		c, err := decodeGuestbookCursor(cursor)
 		if err != nil {
 			return GuestbookActivityPage{}, ErrValidation
 		}
 		args = append(args, c.CreatedAt, c.ID)
-		where = " AND (e.created_at,e.id) < ($2,$3)"
+		before = " AND (e.created_at,e.id) < ($2,$3)"
 	}
 	args = append(args, limit+1)
-	rows, err := s.db.Query(ctx, `SELECT e.id,e.owner_id,COALESCE(po.username,'unknown'),e.author_id,COALESCE(pa.username,'unknown'),e.content,e.created_at,
+	top := " ORDER BY e.created_at DESC,e.id DESC LIMIT $" + strconvArg(len(args))
+	newest := before + top
+
+	// Each branch reads its own newest page through an index that is already
+	// in feed order, and the page is the newest rows of their union. Filtering
+	// one scan by `owner OR author OR author IN (follows)` cannot do that: it
+	// either reads every entry and sorts, or walks a time index past every
+	// entry that is not the viewer's — which for a quiet account is all of them.
+	own := "(SELECT e.id,e.created_at FROM guestbook_entries e WHERE e.owner_id=$1" + newest + ")"
+	authored := "(SELECT e.id,e.created_at FROM guestbook_entries e WHERE e.author_id=$1" + newest + ")"
+	// A page of the followed feed can only hold an author's newest rows, so a
+	// page per author is enough and the cost scales with the follow count.
+	followed := `(SELECT x.id,x.created_at FROM user_follows f CROSS JOIN LATERAL
+  (SELECT e.id,e.created_at FROM guestbook_entries e WHERE e.author_id=f.followed_id` + newest + `) x
+  WHERE f.follower_id=$1)`
+	var candidates string
+	switch filter {
+	case "", "all":
+		// UNION, not UNION ALL: a post on your own wall is in two branches.
+		candidates = own + " UNION " + authored + " UNION " + followed
+	case "following":
+		candidates = followed
+	case "mine":
+		candidates = own
+	default:
+		return GuestbookActivityPage{}, ErrValidation
+	}
+	rows, err := s.db.Query(ctx, `WITH candidates AS (`+candidates+`),
+ page AS (SELECT id FROM candidates e`+top+`)
+ SELECT e.id,e.owner_id,COALESCE(po.username,'unknown'),e.author_id,COALESCE(pa.username,'unknown'),e.content,e.created_at,
  (SELECT count(*) FROM guestbook_replies r WHERE r.entry_id=e.id),
  (SELECT count(*) FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.vote='up'),
  (SELECT count(*) FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.vote='down'),
- COALESCE((SELECT v.vote FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.user_id=$1),'')
- FROM guestbook_entries e
+ COALESCE((SELECT v.vote FROM guestbook_entry_votes v WHERE v.entry_id=e.id AND v.user_id=$1),''),
+ `+guestbookCanPostSQL("e.owner_id", "$1")+`
+ FROM page JOIN guestbook_entries e ON e.id=page.id
  LEFT JOIN public_profiles po ON po.user_id=e.owner_id
  LEFT JOIN public_profiles pa ON pa.user_id=e.author_id
- WHERE `+scope+where+` ORDER BY e.created_at DESC,e.id DESC LIMIT $`+strconvArg(len(args)), args...)
+ ORDER BY e.created_at DESC,e.id DESC`, args...)
 	if err != nil {
 		return GuestbookActivityPage{}, err
 	}
@@ -169,18 +197,12 @@ func (s *Store) ListPersonalWall(ctx context.Context, viewerID, filter, cursor s
 	return page, nil
 }
 
-func (s *Store) ListGuestbookReplies(ctx context.Context, ownerID, entryID, viewerID string) ([]GuestbookReply, error) {
-	if err := s.entryForOwner(ctx, ownerID, entryID); err != nil {
-		return nil, err
-	}
-	rows, err := s.db.Query(ctx, `SELECT r.id,r.entry_id,r.parent_id,r.author_id,COALESCE(p.username,'unknown'),r.content,r.created_at,r.updated_at,
+const guestbookReplyColumns = `r.id,r.entry_id,r.parent_id,r.author_id,COALESCE(p.username,'unknown'),r.content,r.created_at,r.updated_at,
  (SELECT count(*) FROM guestbook_reply_votes v WHERE v.reply_id=r.id AND v.vote='up'),
  (SELECT count(*) FROM guestbook_reply_votes v WHERE v.reply_id=r.id AND v.vote='down'),
- COALESCE((SELECT v.vote FROM guestbook_reply_votes v WHERE v.reply_id=r.id AND v.user_id=$2),'')
- FROM guestbook_replies r LEFT JOIN public_profiles p ON p.user_id=r.author_id WHERE r.entry_id=$1 ORDER BY r.created_at DESC,r.id DESC`, entryID, viewerID)
-	if err != nil {
-		return nil, err
-	}
+ COALESCE((SELECT v.vote FROM guestbook_reply_votes v WHERE v.reply_id=r.id AND v.user_id=$2),'')`
+
+func collectGuestbookReplies(rows pgx.Rows) ([]GuestbookReply, error) {
 	defer rows.Close()
 	out := []GuestbookReply{}
 	for rows.Next() {
@@ -191,6 +213,91 @@ func (s *Store) ListGuestbookReplies(ctx context.Context, ownerID, entryID, view
 		out = append(out, x)
 	}
 	return out, rows.Err()
+}
+
+// ListGuestbookReplies returns the whole thread. Clients that predate paging
+// call it; ListGuestbookReplyPage is the bounded read.
+func (s *Store) ListGuestbookReplies(ctx context.Context, ownerID, entryID, viewerID string) ([]GuestbookReply, error) {
+	if err := s.entryForOwner(ctx, ownerID, entryID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT `+guestbookReplyColumns+`
+ FROM guestbook_replies r LEFT JOIN public_profiles p ON p.user_id=r.author_id WHERE r.entry_id=$1 ORDER BY r.created_at DESC,r.id DESC`, entryID, viewerID)
+	if err != nil {
+		return nil, err
+	}
+	return collectGuestbookReplies(rows)
+}
+
+// ListGuestbookReplyPage pages a thread by its top-level replies, newest
+// first, and returns each one with every descendant. A page is therefore a
+// set of complete subtrees: no reply arrives without its parent, which a page
+// cut across the flat list could not promise. `limit` bounds the top-level
+// replies, not the rows returned.
+func (s *Store) ListGuestbookReplyPage(ctx context.Context, ownerID, entryID, viewerID, cursor string, limit int) (GuestbookReplyPage, error) {
+	if err := s.entryForOwner(ctx, ownerID, entryID); err != nil {
+		return GuestbookReplyPage{}, err
+	}
+	args := []any{entryID}
+	before := ""
+	if cursor != "" {
+		c, err := decodeGuestbookCursor(cursor)
+		if err != nil {
+			return GuestbookReplyPage{}, ErrValidation
+		}
+		args = append(args, c.CreatedAt, c.ID)
+		before = " AND (created_at,id) < ($2,$3)"
+	}
+	args = append(args, limit+1)
+	rows, err := s.db.Query(ctx, `SELECT id,created_at FROM guestbook_replies WHERE entry_id=$1 AND parent_id IS NULL`+before+
+		` ORDER BY created_at DESC,id DESC LIMIT $`+strconvArg(len(args)), args...)
+	if err != nil {
+		return GuestbookReplyPage{}, err
+	}
+	roots := []uuid.UUID{}
+	var last guestbookCursor
+	more := false
+	for rows.Next() {
+		var id uuid.UUID
+		var at time.Time
+		if err := rows.Scan(&id, &at); err != nil {
+			rows.Close()
+			return GuestbookReplyPage{}, err
+		}
+		if len(roots) == limit {
+			more = true
+			break
+		}
+		roots = append(roots, id)
+		last = guestbookCursor{CreatedAt: at, ID: id.String()}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return GuestbookReplyPage{}, err
+	}
+	page := GuestbookReplyPage{Replies: []GuestbookReply{}}
+	if more {
+		b, _ := json.Marshal(last)
+		page.NextCursor = base64.RawURLEncoding.EncodeToString(b)
+	}
+	if err := s.db.QueryRow(ctx, `SELECT count(*) FROM guestbook_replies WHERE entry_id=$1`, entryID).Scan(&page.TotalCount); err != nil {
+		return GuestbookReplyPage{}, err
+	}
+	if len(roots) == 0 {
+		return page, nil
+	}
+	thread, err := s.db.Query(ctx, `WITH RECURSIVE thread AS (
+  SELECT id FROM guestbook_replies WHERE id = ANY($1::uuid[])
+  UNION ALL
+  SELECT c.id FROM guestbook_replies c JOIN thread t ON c.parent_id=t.id)
+ SELECT `+guestbookReplyColumns+`
+ FROM thread t JOIN guestbook_replies r ON r.id=t.id LEFT JOIN public_profiles p ON p.user_id=r.author_id
+ ORDER BY r.created_at DESC,r.id DESC`, roots, viewerID)
+	if err != nil {
+		return GuestbookReplyPage{}, err
+	}
+	page.Replies, err = collectGuestbookReplies(thread)
+	return page, err
 }
 
 func (s *Store) CreateGuestbookEntry(ctx context.Context, ownerID, authorID, content string) (GuestbookEntry, error) {
@@ -356,30 +463,31 @@ func (s *Store) ListFollowers(ctx context.Context, user string) ([]string, error
 	return out, rows.Err()
 }
 
+// guestbookCanPostSQL is the wall policy as a boolean SQL expression over an
+// owner and a caller, each given as a column or a parameter. It is the only
+// copy of the matrix: the write gate and the feed's viewerCanPost flag both
+// evaluate it, so the flag cannot promise a reply the gate would refuse.
+// A profile that predates the setting has no row and reads as 'everyone'.
+func guestbookCanPostSQL(owner, caller string) string {
+	followsOwner := `EXISTS(SELECT 1 FROM user_follows WHERE follower_id=` + caller + ` AND followed_id=` + owner + `)`
+	ownerFollows := `EXISTS(SELECT 1 FROM user_follows WHERE follower_id=` + owner + ` AND followed_id=` + caller + `)`
+	return `(` + owner + `=` + caller + ` OR CASE COALESCE((SELECT guestbook_policy FROM public_profiles WHERE user_id=` + owner + `),'everyone')
+  WHEN 'everyone' THEN true
+  WHEN 'followers' THEN ` + followsOwner + `
+  WHEN 'following' THEN ` + ownerFollows + `
+  WHEN 'mutuals' THEN ` + followsOwner + ` AND ` + ownerFollows + `
+  ELSE false END)`
+}
+
 func (s *Store) canPostGuestbook(ctx context.Context, owner, caller string) error {
-	if owner == caller {
-		return nil
-	}
-	var policy string
-	if e := s.db.QueryRow(ctx, `SELECT guestbook_policy FROM public_profiles WHERE user_id=$1`, owner).Scan(&policy); errors.Is(e, pgx.ErrNoRows) {
-		policy = "everyone"
-	} else if e != nil {
+	var allowed bool
+	if e := s.db.QueryRow(ctx, `SELECT `+guestbookCanPostSQL("$1::text", "$2::text"), owner, caller).Scan(&allowed); e != nil {
 		return e
 	}
-	if policy == "everyone" {
-		return nil
-	}
-	if policy == "nobody" {
+	if !allowed {
 		return ErrForbidden
 	}
-	var followsOwner, ownerFollows bool
-	if e := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$1 AND followed_id=$2),EXISTS(SELECT 1 FROM user_follows WHERE follower_id=$2 AND followed_id=$1)`, caller, owner).Scan(&followsOwner, &ownerFollows); e != nil {
-		return e
-	}
-	if (policy == "followers" && followsOwner) || (policy == "following" && ownerFollows) || (policy == "mutuals" && followsOwner && ownerFollows) {
-		return nil
-	}
-	return ErrForbidden
+	return nil
 }
 func (s *Store) consumeGuestbookQuota(ctx context.Context, tx pgx.Tx, user, column string, max int) error {
 	q := `INSERT INTO guestbook_daily_usage(user_id,day,` + column + `) VALUES($1,current_date,1) ON CONFLICT(user_id,day) DO UPDATE SET ` + column + `=guestbook_daily_usage.` + column + `+1 WHERE guestbook_daily_usage.` + column + ` < $2 RETURNING ` + column
@@ -447,7 +555,7 @@ func scanGuestbookEntry(row pgx.Row) (GuestbookEntry, error) {
 func scanGuestbookActivityEntry(row pgx.Row) (GuestbookActivityEntry, error) {
 	var x GuestbookActivityEntry
 	var id uuid.UUID
-	e := row.Scan(&id, &x.OwnerID, &x.OwnerUsername, &x.AuthorID, &x.AuthorUsername, &x.Content, &x.CreatedAt, &x.CommentCount, &x.UpvoteCount, &x.DownvoteCount, &x.UserVote)
+	e := row.Scan(&id, &x.OwnerID, &x.OwnerUsername, &x.AuthorID, &x.AuthorUsername, &x.Content, &x.CreatedAt, &x.CommentCount, &x.UpvoteCount, &x.DownvoteCount, &x.UserVote, &x.ViewerCanPost)
 	x.ID = id.String()
 	return x, e
 }
