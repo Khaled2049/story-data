@@ -95,6 +95,7 @@ Migration groups correspond to product domains:
 | `000022`–`000023` | Per-user and platform-wide recommendation LLM budgets |
 | `000024`–`000026` | Assistant threads, optional submission story, and story comments |
 | `000027` | Guestbook author-feed and reply-parent indexes |
+| `000028` | Tag URL-form index for public tag listings |
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an
@@ -241,6 +242,12 @@ have today.
   body (`nextCursor`). `GET /v1/competitions` keeps a bare array — clients map
   over it directly — and returns its continuation token in the `X-Next-Cursor`
   response header. Both accept `?limit=` and `?cursor=`.
+- `GET /v1/public/stories` also filters by `?tag=` (the tag's URL form:
+  lower-cased, spaces as hyphens — `store.TagSlug`, served by
+  `story_tags_slug_idx`) and `?author=<uid>`. `GET /v1/public/sitemap` walks
+  the same published set with the same cursor but returns only `id`,
+  `authorId`, `title` and `updatedAt`, up to 1000 a page; the frontend's
+  `seoRender` Function builds `sitemap.xml` from it.
 - Story, chapter, and worldbuilding mutations use optimistic concurrency.
   Clients send `If-Match: <revision>` for writes that update/delete an existing
   record. A stale revision returns `409 Conflict`.

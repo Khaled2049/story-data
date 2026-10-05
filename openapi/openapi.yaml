@@ -31,9 +31,18 @@ paths:
       summary: List published stories
       parameters:
         - { name: category, in: query, schema: { type: string } }
+        - { name: tag, in: query, schema: { type: string, maxLength: 100, description: 'Tag in URL form: case-insensitive, spaces as hyphens' } }
+        - { name: author, in: query, schema: { type: string, description: Owner user ID } }
         - { name: cursor, in: query, schema: { type: string } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 24 } }
       responses: { '200': { description: Cursor-paginated public story summaries, with ETag }, '304': { description: Matches If-None-Match } }
+  /v1/public/sitemap:
+    get:
+      summary: Page every published story as id, authorId, title and updatedAt
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000, default: 1000 } }
+      responses: { '200': { description: 'Cursor-paginated sitemap entries, newest first, with ETag' }, '304': { description: Matches If-None-Match } }
   /v1/public/profiles:
     get:
       summary: Search, list recent, or batch-read public member profiles

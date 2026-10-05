@@ -92,7 +92,22 @@ type publicStoryCursor struct {
 	ID        string    `json:"id"`
 }
 
-func (s *Store) ListPublicStories(ctx context.Context, category, search, cursor string, pageSize int) (PublicStoryPage, error) {
+// PublicStoryFilter narrows the discovery listing. Every field is optional.
+type PublicStoryFilter struct {
+	Category string
+	Search   string
+	Tag      string
+	AuthorID string
+}
+
+// TagSlug is the URL form of a tag: lower-cased with spaces as hyphens. It must
+// match the expression story_tags_slug_idx is built on (migration 000028).
+func TagSlug(tag string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(tag)), " ", "-")
+}
+
+func (s *Store) ListPublicStories(ctx context.Context, f PublicStoryFilter, cursor string, pageSize int) (PublicStoryPage, error) {
+	category, search := f.Category, f.Search
 	if pageSize <= 0 {
 		pageSize = defaultPublicStoryPageSize
 	}
@@ -121,6 +136,14 @@ func (s *Store) ListPublicStories(ctx context.Context, category, search, cursor 
 	if search = strings.TrimSpace(search); search != "" {
 		args = append(args, likeContains(search))
 		where += fmt.Sprintf(" AND (s.title || ' ' || s.author_name) ILIKE $%d ESCAPE '\\'", len(args))
+	}
+	if tag := TagSlug(f.Tag); tag != "" {
+		args = append(args, tag)
+		where += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM story_tags ft WHERE ft.story_id=s.id AND replace(lower(ft.tag), ' ', '-')=$%d)", len(args))
+	}
+	if author := strings.TrimSpace(f.AuthorID); author != "" {
+		args = append(args, author)
+		where += fmt.Sprintf(" AND s.owner_id=$%d", len(args))
 	}
 	if after != nil {
 		args = append(args, after.UpdatedAt, mustUUID(after.ID))
@@ -151,6 +174,68 @@ LIMIT $` + fmt.Sprint(len(args))
 		stories = stories[:pageSize]
 		page.Stories = stories
 		page.NextCursor, _ = encodePublicStoryCursor(stories[len(stories)-1])
+	}
+	return page, nil
+}
+
+const publicSitemapPageSize = 1000
+
+// PublicSitemapEntry is the least a sitemap needs to build a story URL.
+type PublicSitemapEntry struct {
+	ID        string    `json:"id"`
+	AuthorID  string    `json:"authorId"`
+	Title     string    `json:"title"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type PublicSitemapPage struct {
+	Stories    []PublicSitemapEntry `json:"stories"`
+	NextCursor string               `json:"nextCursor,omitempty"`
+}
+
+// ListPublicSitemap pages every published story in the same order, and with
+// the same cursor, as the discovery listing, but without the per-row counters
+// that make that listing too expensive to walk end to end.
+func (s *Store) ListPublicSitemap(ctx context.Context, cursor string, pageSize int) (PublicSitemapPage, error) {
+	if pageSize <= 0 || pageSize > publicSitemapPageSize {
+		pageSize = publicSitemapPageSize
+	}
+	args := []any{}
+	where := "WHERE is_published"
+	if cursor != "" {
+		after, err := decodePublicStoryCursor(cursor)
+		if err != nil {
+			return PublicSitemapPage{}, ErrValidation
+		}
+		args = append(args, after.UpdatedAt, mustUUID(after.ID))
+		where += " AND (updated_at, id) < ($1, $2)"
+	}
+	args = append(args, pageSize+1)
+	rows, err := s.db.Query(ctx, `SELECT id, owner_id, title, updated_at FROM stories `+where+`
+ORDER BY updated_at DESC, id DESC
+LIMIT $`+fmt.Sprint(len(args)), args...)
+	if err != nil {
+		return PublicSitemapPage{}, err
+	}
+	defer rows.Close()
+	entries := []PublicSitemapEntry{}
+	for rows.Next() {
+		var x PublicSitemapEntry
+		var id uuid.UUID
+		if err := rows.Scan(&id, &x.AuthorID, &x.Title, &x.UpdatedAt); err != nil {
+			return PublicSitemapPage{}, err
+		}
+		x.ID = id.String()
+		entries = append(entries, x)
+	}
+	if err := rows.Err(); err != nil {
+		return PublicSitemapPage{}, err
+	}
+	page := PublicSitemapPage{Stories: entries}
+	if len(entries) > pageSize {
+		page.Stories = entries[:pageSize]
+		last := page.Stories[pageSize-1]
+		page.NextCursor, _ = encodeStoryListCursor(last.UpdatedAt, last.ID)
 	}
 	return page, nil
 }

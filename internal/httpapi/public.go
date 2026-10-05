@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/kh1011/novelsync-story-data/internal/store"
 )
 
 // viewerKey identifies who is counting a view, without storing who they are.
@@ -47,8 +49,32 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "q must be at most 100 characters")
 			return
 		}
-		x, err := s.store.ListPublicStories(r.Context(), r.URL.Query().Get("category"), search, r.URL.Query().Get("cursor"), limit)
+		tag := r.URL.Query().Get("tag")
+		if len(tag) > maxPublicStorySearchLen {
+			writeError(w, http.StatusBadRequest, "tag must be at most 100 characters")
+			return
+		}
+		x, err := s.store.ListPublicStories(r.Context(), store.PublicStoryFilter{
+			Category: r.URL.Query().Get("category"),
+			Search:   search,
+			Tag:      tag,
+			AuthorID: r.URL.Query().Get("author"),
+		}, r.URL.Query().Get("cursor"), limit)
 		respondCacheable(w, r, x, err, publicStoryListCacheControl)
+		return
+	}
+	if len(p) == 1 && p[0] == "sitemap" {
+		if r.Method != http.MethodGet {
+			method(w)
+			return
+		}
+		limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if r.URL.Query().Get("limit") != "" && (err != nil || limit < 1) {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		x, err := s.store.ListPublicSitemap(r.Context(), r.URL.Query().Get("cursor"), limit)
+		respondCacheable(w, r, x, err, publicSitemapCacheControl)
 		return
 	}
 	if len(p) < 2 || p[0] != "stories" || p[1] == "" {
