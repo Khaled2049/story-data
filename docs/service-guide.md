@@ -96,6 +96,7 @@ Migration groups correspond to product domains:
 | `000024`–`000026` | Assistant threads, optional submission story, and story comments |
 | `000027` | Guestbook author-feed and reply-parent indexes |
 | `000028` | Tag URL-form index for public tag listings |
+| `000029` | Versioned writer agreement records |
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an
@@ -465,3 +466,26 @@ gcloud run jobs execute novelsync-story-data-sync-recs \
 The job performs a transactional full derivation and is safe to retry. Do not
 run overlapping executions: they do redundant full scans and contend while
 replacing the same interaction rows.
+
+## Writer agreement
+
+`GET /v1/me/writer-agreement` returns the current terms/privacy/attestation
+versions, the attestation text, and the authenticated user's acceptance status.
+`POST` requires exact current versions and explicit true values for `agreeTerms`,
+`acknowledgePrivacy`, `attestRights`, and `adult`. The server records the Firebase
+UID and its own timestamp; retries preserve the first timestamp. Records are
+independent of story deletion. Do not auto-accept for real users or let MCP/AI
+clients attest on behalf of users; direct them to the frontend agreement screen.
+
+`CreateStory` requires acceptance in the store, including for imports and service
+clients. The HTTP story workspace also requires it for POST/PUT/PATCH writes to
+stories, chapters, worldbuilding, and assistant threads. Reads, reader social
+interactions, and DELETE operations remain available. A new version leaves old
+records intact but requires renewed acceptance for writing. Changes to policy
+text must bump the matching constants in `internal/store/writer_agreement.go`
+and the published frontend version, and preserve the old documents and
+attestation text in the frontend's `docs/legal` archive.
+
+Deploy the API/migration and frontend together. Older clients that create stories
+without first recording agreement will receive 403. Local seeding records
+agreement only for synthetic fixture accounts through the dev-auth API.

@@ -16,6 +16,9 @@ const (
 
 func newStory(t *testing.T, uid, title string) map[string]any {
 	t.Helper()
+	if uid != alice && uid != bob {
+		acceptWriter(t, uid)
+	}
 	return call(t, "POST", "/v1/stories", uid, map[string]any{
 		"title": title, "description": "d", "authorName": "a", "tags": []string{"x"},
 	}).expect(http.StatusCreated).json()

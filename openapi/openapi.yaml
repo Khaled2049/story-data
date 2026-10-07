@@ -6,6 +6,27 @@ info:
 servers:
   - url: https://story-data.example.invalid
 paths:
+  /v1/me/writer-agreement:
+    get:
+      summary: Current writer policies and this user's acceptance
+      security: [{ firebaseBearer: [] }]
+      responses:
+        '200':
+          description: Current policy versions, attestation text, accepted flag, and optional server acceptance time
+          content: { application/json: { schema: { $ref: '#/components/schemas/WriterAgreement' } } }
+        '401': { description: Authentication required }
+    post:
+      summary: Explicitly accept the current writer agreement
+      security: [{ firebaseBearer: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/WriterAgreementInput' } } }
+      responses:
+        '200':
+          description: Recorded acceptance; retries preserve the original acceptance time
+          content: { application/json: { schema: { $ref: '#/components/schemas/WriterAgreement' } } }
+        '401': { description: Authentication required }
+        '422': { description: Missing confirmation or outdated policy version }
   /health:
     get:
       responses: { '200': { description: Healthy } }
@@ -336,6 +357,27 @@ components:
   securitySchemes:
     firebaseBearer: { type: http, scheme: bearer, bearerFormat: Firebase-ID-token }
   schemas:
+    WriterAgreement:
+      type: object
+      required: [termsVersion, privacyVersion, attestationVersion, attestation, accepted]
+      properties:
+        termsVersion: { type: string }
+        privacyVersion: { type: string }
+        attestationVersion: { type: string }
+        attestation: { type: string }
+        accepted: { type: boolean }
+        acceptedAt: { type: string, format: date-time }
+    WriterAgreementInput:
+      type: object
+      required: [termsVersion, privacyVersion, attestationVersion, agreeTerms, acknowledgePrivacy, attestRights, adult]
+      properties:
+        termsVersion: { type: string }
+        privacyVersion: { type: string }
+        attestationVersion: { type: string }
+        agreeTerms: { type: boolean, enum: [true] }
+        acknowledgePrivacy: { type: boolean, enum: [true] }
+        attestRights: { type: boolean, enum: [true] }
+        adult: { type: boolean, enum: [true] }
     StoryInput:
       type: object
       required: [title]
