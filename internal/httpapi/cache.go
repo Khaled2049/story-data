@@ -11,6 +11,7 @@ import (
 const (
 	publicStoryListCacheControl   = "public, max-age=0, s-maxage=30, stale-while-revalidate=300"
 	publicStoryDetailCacheControl = "public, max-age=0, s-maxage=30"
+	publicSitemapCacheControl     = "public, max-age=0, s-maxage=300"
 	publicChapterCacheControl     = "public, max-age=0, s-maxage=60, stale-while-revalidate=600"
 )
 

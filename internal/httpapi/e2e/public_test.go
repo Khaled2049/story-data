@@ -261,6 +261,73 @@ func TestPublicListingFiltersByCategory(t *testing.T) {
 	}
 }
 
+func TestPublicListingFiltersByTagAndAuthor(t *testing.T) {
+	reset(t)
+	tagged := call(t, "POST", "/v1/stories", alice, map[string]any{
+		"title": "Tagged", "description": "d", "authorName": "a",
+		"tags": []string{"Dark Fantasy", "x"}, "published": true,
+	}).expect(http.StatusCreated).json()["id"]
+	other := newPublishedStory(t, bob, "Untagged")["id"]
+	// A draft carrying the tag must not surface through the filter.
+	call(t, "POST", "/v1/stories", alice, map[string]any{
+		"title": "Draft", "description": "d", "authorName": "a",
+		"tags": []string{"dark fantasy"},
+	}).expect(http.StatusCreated)
+
+	// The URL form is case-insensitive with spaces as hyphens.
+	for _, q := range []string{"?tag=dark-fantasy", "?tag=Dark%20Fantasy"} {
+		if hits := pageStories(t, publicPage(t, q)); len(hits) != 1 || hits[0]["id"] != tagged {
+			t.Errorf("%s = %v", q, hits)
+		}
+	}
+	if none := pageStories(t, publicPage(t, "?tag=dark")); len(none) != 0 {
+		t.Errorf("a tag filter matched a partial tag: %v", none)
+	}
+
+	if hits := pageStories(t, publicPage(t, "?author="+bob)); len(hits) != 1 || hits[0]["id"] != other {
+		t.Errorf("author filter = %v", hits)
+	}
+	if none := pageStories(t, publicPage(t, "?author=nobody")); len(none) != 0 {
+		t.Errorf("an unknown author returned stories: %v", none)
+	}
+}
+
+func TestPublicSitemapListsOnlyPublishedStories(t *testing.T) {
+	reset(t)
+	first := newPublishedStory(t, alice, "First Out")["id"].(string)
+	second := newPublishedStory(t, bob, "Second Out")["id"].(string)
+	newStory(t, alice, "Never Out")
+
+	seen := map[string]bool{}
+	cursor := ""
+	for pages := 0; pages < 3; pages++ {
+		res := get(t, "/v1/public/sitemap?limit=1"+cursor, "").expect(http.StatusOK)
+		page := res.json()
+		for _, raw := range page["stories"].([]any) {
+			entry := raw.(map[string]any)
+			seen[entry["id"].(string)] = true
+			if entry["title"] == "" || entry["authorId"] == "" || entry["updatedAt"] == "" {
+				t.Errorf("sitemap entry is missing a field: %v", entry)
+			}
+		}
+		next, _ := page["nextCursor"].(string)
+		if next == "" {
+			break
+		}
+		cursor = "&cursor=" + next
+	}
+	if len(seen) != 2 || !seen[first] || !seen[second] {
+		t.Errorf("sitemap = %v, want exactly the two published stories", seen)
+	}
+
+	// An empty catalogue is an empty array, never null.
+	reset(t)
+	empty := get(t, "/v1/public/sitemap", "").expect(http.StatusOK).json()
+	if stories, ok := empty["stories"].([]any); !ok || len(stories) != 0 {
+		t.Errorf("empty sitemap = %v", empty["stories"])
+	}
+}
+
 func TestPublicListingSearchesTitleAndAuthor(t *testing.T) {
 	reset(t)
 	call(t, "POST", "/v1/stories", alice, map[string]any{
