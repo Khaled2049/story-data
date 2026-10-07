@@ -178,6 +178,9 @@ func (s *Store) CreateStory(ctx context.Context, owner string, in StoryInput) (S
 	if !validStoryInput(in) {
 		return Story{}, ErrValidation
 	}
+	if err := s.RequireWriterAgreement(ctx, owner); err != nil {
+		return Story{}, err
+	}
 	id := uuid.New()
 	tx, err := s.db.Begin(ctx)
 	if err != nil {

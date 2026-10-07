@@ -218,7 +218,8 @@ func resetQueryCount() { queries.n.Store(0) }
 
 func queryCount() int64 { return queries.n.Load() }
 
-// reset empties every table so each test starts from a known state.
+// reset empties every table and accepts current writing policies for the standard
+// adult author fixtures. Agreement-specific tests use a separate unaccepted uid.
 func reset(t *testing.T) {
 	t.Helper()
 	if tableCount == 0 {
@@ -227,6 +228,17 @@ func reset(t *testing.T) {
 	if _, err := testPool.Exec(context.Background(), resetSQL); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
+	acceptWriter(t, alice)
+	acceptWriter(t, bob)
+}
+
+func acceptWriter(t *testing.T, uid string) {
+	t.Helper()
+	call(t, "POST", "/v1/me/writer-agreement", uid, map[string]any{
+		"termsVersion": store.TermsVersion, "privacyVersion": store.PrivacyVersion,
+		"attestationVersion": store.AttestationVersion,
+		"agreeTerms":         true, "acknowledgePrivacy": true, "attestRights": true, "adult": true,
+	}).expect(http.StatusOK)
 }
 
 // ── request helpers ─────────────────────────────────────────────────────────

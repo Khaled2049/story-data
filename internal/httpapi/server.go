@@ -45,6 +45,7 @@ func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.
 	}
 	m := http.NewServeMux()
 	m.HandleFunc("/health", x.health)
+	m.HandleFunc("/v1/me/writer-agreement", x.writerAgreement)
 	m.HandleFunc("/v1/public/", x.public)
 	m.HandleFunc("/v1/public/profiles", x.profiles)
 	m.HandleFunc("/v1/public/profiles/", x.profiles)
@@ -145,6 +146,14 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 	// Guards the whole /v1/stories/{id}/... subtree in one place.
 	if !uuidPath(w, p[0]) {
 		return
+	}
+	// Reader interactions and deletion remain available without a writer agreement.
+	workspace := len(p) == 1 || p[1] == "chapters" || p[1] == "characters" || p[1] == "places" || p[1] == "plots" || p[1] == "assistant-threads"
+	if workspace && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
+		if err := s.store.RequireWriterAgreement(r.Context(), uid); err != nil {
+			respond(w, nil, err)
+			return
+		}
 	}
 	if len(p) == 1 {
 		s.storyResource(w, r, uid, p[0])

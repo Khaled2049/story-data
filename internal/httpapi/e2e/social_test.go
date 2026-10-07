@@ -19,6 +19,9 @@ import (
 // is the precondition for every social endpoint.
 func newPublishedStory(t *testing.T, uid, title string) map[string]any {
 	t.Helper()
+	if uid != alice && uid != bob {
+		acceptWriter(t, uid)
+	}
 	return call(t, "POST", "/v1/stories", uid, map[string]any{
 		"title": title, "description": "d", "authorName": "a",
 		"tags": []string{"x"}, "published": true,
