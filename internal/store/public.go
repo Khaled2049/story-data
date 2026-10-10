@@ -30,6 +30,7 @@ type PublicStory struct {
 	CoverImageURL  string    `json:"coverImageUrl"`
 	ThumbnailURL   string    `json:"thumbnailUrl"`
 	Tags           []string  `json:"tags"`
+	ParagraphStyle string    `json:"paragraphStyle"`
 	ChapterCount   int       `json:"chapterCount"`
 	Views          int64     `json:"views"`
 	LikeCount      int64     `json:"likeCount"`
@@ -75,7 +76,8 @@ const publicStoryColumns = `s.id, s.owner_id, s.title, s.description, COALESCE(p
   (SELECT round(avg(sr.rating)::numeric, 1) FROM story_ratings sr WHERE sr.story_id=s.id),
   (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id),
   COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM story_tags st WHERE st.story_id=s.id), '{}'),
-  (SELECT count(*) FROM chapters c WHERE c.story_id=s.id)`
+  (SELECT count(*) FROM chapters c WHERE c.story_id=s.id),
+  s.paragraph_style`
 
 const publicStoryFrom = `
 FROM stories s
@@ -345,7 +347,7 @@ func (s *Store) publicChapters(ctx context.Context, storyID string, content bool
 func scanPublicStory(row pgx.Row, extra ...any) (PublicStory, error) {
 	var x PublicStory
 	var id uuid.UUID
-	dest := []any{&id, &x.AuthorID, &x.Title, &x.Description, &x.AuthorName, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Views, &x.CreatedAt, &x.UpdatedAt, &x.LikeCount, &x.AverageRating, &x.RatingsCount, &x.Tags, &x.ChapterCount}
+	dest := []any{&id, &x.AuthorID, &x.Title, &x.Description, &x.AuthorName, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Views, &x.CreatedAt, &x.UpdatedAt, &x.LikeCount, &x.AverageRating, &x.RatingsCount, &x.Tags, &x.ChapterCount, &x.ParagraphStyle}
 	err := row.Scan(append(dest, extra...)...)
 	x.ID = id.String()
 	return x, err

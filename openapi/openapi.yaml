@@ -386,6 +386,10 @@ components:
         description: { type: string }
         authorName: { type: string }
         published: { type: boolean }
+        paragraphStyle:
+          type: string
+          enum: [spaced, indented]
+          description: Omit to default to spaced on create and keep the stored value on update.
     AssistantThreadInput:
       type: object
       properties:

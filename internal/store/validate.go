@@ -95,7 +95,14 @@ func validStoryInput(in StoryInput) bool {
 		validText(in.Copyright, maxShortFieldChars) &&
 		validURL(in.CoverImageURL) &&
 		validURL(in.ThumbnailURL) &&
-		validTags(in.Tags)
+		validTags(in.Tags) &&
+		validParagraphStyle(in.ParagraphStyle)
+}
+
+// validParagraphStyle mirrors stories_paragraph_style_valid, plus the empty
+// value StoryInput uses for "unspecified".
+func validParagraphStyle(v string) bool {
+	return v == "" || v == "spaced" || v == "indented"
 }
 
 func validCharacterInput(in CharacterInput) bool {

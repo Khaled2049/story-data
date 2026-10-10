@@ -65,6 +65,7 @@ type Story struct {
 	CoverImageURL  string    `json:"coverImageUrl"`
 	ThumbnailURL   string    `json:"thumbnailUrl"`
 	Tags           []string  `json:"tags"`
+	ParagraphStyle string    `json:"paragraphStyle"`
 	Published      bool      `json:"published"`
 	Revision       int64     `json:"revision"`
 	CreatedAt      time.Time `json:"createdAt"`
@@ -145,7 +146,10 @@ type StoryInput struct {
 	CoverImageURL  string   `json:"coverImageUrl"`
 	ThumbnailURL   string   `json:"thumbnailUrl"`
 	Tags           []string `json:"tags"`
-	Published      bool     `json:"published"`
+	// Empty means "unspecified": a create takes the default and an update keeps
+	// the stored value, so a client that predates the field cannot reset it.
+	ParagraphStyle string `json:"paragraphStyle"`
+	Published      bool   `json:"published"`
 }
 type ChapterInput struct {
 	Title    string  `json:"title"`
@@ -201,8 +205,8 @@ func (s *Store) CreateStory(ctx context.Context, owner string, in StoryInput) (S
 	if owned >= storyLimit {
 		return Story{}, limitErrf("you have reached the limit of %d stories", storyLimit)
 	}
-	row := tx.QueryRow(ctx, `INSERT INTO stories (id, owner_id, title, description, author_name, is_published, category, target_audience, language, copyright, cover_image_url, thumbnail_url)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), revision, created_at, updated_at`, id, owner, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL))
+	row := tx.QueryRow(ctx, `INSERT INTO stories (id, owner_id, title, description, author_name, is_published, category, target_audience, language, copyright, cover_image_url, thumbnail_url, paragraph_style)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,COALESCE(NULLIF($13,''),'spaced')) RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), paragraph_style, revision, created_at, updated_at`, id, owner, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL), in.ParagraphStyle)
 	story, err := scanStory(row)
 	if err != nil {
 		return Story{}, err
@@ -277,7 +281,7 @@ func (s *Store) listStories(ctx context.Context, owner, cursor string, limit int
 	// hide for a count but silently inflates sum(word_count).
 	query := `SELECT s.id, s.owner_id, s.title, s.description, s.author_name, s.is_published,
   COALESCE(s.category,''), COALESCE(s.target_audience,''), COALESCE(s.language,''), COALESCE(s.copyright,''),
-  COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''), s.revision, s.created_at, s.updated_at,
+  COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''), s.paragraph_style, s.revision, s.created_at, s.updated_at,
   (SELECT count(*) FROM chapters c WHERE c.story_id=s.id),
   (SELECT COALESCE(sum(c.word_count),0) FROM chapters c WHERE c.story_id=s.id),
   s.views,
@@ -307,7 +311,7 @@ FROM stories s WHERE s.owner_id=$1`
 		var id uuid.UUID
 		if err := rows.Scan(&id, &x.OwnerID, &x.Title, &x.Description, &x.AuthorName, &x.Published,
 			&x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL,
-			&x.Revision, &x.CreatedAt, &x.UpdatedAt,
+			&x.ParagraphStyle, &x.Revision, &x.CreatedAt, &x.UpdatedAt,
 			&x.ChapterCount, &x.WordCount, &x.Views, &x.LikeCount, &x.AverageRating, &x.RatingsCount); err != nil {
 			return nil, err
 		}
@@ -345,7 +349,7 @@ FROM stories s WHERE s.owner_id=$1`
 }
 
 func (s *Store) GetStory(ctx context.Context, id, caller string) (Story, error) {
-	row := s.db.QueryRow(ctx, `SELECT id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), revision, created_at, updated_at FROM stories WHERE id=$1`, id)
+	row := s.db.QueryRow(ctx, `SELECT id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), paragraph_style, revision, created_at, updated_at FROM stories WHERE id=$1`, id)
 	story, err := scanStory(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Story{}, ErrNotFound
@@ -387,7 +391,7 @@ func (s *Store) UpdateStory(ctx context.Context, id, owner string, rev int64, in
 		return Story{}, err
 	}
 	defer tx.Rollback(ctx)
-	row := tx.QueryRow(ctx, `UPDATE stories SET title=$1, description=$2, author_name=$3, is_published=$4, category=$5, target_audience=$6, language=$7, copyright=$8, cover_image_url=$9, thumbnail_url=$10, revision=revision+1, updated_at=now() WHERE id=$11 AND owner_id=$12 AND revision=$13 RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), revision, created_at, updated_at`, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL), id, owner, rev)
+	row := tx.QueryRow(ctx, `UPDATE stories SET title=$1, description=$2, author_name=$3, is_published=$4, category=$5, target_audience=$6, language=$7, copyright=$8, cover_image_url=$9, thumbnail_url=$10, paragraph_style=COALESCE(NULLIF($14,''),paragraph_style), revision=revision+1, updated_at=now() WHERE id=$11 AND owner_id=$12 AND revision=$13 RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), paragraph_style, revision, created_at, updated_at`, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL), id, owner, rev, in.ParagraphStyle)
 	story, err := scanStory(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Story{}, s.classifyWrite(ctx, "stories", id, owner)
@@ -655,7 +659,7 @@ func (s *Store) classifyChapterWrite(ctx context.Context, storyID, id, owner str
 func scanStory(row pgx.Row) (Story, error) {
 	var x Story
 	var id uuid.UUID
-	err := row.Scan(&id, &x.OwnerID, &x.Title, &x.Description, &x.AuthorName, &x.Published, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Revision, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&id, &x.OwnerID, &x.Title, &x.Description, &x.AuthorName, &x.Published, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.ParagraphStyle, &x.Revision, &x.CreatedAt, &x.UpdatedAt)
 	x.ID = id.String()
 	return x, err
 }
