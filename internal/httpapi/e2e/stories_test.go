@@ -181,6 +181,46 @@ func TestStoryUpdateRequiresMatchingRevision(t *testing.T) {
 	call(t, "PATCH", "/v1/stories/"+id, alice, body, ifMatch(rev)).expect(http.StatusConflict)
 }
 
+func TestStoryParagraphStyle(t *testing.T) {
+	reset(t)
+	story := newStory(t, alice, "Original")
+	id := story["id"].(string)
+	if story["paragraphStyle"] != "spaced" {
+		t.Fatalf("new story paragraphStyle = %v, want spaced", story["paragraphStyle"])
+	}
+	body := func(style any) map[string]any {
+		b := map[string]any{"title": "Original", "description": "d", "authorName": "a", "tags": []string{"x"}, "published": true}
+		if style != nil {
+			b["paragraphStyle"] = style
+		}
+		return b
+	}
+	patch := func(style any, want int) map[string]any {
+		t.Helper()
+		current := call(t, "GET", "/v1/stories/"+id, alice, nil).expect(http.StatusOK).json()
+		rev := int64(current["revision"].(float64))
+		res := call(t, "PATCH", "/v1/stories/"+id, alice, body(style), ifMatch(rev)).expect(want)
+		if want != http.StatusOK {
+			return nil
+		}
+		return res.json()
+	}
+
+	if got := patch("indented", http.StatusOK)["paragraphStyle"]; got != "indented" {
+		t.Errorf("after setting, paragraphStyle = %v, want indented", got)
+	}
+	// A client that predates the field sends none; that must not reset it.
+	if got := patch(nil, http.StatusOK)["paragraphStyle"]; got != "indented" {
+		t.Errorf("after an update without the field, paragraphStyle = %v, want indented", got)
+	}
+	patch("double", http.StatusUnprocessableEntity)
+
+	public := call(t, "GET", publicStoryPath(id), "", nil).expect(http.StatusOK).json()
+	if got := public["story"].(map[string]any)["paragraphStyle"]; got != "indented" {
+		t.Errorf("public paragraphStyle = %v, want indented", got)
+	}
+}
+
 func TestStoryOwnershipIsEnforced(t *testing.T) {
 	reset(t)
 	story := newStory(t, alice, "Alice's")
