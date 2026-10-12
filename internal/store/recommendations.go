@@ -47,6 +47,7 @@ WITH chapter_rank AS (
          row_number() OVER (PARTITION BY c.story_id ORDER BY c.position) AS idx,
          count(*)     OVER (PARTITION BY c.story_id)                     AS total
     FROM chapters c
+   WHERE c.published_at IS NOT NULL
 ), signals AS (
       SELECT sl.user_id, i.id AS item_id, 'like'::text AS kind,
              NULL::double precision AS value, sl.created_at AS occurred_at

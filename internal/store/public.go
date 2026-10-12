@@ -37,7 +37,13 @@ type PublicStory struct {
 	AverageRating  *float64  `json:"averageRating,omitempty"`
 	RatingsCount   int       `json:"ratingsCount"`
 	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	// The last change a reader could see, not the author's last draft save.
+	UpdatedAt time.Time `json:"updatedAt"`
+	// NextChapterOn is omitted once the date has passed; see publicNextChapterOn.
+	CompletionStatus    string     `json:"completionStatus"`
+	NextChapterOn       string     `json:"nextChapterOn,omitempty"`
+	ReaderNote          string     `json:"readerNote,omitempty"`
+	ReaderNoteUpdatedAt *time.Time `json:"readerNoteUpdatedAt,omitempty"`
 }
 
 type PublicChapter struct {
@@ -49,6 +55,8 @@ type PublicChapter struct {
 	WordCount int       `json:"wordCount"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// When the author released it. Drafts never reach this type.
+	PublishedAt time.Time `json:"publishedAt"`
 }
 
 type PublicStoryAuthor struct {
@@ -71,13 +79,14 @@ type PublicStoryPage struct {
 const publicStoryColumns = `s.id, s.owner_id, s.title, s.description, COALESCE(p.username, s.author_name),
   COALESCE(s.category,''), COALESCE(s.target_audience,''), COALESCE(s.language,''),
   COALESCE(s.copyright,''), COALESCE(s.cover_image_url,''), COALESCE(s.thumbnail_url,''),
-  s.views, s.created_at, s.updated_at,
+  s.views, s.created_at, s.public_updated_at,
   (SELECT count(*) FROM story_likes sl WHERE sl.story_id=s.id),
   (SELECT round(avg(sr.rating)::numeric, 1) FROM story_ratings sr WHERE sr.story_id=s.id),
   (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id),
   COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM story_tags st WHERE st.story_id=s.id), '{}'),
-  (SELECT count(*) FROM chapters c WHERE c.story_id=s.id),
-  s.paragraph_style`
+  (SELECT count(*) FROM chapters c WHERE c.story_id=s.id AND c.published_at IS NOT NULL),
+  s.paragraph_style,
+  s.completion_status, ` + publicNextChapterOn + `, s.reader_note, s.reader_note_updated_at`
 
 const publicStoryFrom = `
 FROM stories s
@@ -100,6 +109,8 @@ type PublicStoryFilter struct {
 	Search   string
 	Tag      string
 	AuthorID string
+	// Status is a completion status; anything else must be rejected by the caller.
+	Status string
 }
 
 // TagSlug is the URL form of a tag: lower-cased with spaces as hyphens. It must
@@ -147,13 +158,20 @@ func (s *Store) ListPublicStories(ctx context.Context, f PublicStoryFilter, curs
 		args = append(args, author)
 		where += fmt.Sprintf(" AND s.owner_id=$%d", len(args))
 	}
+	if f.Status != "" {
+		if !ValidCompletionStatus(f.Status) {
+			return PublicStoryPage{}, ErrValidation
+		}
+		args = append(args, f.Status)
+		where += fmt.Sprintf(" AND s.completion_status=$%d", len(args))
+	}
 	if after != nil {
 		args = append(args, after.UpdatedAt, mustUUID(after.ID))
-		where += fmt.Sprintf(" AND (s.updated_at, s.id) < ($%d, $%d)", len(args)-1, len(args))
+		where += fmt.Sprintf(" AND (s.public_updated_at, s.id) < ($%d, $%d)", len(args)-1, len(args))
 	}
 	args = append(args, pageSize+1)
 	query := publicStorySelect + where + `
-ORDER BY s.updated_at DESC, s.id DESC
+ORDER BY s.public_updated_at DESC, s.id DESC
 LIMIT $` + fmt.Sprint(len(args))
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
@@ -210,11 +228,11 @@ func (s *Store) ListPublicSitemap(ctx context.Context, cursor string, pageSize i
 			return PublicSitemapPage{}, ErrValidation
 		}
 		args = append(args, after.UpdatedAt, mustUUID(after.ID))
-		where += " AND (updated_at, id) < ($1, $2)"
+		where += " AND (public_updated_at, id) < ($1, $2)"
 	}
 	args = append(args, pageSize+1)
-	rows, err := s.db.Query(ctx, `SELECT id, owner_id, title, updated_at FROM stories `+where+`
-ORDER BY updated_at DESC, id DESC
+	rows, err := s.db.Query(ctx, `SELECT id, owner_id, title, public_updated_at FROM stories `+where+`
+ORDER BY public_updated_at DESC, id DESC
 LIMIT $`+fmt.Sprint(len(args)), args...)
 	if err != nil {
 		return PublicSitemapPage{}, err
@@ -258,7 +276,7 @@ func (s *Store) GetPublicChapter(ctx context.Context, storyID, chapterID string)
 	if err := s.publicStoryExists(ctx, storyID); err != nil {
 		return PublicChapter{}, err
 	}
-	row := s.db.QueryRow(ctx, `SELECT id, story_id, title, content, position, word_count, created_at, updated_at FROM chapters WHERE story_id=$1 AND id=$2`, storyID, chapterID)
+	row := s.db.QueryRow(ctx, `SELECT id, story_id, title, content, position, word_count, created_at, updated_at, published_at FROM chapters WHERE story_id=$1 AND id=$2 AND published_at IS NOT NULL`, storyID, chapterID)
 	chapter, err := scanPublicChapter(row, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return PublicChapter{}, ErrNotFound
@@ -328,7 +346,7 @@ func (s *Store) publicChapters(ctx context.Context, storyID string, content bool
 	if content {
 		selectContent = "content"
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, story_id, title, `+selectContent+`, position, word_count, created_at, updated_at FROM chapters WHERE story_id=$1 ORDER BY position`, storyID)
+	rows, err := s.db.Query(ctx, `SELECT id, story_id, title, `+selectContent+`, position, word_count, created_at, updated_at, published_at FROM chapters WHERE story_id=$1 AND published_at IS NOT NULL ORDER BY position`, storyID)
 	if err != nil {
 		return nil, err
 	}
@@ -347,7 +365,7 @@ func (s *Store) publicChapters(ctx context.Context, storyID string, content bool
 func scanPublicStory(row pgx.Row, extra ...any) (PublicStory, error) {
 	var x PublicStory
 	var id uuid.UUID
-	dest := []any{&id, &x.AuthorID, &x.Title, &x.Description, &x.AuthorName, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Views, &x.CreatedAt, &x.UpdatedAt, &x.LikeCount, &x.AverageRating, &x.RatingsCount, &x.Tags, &x.ChapterCount, &x.ParagraphStyle}
+	dest := []any{&id, &x.AuthorID, &x.Title, &x.Description, &x.AuthorName, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Views, &x.CreatedAt, &x.UpdatedAt, &x.LikeCount, &x.AverageRating, &x.RatingsCount, &x.Tags, &x.ChapterCount, &x.ParagraphStyle, &x.CompletionStatus, &x.NextChapterOn, &x.ReaderNote, &x.ReaderNoteUpdatedAt}
 	err := row.Scan(append(dest, extra...)...)
 	x.ID = id.String()
 	return x, err
@@ -356,7 +374,7 @@ func scanPublicStory(row pgx.Row, extra ...any) (PublicStory, error) {
 func scanPublicChapter(row pgx.Row, includeContent bool) (PublicChapter, error) {
 	var x PublicChapter
 	var id, storyID uuid.UUID
-	err := row.Scan(&id, &storyID, &x.Title, &x.Content, &x.Position, &x.WordCount, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&id, &storyID, &x.Title, &x.Content, &x.Position, &x.WordCount, &x.CreatedAt, &x.UpdatedAt, &x.PublishedAt)
 	x.ID, x.StoryID = id.String(), storyID.String()
 	if !includeContent {
 		x.Content = ""

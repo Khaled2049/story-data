@@ -37,6 +37,21 @@ func newChapter(t *testing.T, uid, storyID, title string, position float64) map[
 	}).expect(http.StatusCreated).json()
 }
 
+// releaseChapter makes a chapter readable by anyone who can see the story.
+func releaseChapter(t *testing.T, uid string, chapter map[string]any) map[string]any {
+	t.Helper()
+	path := fmt.Sprintf("/v1/stories/%s/chapters/%s/publication", chapter["storyId"], chapter["id"])
+	return call(t, "PUT", path, uid, map[string]any{"published": true},
+		ifMatch(int64(chapter["revision"].(float64)))).expect(http.StatusOK).json()
+}
+
+// newReleasedChapter is newChapter for tests about what readers see: a new
+// chapter is a draft until its author releases it.
+func newReleasedChapter(t *testing.T, uid, storyID, title string, position float64) map[string]any {
+	t.Helper()
+	return releaseChapter(t, uid, newChapter(t, uid, storyID, title, position))
+}
+
 // socialFixture is the shape every test here needs: a published story with one
 // chapter, owned by alice.
 func socialFixture(t *testing.T) (storyID, chapterID string) {

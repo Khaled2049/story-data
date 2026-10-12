@@ -20,7 +20,7 @@ func progressPath(storyID string) string { return "/v1/me/reading-progress/" + s
 func TestReadingProgressRoundTrip(t *testing.T) {
 	reset(t)
 	storyID := newPublishedStory(t, alice, "A Long Book")["id"].(string)
-	chapterID := newChapter(t, alice, storyID, "Chapter One", 1)["id"].(string)
+	chapterID := newReleasedChapter(t, alice, storyID, "Chapter One", 1)["id"].(string)
 
 	// Nothing saved yet reads as the start of the book rather than a 404.
 	fresh := get(t, progressPath(storyID), bob).expect(http.StatusOK).json()
@@ -60,7 +60,7 @@ func TestReadingProgressRoundTrip(t *testing.T) {
 func TestReadingProgressValidation(t *testing.T) {
 	reset(t)
 	storyID := newPublishedStory(t, alice, "Bounded")["id"].(string)
-	chapterID := newChapter(t, alice, storyID, "Chapter One", 1)["id"].(string)
+	chapterID := newReleasedChapter(t, alice, storyID, "Chapter One", 1)["id"].(string)
 	absent := "11111111-1111-1111-1111-111111111111"
 
 	// scrollPercent is a fraction, not a percentage.
@@ -87,7 +87,7 @@ func TestReadingProgressValidation(t *testing.T) {
 	// A chapter that belongs to a different story cannot be used to fake a
 	// position in this one.
 	other := newPublishedStory(t, alice, "Elsewhere")["id"].(string)
-	elsewhere := newChapter(t, alice, other, "Not here", 1)["id"].(string)
+	elsewhere := newReleasedChapter(t, alice, other, "Not here", 1)["id"].(string)
 	call(t, "PUT", progressPath(storyID), bob, map[string]any{
 		"chapterId": elsewhere, "scrollPercent": 0.5,
 	}).expect(http.StatusNotFound)
@@ -101,7 +101,7 @@ func TestReadingProgressValidation(t *testing.T) {
 func TestReadingProgressRequiresAPublishedStory(t *testing.T) {
 	reset(t)
 	draft := newStory(t, alice, "Draft")["id"].(string)
-	chapterID := newChapter(t, alice, draft, "Chapter One", 1)["id"].(string)
+	chapterID := newReleasedChapter(t, alice, draft, "Chapter One", 1)["id"].(string)
 
 	// Even the author cannot record progress against their own unpublished
 	// draft — progress is a reader-facing record.
@@ -116,9 +116,9 @@ func TestReadingProgressRequiresAPublishedStory(t *testing.T) {
 func TestReadingHistoryDerivesPositionInTheBook(t *testing.T) {
 	reset(t)
 	storyID := newPublishedStory(t, alice, "Three Chapters")["id"].(string)
-	first := newChapter(t, alice, storyID, "One", 1)["id"].(string)
-	second := newChapter(t, alice, storyID, "Two", 2)["id"].(string)
-	newChapter(t, alice, storyID, "Three", 3)
+	first := newReleasedChapter(t, alice, storyID, "One", 1)["id"].(string)
+	second := newReleasedChapter(t, alice, storyID, "Two", 2)["id"].(string)
+	newReleasedChapter(t, alice, storyID, "Three", 3)
 
 	call(t, "PUT", progressPath(storyID), bob, map[string]any{
 		"chapterId": second, "scrollPercent": 0.5,
@@ -132,31 +132,31 @@ func TestReadingHistoryDerivesPositionInTheBook(t *testing.T) {
 	if entry["storyTitle"] != "Three Chapters" {
 		t.Errorf("storyTitle = %v", entry["storyTitle"])
 	}
-	// The auto-created chapter counts too, so four in total.
-	if entry["totalChapters"].(float64) != 4 {
-		t.Errorf("totalChapters = %v, want 4", entry["totalChapters"])
+	// Only released chapters count; the auto-created one is still a draft.
+	if entry["totalChapters"].(float64) != 3 {
+		t.Errorf("totalChapters = %v, want 3", entry["totalChapters"])
 	}
 	// chapterIndex is derived from position rather than stored, so it stays
 	// right when chapters are reordered around the saved one.
-	if entry["chapterIndex"].(float64) != 2 {
-		t.Errorf("chapterIndex = %v, want 2", entry["chapterIndex"])
+	if entry["chapterIndex"].(float64) != 1 {
+		t.Errorf("chapterIndex = %v, want 1", entry["chapterIndex"])
 	}
 
 	// Moving back to the first chapter moves the derived index with it.
 	call(t, "PUT", progressPath(storyID), bob, map[string]any{
 		"chapterId": first, "scrollPercent": 0.1,
 	}).expect(http.StatusOK)
-	if idx := get(t, "/v1/me/reading-history", bob).expect(http.StatusOK).list()[0]["chapterIndex"].(float64); idx != 1 {
-		t.Errorf("chapterIndex after moving back = %v, want 1", idx)
+	if idx := get(t, "/v1/me/reading-history", bob).expect(http.StatusOK).list()[0]["chapterIndex"].(float64); idx != 0 {
+		t.Errorf("chapterIndex after moving back = %v, want 0", idx)
 	}
 }
 
 func TestReadingHistoryIsPerReaderAndClearable(t *testing.T) {
 	reset(t)
 	first := newPublishedStory(t, alice, "First")["id"].(string)
-	firstChapter := newChapter(t, alice, first, "One", 1)["id"].(string)
+	firstChapter := newReleasedChapter(t, alice, first, "One", 1)["id"].(string)
 	second := newPublishedStory(t, alice, "Second")["id"].(string)
-	secondChapter := newChapter(t, alice, second, "One", 1)["id"].(string)
+	secondChapter := newReleasedChapter(t, alice, second, "One", 1)["id"].(string)
 
 	call(t, "PUT", progressPath(first), bob, map[string]any{
 		"chapterId": firstChapter, "scrollPercent": 0.2,
@@ -191,7 +191,7 @@ func TestReadingHistoryLimitAndUnpublishing(t *testing.T) {
 	stories := []string{}
 	for i := 0; i < 3; i++ {
 		id := newPublishedStory(t, alice, fmt.Sprintf("Book %d", i))["id"].(string)
-		chapter := newChapter(t, alice, id, "One", 1)["id"].(string)
+		chapter := newReleasedChapter(t, alice, id, "One", 1)["id"].(string)
 		call(t, "PUT", progressPath(id), bob, map[string]any{
 			"chapterId": chapter, "scrollPercent": 0.5,
 		}).expect(http.StatusOK)

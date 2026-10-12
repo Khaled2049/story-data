@@ -97,6 +97,8 @@ Migration groups correspond to product domains:
 | `000027` | Guestbook author-feed and reply-parent indexes |
 | `000028` | Tag URL-form index for public tag listings |
 | `000029` | Versioned writer agreement records |
+| `000030` | Per-story paragraph style |
+| `000031`–`000032` | Story completion status and reader update; per-chapter publication and `public_updated_at` |
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an
@@ -249,6 +251,42 @@ have today.
   the same published set with the same cursor but returns only `id`,
   `authorId`, `title` and `updatedAt`, up to 1000 a page; the frontend's
   `seoRender` Function builds `sitemap.xml` from it.
+- `GET /v1/public/stories` filters by `?status=ongoing|completed` too. A
+  story's completion status is separate from `is_published`: a serial is public
+  long before it is finished. The author sets it, with an optional
+  `nextChapterOn` date and a `readerNote` of up to 280 characters, through
+  `PUT /v1/stories/{id}/reader-update` (`internal/store/reader_update.go`).
+  That endpoint is the one story write that takes no `If-Match` and bumps
+  neither `revision` nor `updated_at`, so a note edit cannot conflict with a
+  story edit the author has open. A story `PATCH` does not carry these fields
+  and cannot reset them.
+  Public responses omit `nextChapterOn` once the date is more than a day past
+  (the day of grace covers authors west of UTC); the owner still sees it.
+- **A chapter is a draft until its author releases it.** `chapters.published_at`
+  is null for a draft. New chapters start as drafts;
+  `PUT /v1/stories/{id}/chapters/{chapterId}/publication` with
+  `{"published": true|false}` and the chapter's `If-Match` revision releases one
+  or pulls it back (`internal/store/chapter_publication.go`). It does not bump
+  the chapter revision, since the text is unchanged, and it refuses to release
+  an empty chapter. A release also clears the story's `nextChapterOn`.
+  Publishing a story for the first time releases every chapter that has text,
+  but only if the author has released none themselves.
+- **Every non-owner chapter read must exclude drafts.** That is the public
+  manifest, the public chapter read and `chapterCount`, and also the
+  authenticated `ListChapters`, `ListChapterIndex`, `GetChapter` and
+  `StoryContext`, which serve a published story to any caller (`draftFilter` in
+  `store.go`). Reading progress can only be saved on a released chapter, and
+  history and the recommendations completion rule count released chapters
+  only. Any new query that returns chapter rows to someone other than the owner
+  needs the same condition; `TestDraftChaptersAreHiddenFromEveryoneButTheAuthor`
+  is the guard.
+- **Discovery orders by `stories.public_updated_at`, not `updated_at`.**
+  `updated_at` moves on every draft save and orders the owner's shelf.
+  `public_updated_at` moves only on a change readers can see: a story `PATCH`,
+  a chapter release or pull-back, an edit to or deletion of a released chapter,
+  and a change of completion status (`touchStory` in `store.go`). The public
+  listing, the sitemap, their shared cursor and the `updatedAt` on public
+  responses all use it.
 - Story, chapter, and worldbuilding mutations use optimistic concurrency.
   Clients send `If-Match: <revision>` for writes that update/delete an existing
   record. A stale revision returns `409 Conflict`.
@@ -321,7 +359,7 @@ generated readers recs writes itself.
 
 Two details are implemented here **and** in recs, because recs cannot compute
 them without reading the private table: the engagement weight per signal kind,
-and the completion rule (last chapter, scrolled past 0.9).
+and the completion rule (last released chapter, scrolled past 0.9).
 `TestRecommendationSignalWeights` and
 `TestCompletionNeedsLastChapterAndDeepScroll` pin both to recs's Python values,
 so drift fails a test rather than silently re-ranking the catalog.

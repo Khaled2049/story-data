@@ -221,6 +221,93 @@ func TestStoryParagraphStyle(t *testing.T) {
 	}
 }
 
+func TestReaderUpdate(t *testing.T) {
+	reset(t)
+	story := newStory(t, alice, "Serial")
+	id := story["id"].(string)
+	if story["completionStatus"] != "ongoing" {
+		t.Fatalf("new story completionStatus = %v, want ongoing", story["completionStatus"])
+	}
+	path := "/v1/stories/" + id + "/reader-update"
+	nextWeek := time.Now().UTC().AddDate(0, 0, 7).Format(time.DateOnly)
+
+	updated := call(t, "PUT", path, alice, map[string]any{
+		"completionStatus": "ongoing", "nextChapterOn": nextWeek, "readerNote": "  New chapters every Friday.  ",
+	}).expect(http.StatusOK).json()
+	if updated["nextChapterOn"] != nextWeek || updated["readerNote"] != "New chapters every Friday." {
+		t.Errorf("reader update = %v / %v", updated["nextChapterOn"], updated["readerNote"])
+	}
+	if updated["readerNoteUpdatedAt"] == nil {
+		t.Error("readerNoteUpdatedAt should be set once there is a note")
+	}
+	// A note edit is not new writing: it must not reorder discovery or
+	// invalidate a story edit the author has open.
+	if updated["revision"] != story["revision"] || updated["updatedAt"] != story["updatedAt"] {
+		t.Errorf("reader update moved revision/updatedAt: %v/%v -> %v/%v",
+			story["revision"], story["updatedAt"], updated["revision"], updated["updatedAt"])
+	}
+	if tags := updated["tags"].([]any); len(tags) != 1 {
+		t.Errorf("tags = %v, want the story's one tag", tags)
+	}
+
+	// A story PATCH carries none of these fields and must leave them alone.
+	rev := int64(updated["revision"].(float64))
+	patched := call(t, "PATCH", "/v1/stories/"+id, alice, map[string]any{
+		"title": "Serial", "description": "d", "authorName": "a", "tags": []string{"x"},
+	}, ifMatch(rev)).expect(http.StatusOK).json()
+	if patched["readerNote"] != "New chapters every Friday." || patched["nextChapterOn"] != nextWeek {
+		t.Errorf("story PATCH reset the reader update: %v / %v", patched["readerNote"], patched["nextChapterOn"])
+	}
+
+	// A finished story has no next chapter to promise; the note survives.
+	done := call(t, "PUT", path, alice, map[string]any{
+		"completionStatus": "completed", "nextChapterOn": nextWeek, "readerNote": "New chapters every Friday.",
+	}).expect(http.StatusOK).json()
+	if done["completionStatus"] != "completed" {
+		t.Errorf("completionStatus = %v, want completed", done["completionStatus"])
+	}
+	if _, ok := done["nextChapterOn"]; ok {
+		t.Errorf("completed story kept nextChapterOn = %v", done["nextChapterOn"])
+	}
+	if done["readerNoteUpdatedAt"] != updated["readerNoteUpdatedAt"] {
+		t.Error("readerNoteUpdatedAt moved although the note did not change")
+	}
+	shelf := call(t, "GET", "/v1/stories?limit=10", alice, nil).expect(http.StatusOK).json()
+	if got := shelf["stories"].([]any)[0].(map[string]any)["completionStatus"]; got != "completed" {
+		t.Errorf("shelf completionStatus = %v, want completed", got)
+	}
+
+	cleared := call(t, "PUT", path, alice, map[string]any{"completionStatus": "ongoing"}).
+		expect(http.StatusOK).json()
+	if cleared["readerNote"] != "" || cleared["readerNoteUpdatedAt"] != nil {
+		t.Errorf("clearing the note left %v / %v", cleared["readerNote"], cleared["readerNoteUpdatedAt"])
+	}
+
+	for name, body := range map[string]map[string]any{
+		"missing status": {"readerNote": "hi"},
+		"unknown status": {"completionStatus": "hiatus"},
+		"malformed date": {"completionStatus": "ongoing", "nextChapterOn": "next friday"},
+		"note too long":  {"completionStatus": "ongoing", "readerNote": strings.Repeat("é", 281)},
+	} {
+		if res := call(t, "PUT", path, alice, body); res.Status != http.StatusUnprocessableEntity {
+			t.Errorf("%s: status = %d, want 422", name, res.Status)
+		}
+	}
+	call(t, "PUT", path, alice, map[string]any{
+		"completionStatus": "ongoing", "readerNote": strings.Repeat("é", 280),
+	}).expect(http.StatusOK)
+
+	body := map[string]any{"completionStatus": "completed"}
+	call(t, "PUT", path, bob, body).expect(http.StatusForbidden)
+	call(t, "PUT", path, "", body).expect(http.StatusUnauthorized)
+	call(t, "POST", path, alice, body).expect(http.StatusMethodNotAllowed)
+	call(t, "PUT", "/v1/stories/00000000-0000-4000-8000-000000000000/reader-update", alice, body).
+		expect(http.StatusNotFound)
+	if still := get(t, "/v1/stories/"+id, alice).expect(http.StatusOK).json(); still["completionStatus"] != "ongoing" {
+		t.Errorf("a refused write changed completionStatus to %v", still["completionStatus"])
+	}
+}
+
 func TestStoryOwnershipIsEnforced(t *testing.T) {
 	reset(t)
 	story := newStory(t, alice, "Alice's")
@@ -500,6 +587,128 @@ func TestChapterWordLimit(t *testing.T) {
 	call(t, "POST", base, alice, map[string]any{
 		"title": "Too long", "content": long, "position": 1,
 	}).expect(http.StatusUnprocessableEntity)
+}
+
+func TestChapterPublication(t *testing.T) {
+	reset(t)
+	storyID := newStory(t, alice, "Serial")["id"].(string)
+	chapter := newChapter(t, alice, storyID, "One", 1)
+	if chapter["publishedAt"] != nil {
+		t.Fatalf("a new chapter should be a draft, publishedAt = %v", chapter["publishedAt"])
+	}
+	id := chapter["id"].(string)
+	rev := int64(chapter["revision"].(float64))
+	path := "/v1/stories/" + storyID + "/chapters/" + id + "/publication"
+	release, pull := map[string]any{"published": true}, map[string]any{"published": false}
+
+	call(t, "PUT", path, alice, release).expect(http.StatusPreconditionRequired)
+	call(t, "PUT", path, alice, release, ifMatch(rev+1)).expect(http.StatusConflict)
+	call(t, "PUT", path, alice, map[string]any{}, ifMatch(rev)).expect(http.StatusBadRequest)
+	call(t, "PUT", path, bob, release, ifMatch(rev)).expect(http.StatusForbidden)
+	call(t, "POST", path, alice, release, ifMatch(rev)).expect(http.StatusMethodNotAllowed)
+	call(t, "PUT", "/v1/stories/"+storyID+"/chapters/00000000-0000-4000-8000-000000000000/publication",
+		alice, release, ifMatch(rev)).expect(http.StatusNotFound)
+
+	released := call(t, "PUT", path, alice, release, ifMatch(rev)).expect(http.StatusOK).json()
+	if released["publishedAt"] == nil {
+		t.Fatal("released chapter has no publishedAt")
+	}
+	// The text did not change, so neither does the revision an open editor holds.
+	if int64(released["revision"].(float64)) != rev {
+		t.Errorf("release moved the revision: %d -> %v", rev, released["revision"])
+	}
+	again := call(t, "PUT", path, alice, release, ifMatch(rev)).expect(http.StatusOK).json()
+	if again["publishedAt"] != released["publishedAt"] {
+		t.Errorf("releasing twice moved publishedAt: %v -> %v", released["publishedAt"], again["publishedAt"])
+	}
+	if got := get(t, "/v1/stories/"+storyID+"/chapters/"+id, alice).expect(http.StatusOK).json(); got["publishedAt"] != released["publishedAt"] {
+		t.Errorf("chapter read publishedAt = %v", got["publishedAt"])
+	}
+
+	pulled := call(t, "PUT", path, alice, pull, ifMatch(rev)).expect(http.StatusOK).json()
+	if pulled["publishedAt"] != nil {
+		t.Errorf("pulled-back chapter kept publishedAt = %v", pulled["publishedAt"])
+	}
+
+	// An empty chapter has nothing to release.
+	empty := call(t, "POST", "/v1/stories/"+storyID+"/chapters", alice, map[string]any{
+		"title": "Blank", "content": "", "position": 2,
+	}).expect(http.StatusCreated).json()
+	res := call(t, "PUT", "/v1/stories/"+storyID+"/chapters/"+empty["id"].(string)+"/publication",
+		alice, release, ifMatch(int64(empty["revision"].(float64)))).expect(http.StatusUnprocessableEntity)
+	if !strings.Contains(string(res.Body), "write something") {
+		t.Errorf("empty-chapter refusal = %s", res.Body)
+	}
+}
+
+func TestChapterReleaseSpendsTheNextChapterDate(t *testing.T) {
+	reset(t)
+	storyID := newPublishedStory(t, alice, "Serial")["id"].(string)
+	nextWeek := time.Now().UTC().AddDate(0, 0, 7).Format(time.DateOnly)
+	call(t, "PUT", "/v1/stories/"+storyID+"/reader-update", alice, map[string]any{
+		"completionStatus": "ongoing", "nextChapterOn": nextWeek, "readerNote": "Fridays.",
+	}).expect(http.StatusOK)
+
+	// A draft is not the promised chapter yet.
+	chapter := newChapter(t, alice, storyID, "Two", 1)
+	if got := get(t, "/v1/stories/"+storyID, alice).expect(http.StatusOK).json(); got["nextChapterOn"] != nextWeek {
+		t.Fatalf("a draft cleared nextChapterOn: %v", got["nextChapterOn"])
+	}
+	releaseChapter(t, alice, chapter)
+	got := get(t, "/v1/stories/"+storyID, alice).expect(http.StatusOK).json()
+	if got["nextChapterOn"] != nil || got["readerNote"] != "Fridays." {
+		t.Errorf("after a release: nextChapterOn = %v, readerNote = %v", got["nextChapterOn"], got["readerNote"])
+	}
+}
+
+func TestPublishingAStoryReleasesItsWrittenChapters(t *testing.T) {
+	reset(t)
+	publish := func(story map[string]any, published bool) map[string]any {
+		t.Helper()
+		current := get(t, "/v1/stories/"+story["id"].(string), alice).expect(http.StatusOK).json()
+		return call(t, "PATCH", "/v1/stories/"+story["id"].(string), alice, map[string]any{
+			"title": story["title"], "description": "d", "authorName": "a", "tags": []string{"x"}, "published": published,
+		}, ifMatch(int64(current["revision"].(float64)))).expect(http.StatusOK).json()
+	}
+	publicTitles := func(storyID string) []string {
+		t.Helper()
+		titles := []string{}
+		for _, c := range get(t, publicStoryPath(storyID), "").expect(http.StatusOK).json()["chapters"].([]any) {
+			titles = append(titles, c.(map[string]any)["title"].(string))
+		}
+		return titles
+	}
+
+	// Nothing chosen: every chapter with text goes out, the empty one does not.
+	manuscript := newStory(t, alice, "Manuscript")
+	id := manuscript["id"].(string)
+	newChapter(t, alice, id, "One", 1)
+	newChapter(t, alice, id, "Two", 2)
+	publish(manuscript, true)
+	if got := publicTitles(id); len(got) != 2 || got[0] != "One" || got[1] != "Two" {
+		t.Errorf("published manuscript shows %v, want [One Two]", got)
+	}
+
+	// It happens once. Pulling everything back and editing the story must not
+	// release it all again.
+	for _, c := range get(t, "/v1/stories/"+id+"/chapters", alice).expect(http.StatusOK).list() {
+		call(t, "PUT", "/v1/stories/"+id+"/chapters/"+c["id"].(string)+"/publication", alice,
+			map[string]any{"published": false}, ifMatch(int64(c["revision"].(float64)))).expect(http.StatusOK)
+	}
+	publish(manuscript, true)
+	if got := publicTitles(id); len(got) != 0 {
+		t.Errorf("a story edit re-released %v", got)
+	}
+
+	// The author already chose: only that chapter goes out.
+	serial := newStory(t, alice, "Serial")
+	sid := serial["id"].(string)
+	releaseChapter(t, alice, newChapter(t, alice, sid, "Ready", 1))
+	newChapter(t, alice, sid, "Not Ready", 2)
+	publish(serial, true)
+	if got := publicTitles(sid); len(got) != 1 || got[0] != "Ready" {
+		t.Errorf("published serial shows %v, want [Ready]", got)
+	}
 }
 
 func TestChapterNotFoundForUnknownIDs(t *testing.T) {

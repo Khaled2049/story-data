@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func publicStoryPath(id string) string { return "/v1/public/stories/" + id }
@@ -69,12 +70,13 @@ func TestPublicOnlyShowsPublishedStories(t *testing.T) {
 func TestPublicStoryDetailHidesChapterProse(t *testing.T) {
 	reset(t)
 	storyID := newPublishedStory(t, alice, "With Chapters")["id"].(string)
-	chapterID := newChapter(t, alice, storyID, "The Opening", 1)["id"].(string)
+	chapterID := newReleasedChapter(t, alice, storyID, "The Opening", 1)["id"].(string)
 
 	detail := get(t, publicStoryPath(storyID), "").expect(http.StatusOK).json()
 	chapters := detail["chapters"].([]any)
-	if len(chapters) != 2 {
-		t.Fatalf("expected the auto-created chapter plus one, got %d", len(chapters))
+	// The auto-created chapter is an empty draft, so only the released one shows.
+	if len(chapters) != 1 {
+		t.Fatalf("expected only the released chapter, got %d", len(chapters))
 	}
 	// The detail view is a table of contents: titles and word counts, no prose.
 	for _, raw := range chapters {
@@ -96,7 +98,7 @@ func TestPublicStoryDetailHidesChapterProse(t *testing.T) {
 
 	// A chapter of an unpublished story is not readable either.
 	draft := newStory(t, alice, "Draft")["id"].(string)
-	draftChapter := newChapter(t, alice, draft, "Hidden", 1)["id"].(string)
+	draftChapter := newReleasedChapter(t, alice, draft, "Hidden", 1)["id"].(string)
 	get(t, publicStoryPath(draft)+"/chapters/"+draftChapter, "").
 		expect(http.StatusNotFound)
 }
@@ -118,9 +120,9 @@ func TestPublicStoryCarriesTagsAndSocialCounters(t *testing.T) {
 	if tags := story["tags"].([]any); len(tags) != 1 || tags[0] != "x" {
 		t.Errorf("tags = %v", tags)
 	}
-	// chapterCount counts the auto-created chapter.
-	if story["chapterCount"].(float64) != 1 {
-		t.Errorf("chapterCount = %v", story["chapterCount"])
+	// chapterCount is what a reader can open: the auto-created draft is not in it.
+	if story["chapterCount"].(float64) != 0 {
+		t.Errorf("chapterCount = %v, want 0", story["chapterCount"])
 	}
 	// The owner id is exposed deliberately — it is the link to the author's
 	// public profile — but nothing else about the account is.
@@ -292,6 +294,199 @@ func TestPublicListingFiltersByTagAndAuthor(t *testing.T) {
 	}
 }
 
+func TestPublicListingFiltersByCompletionStatus(t *testing.T) {
+	reset(t)
+	ongoing := newPublishedStory(t, alice, "Still Going")["id"].(string)
+	finished := newPublishedStory(t, alice, "All Done")["id"].(string)
+	call(t, "PUT", "/v1/stories/"+finished+"/reader-update", alice,
+		map[string]any{"completionStatus": "completed"}).expect(http.StatusOK)
+	// A completed draft must not surface through the filter.
+	draft := newStory(t, alice, "Finished Draft")["id"].(string)
+	call(t, "PUT", "/v1/stories/"+draft+"/reader-update", alice,
+		map[string]any{"completionStatus": "completed"}).expect(http.StatusOK)
+
+	for status, want := range map[string]string{"ongoing": ongoing, "completed": finished} {
+		got := pageStories(t, publicPage(t, "?status="+status))
+		if len(got) != 1 || got[0]["id"] != want || got[0]["completionStatus"] != status {
+			t.Errorf("status=%s returned %v", status, got)
+		}
+	}
+	if all := pageStories(t, publicPage(t, "")); len(all) != 2 {
+		t.Errorf("unfiltered listing returned %d stories, want 2", len(all))
+	}
+	// No match is an empty array, never null.
+	raw := get(t, "/v1/public/stories?status=completed&category=nonexistent", "").expect(http.StatusOK)
+	if !strings.Contains(string(raw.Body), `"stories":[]`) {
+		t.Errorf("empty filtered page = %s", raw.Body)
+	}
+	get(t, "/v1/public/stories?status=hiatus", "").expect(http.StatusBadRequest)
+}
+
+func TestPublicStoryCarriesReaderUpdate(t *testing.T) {
+	reset(t)
+	id := newPublishedStory(t, alice, "Serial")["id"].(string)
+	publicStory := func() map[string]any {
+		t.Helper()
+		return get(t, publicStoryPath(id), "").expect(http.StatusOK).json()["story"].(map[string]any)
+	}
+	if got := publicStory(); got["completionStatus"] != "ongoing" {
+		t.Errorf("completionStatus = %v, want ongoing", got["completionStatus"])
+	}
+
+	tomorrow := time.Now().UTC().AddDate(0, 0, 1).Format(time.DateOnly)
+	call(t, "PUT", "/v1/stories/"+id+"/reader-update", alice, map[string]any{
+		"completionStatus": "ongoing", "nextChapterOn": tomorrow, "readerNote": "Back soon.",
+	}).expect(http.StatusOK)
+	got := publicStory()
+	if got["nextChapterOn"] != tomorrow || got["readerNote"] != "Back soon." || got["readerNoteUpdatedAt"] == nil {
+		t.Errorf("public reader update = %v", got)
+	}
+	listed := pageStories(t, publicPage(t, ""))[0]
+	if listed["nextChapterOn"] != tomorrow || listed["readerNote"] != "Back soon." {
+		t.Errorf("listing reader update = %v", listed)
+	}
+
+	// An overdue date reads as an abandoned story, so readers stop seeing it
+	// while the author still does.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE stories SET next_chapter_on = CURRENT_DATE - 3 WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if got := publicStory(); got["nextChapterOn"] != nil || got["readerNote"] != "Back soon." {
+		t.Errorf("overdue date still public: %v", got)
+	}
+	if owner := get(t, "/v1/stories/"+id, alice).expect(http.StatusOK).json(); owner["nextChapterOn"] == nil {
+		t.Error("the author should still see their overdue date")
+	}
+}
+
+func TestDraftChaptersAreHiddenFromEveryoneButTheAuthor(t *testing.T) {
+	reset(t)
+	storyID := newPublishedStory(t, alice, "Serial")["id"].(string)
+	released := newReleasedChapter(t, alice, storyID, "Out Now", 1)["id"].(string)
+	draft := newChapter(t, alice, storyID, "Still Writing", 2)["id"].(string)
+	base := "/v1/stories/" + storyID
+
+	// Anonymous readers.
+	detail := get(t, publicStoryPath(storyID), "").expect(http.StatusOK).json()
+	chapters := detail["chapters"].([]any)
+	if len(chapters) != 1 || chapters[0].(map[string]any)["id"] != released {
+		t.Errorf("public manifest = %v", chapters)
+	}
+	if chapters[0].(map[string]any)["publishedAt"] == nil {
+		t.Error("public chapter carries no publishedAt")
+	}
+	if n := detail["story"].(map[string]any)["chapterCount"].(float64); n != 1 {
+		t.Errorf("public chapterCount = %v, want 1", n)
+	}
+	get(t, publicStoryPath(storyID)+"/chapters/"+released, "").expect(http.StatusOK)
+	get(t, publicStoryPath(storyID)+"/chapters/"+draft, "").expect(http.StatusNotFound)
+
+	// A signed-in reader gets a published story through the authenticated
+	// routes too, and must not find the draft there either.
+	for _, path := range []string{base + "/chapters", base + "/chapters?content=false"} {
+		list := get(t, path, bob).expect(http.StatusOK).list()
+		if len(list) != 1 || list[0]["id"] != released {
+			t.Errorf("%s as a non-owner = %v", path, list)
+		}
+		if mine := get(t, path, alice).expect(http.StatusOK).list(); len(mine) != 3 {
+			t.Errorf("%s as the author returned %d chapters, want 3", path, len(mine))
+		}
+	}
+	get(t, base+"/chapters/"+released, bob).expect(http.StatusOK)
+	get(t, base+"/chapters/"+draft, bob).expect(http.StatusNotFound)
+	get(t, base+"/chapters/"+draft, alice).expect(http.StatusOK)
+	if body := string(get(t, base+"/context", bob).expect(http.StatusOK).Body); strings.Contains(body, "Still Writing") {
+		t.Error("story context leaked a draft chapter to a non-owner")
+	}
+
+	// Progress cannot be saved against a draft.
+	call(t, "PUT", progressPath(storyID), bob, map[string]any{
+		"chapterId": draft, "scrollPercent": 0.5,
+	}).expect(http.StatusNotFound)
+}
+
+func TestPullingAChapterBackResetsReadersOnIt(t *testing.T) {
+	reset(t)
+	storyID := newPublishedStory(t, alice, "Serial")["id"].(string)
+	chapter := newReleasedChapter(t, alice, storyID, "Out Now", 1)
+	id := chapter["id"].(string)
+	call(t, "PUT", progressPath(storyID), bob, map[string]any{
+		"chapterId": id, "scrollPercent": 0.5,
+	}).expect(http.StatusOK)
+
+	call(t, "PUT", "/v1/stories/"+storyID+"/chapters/"+id+"/publication", alice,
+		map[string]any{"published": false}, ifMatch(int64(chapter["revision"].(float64)))).expect(http.StatusOK)
+
+	// The reader starts over rather than resuming on a chapter they cannot open.
+	progress := get(t, progressPath(storyID), bob).expect(http.StatusOK).json()
+	if progress["chapterId"] != nil || progress["scrollPercent"].(float64) != 0 {
+		t.Errorf("progress on a pulled-back chapter = %v", progress)
+	}
+	if history := get(t, "/v1/me/reading-history", bob).expect(http.StatusOK).list(); len(history) != 0 {
+		t.Errorf("history still lists %v", history)
+	}
+	get(t, publicStoryPath(storyID)+"/chapters/"+id, "").expect(http.StatusNotFound)
+}
+
+func TestDiscoveryOrderIgnoresDraftWork(t *testing.T) {
+	reset(t)
+	older := newPublishedStory(t, alice, "Older")["id"].(string)
+	newer := newPublishedStory(t, alice, "Newer")["id"].(string)
+	first := func() string {
+		t.Helper()
+		return pageStories(t, publicPage(t, ""))[0]["id"].(string)
+	}
+	sitemapFirst := func() string {
+		t.Helper()
+		return get(t, "/v1/public/sitemap", "").expect(http.StatusOK).json()["stories"].([]any)[0].(map[string]any)["id"].(string)
+	}
+	publicUpdatedAt := func() any {
+		t.Helper()
+		return get(t, publicStoryPath(older), "").expect(http.StatusOK).json()["story"].(map[string]any)["updatedAt"]
+	}
+	before := publicUpdatedAt()
+
+	// Writing and saving a draft is private: discovery does not move.
+	draft := newChapter(t, alice, older, "Draft", 1)
+	draft = call(t, "PATCH", "/v1/stories/"+older+"/chapters/"+draft["id"].(string), alice,
+		map[string]any{"title": "Draft", "content": "<p>more words</p>", "position": 1},
+		ifMatch(int64(draft["revision"].(float64)))).expect(http.StatusOK).json()
+	if first() != newer || sitemapFirst() != newer || publicUpdatedAt() != before {
+		t.Error("a draft save moved the story in discovery")
+	}
+	// The author's own shelf does follow their latest work.
+	shelf := call(t, "GET", "/v1/stories?limit=10", alice, nil).expect(http.StatusOK).json()
+	if got := shelf["stories"].([]any)[0].(map[string]any)["id"]; got != older {
+		t.Errorf("owner shelf leads with %v, want the story just edited", got)
+	}
+
+	// Releasing it is news.
+	draft = releaseChapter(t, alice, draft)
+	if first() != older || sitemapFirst() != older {
+		t.Error("releasing a chapter did not move the story up")
+	}
+
+	// So is an edit to text readers can already see.
+	newReleasedChapter(t, alice, newer, "Out", 1)
+	if first() != newer {
+		t.Fatal("setup: the other story should lead again")
+	}
+	call(t, "PATCH", "/v1/stories/"+older+"/chapters/"+draft["id"].(string), alice,
+		map[string]any{"title": "Draft", "content": "<p>revised</p>", "position": 1},
+		ifMatch(int64(draft["revision"].(float64)))).expect(http.StatusOK)
+	if first() != older {
+		t.Error("editing a released chapter did not move the story up")
+	}
+
+	// Paging still covers every story exactly once on the new ordering.
+	page := publicPage(t, "?limit=1")
+	second := pageStories(t, publicPage(t, "?limit=1&cursor="+page["nextCursor"].(string)))
+	if len(second) != 1 || second[0]["id"] != newer {
+		t.Errorf("second page = %v, want the other story", second)
+	}
+}
+
 func TestPublicSitemapListsOnlyPublishedStories(t *testing.T) {
 	reset(t)
 	first := newPublishedStory(t, alice, "First Out")["id"].(string)
@@ -415,7 +610,7 @@ func TestPublicStoryShowsTheAuthorsCurrentUsername(t *testing.T) {
 func TestPublicReadsAreCacheableOnlyBySharedCaches(t *testing.T) {
 	reset(t)
 	id := newPublishedStory(t, alice, "Cached Somewhere")["id"].(string)
-	chapterID := newChapter(t, alice, id, "Chapter One", 1)["id"].(string)
+	chapterID := newReleasedChapter(t, alice, id, "Chapter One", 1)["id"].(string)
 
 	listCache := "public, max-age=0, s-maxage=30, stale-while-revalidate=300"
 	detailCache := "public, max-age=0, s-maxage=30"
@@ -448,7 +643,7 @@ func TestPublicReadsAreCacheableOnlyBySharedCaches(t *testing.T) {
 func TestPublicChapterRevalidatesWithETag(t *testing.T) {
 	reset(t)
 	id := newPublishedStory(t, alice, "Revalidated")["id"].(string)
-	chapter := newChapter(t, alice, id, "Chapter One", 1)
+	chapter := newReleasedChapter(t, alice, id, "Chapter One", 1)
 	path := publicStoryPath(id) + "/chapters/" + chapter["id"].(string)
 
 	first := get(t, path, "").expect(http.StatusOK)

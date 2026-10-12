@@ -37,8 +37,8 @@ func seedCatalog(t *testing.T, title string, chapters int) (string, []string, in
 	for i := range chapters {
 		id := uuid.NewString()
 		if _, err := testPool.Exec(ctx,
-			`INSERT INTO chapters (id, story_id, title, content, position, word_count)
-			 VALUES ($1,$2,'Chapter','x',$3,100)`, id, storyID, i+1); err != nil {
+			`INSERT INTO chapters (id, story_id, title, content, position, word_count, published_at)
+			 VALUES ($1,$2,'Chapter','x',$3,100,now())`, id, storyID, i+1); err != nil {
 			t.Fatalf("seed chapter: %v", err)
 		}
 		chapterIDs = append(chapterIDs, id)
@@ -116,6 +116,25 @@ func TestSyncDerivesLikesRatingsAndProgress(t *testing.T) {
 	}
 	if _, _, ok := interactionRow(t, "reader-a", itemID, "completion"); ok {
 		t.Fatal("mid-book progress must not derive a completion")
+	}
+}
+
+func TestCompletionIgnoresDraftChapters(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	storyID, chapterIDs, itemID := seedCatalog(t, "Unfinished Business", 3)
+	// The third chapter is still a draft, so the second is the last a reader can reach.
+	if _, err := testPool.Exec(ctx, `UPDATE chapters SET published_at=NULL WHERE id=$1`, chapterIDs[2]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO reading_progress (user_id, story_id, chapter_id, scroll_percent)
+		 VALUES ('caught-up',$1,$2,0.95)`, storyID, chapterIDs[1]); err != nil {
+		t.Fatal(err)
+	}
+	syncSignals(t)
+	if _, _, ok := interactionRow(t, "caught-up", itemID, "completion"); !ok {
+		t.Error("a reader who finished every released chapter has no completion signal")
 	}
 }
 
