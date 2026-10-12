@@ -231,6 +231,32 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 		s.chapter(w, r, uid, p[0], p[2])
 		return
 	}
+	if len(p) == 4 && p[1] == "chapters" && p[3] == "publication" {
+		if !uuidPath(w, p[2]) {
+			return
+		}
+		if r.Method != http.MethodPut {
+			method(w)
+			return
+		}
+		rev, ok := revision(w, r)
+		if !ok {
+			return
+		}
+		var in struct {
+			Published *bool `json:"published"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		if in.Published == nil {
+			writeError(w, http.StatusBadRequest, "published is required")
+			return
+		}
+		x, e := s.store.SetChapterPublication(r.Context(), p[0], p[2], uid, rev, *in.Published)
+		respond(w, x, e)
+		return
+	}
 	if len(p) == 4 && p[1] == "chapters" && p[3] == "summary" && r.Method == http.MethodPut {
 		if !uuidPath(w, p[2]) {
 			return

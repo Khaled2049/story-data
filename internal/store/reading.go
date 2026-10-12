@@ -40,7 +40,9 @@ func (s *Store) GetReadingProgress(ctx context.Context, userID, storyID string) 
 	}
 	var x ReadingProgress
 	var chapterID uuid.UUID
-	err := s.db.QueryRow(ctx, `SELECT story_id, chapter_id, scroll_percent, last_read_at FROM reading_progress WHERE user_id=$1 AND story_id=$2`, userID, storyID).Scan(&x.StoryID, &chapterID, &x.ScrollPercent, &x.LastReadAt)
+	err := s.db.QueryRow(ctx, `SELECT rp.story_id, rp.chapter_id, rp.scroll_percent, rp.last_read_at FROM reading_progress rp JOIN chapters c ON c.id=rp.chapter_id AND c.published_at IS NOT NULL WHERE rp.user_id=$1 AND rp.story_id=$2`, userID, storyID).Scan(&x.StoryID, &chapterID, &x.ScrollPercent, &x.LastReadAt)
+	// No row also covers a saved chapter the author has since pulled back to
+	// draft: the reader starts over rather than resuming somewhere unreadable.
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ReadingProgress{StoryID: storyID, ScrollPercent: 0}, nil
 	}
@@ -60,7 +62,7 @@ func (s *Store) PutReadingProgress(ctx context.Context, userID, storyID string, 
 	var storedChapterID uuid.UUID
 	err = s.db.QueryRow(ctx, `INSERT INTO reading_progress (user_id, story_id, chapter_id, scroll_percent, last_read_at)
 SELECT $1, c.story_id, c.id, $3, now() FROM chapters c JOIN stories st ON st.id=c.story_id
-WHERE c.story_id=$2 AND c.id=$4 AND st.is_published
+WHERE c.story_id=$2 AND c.id=$4 AND st.is_published AND c.published_at IS NOT NULL
 ON CONFLICT (user_id, story_id) DO UPDATE SET chapter_id=EXCLUDED.chapter_id, scroll_percent=EXCLUDED.scroll_percent, last_read_at=EXCLUDED.last_read_at
 RETURNING story_id, chapter_id, scroll_percent, last_read_at`, userID, storyID, in.ScrollPercent, chapterID).Scan(&x.StoryID, &storedChapterID, &x.ScrollPercent, &x.LastReadAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -78,12 +80,12 @@ func (s *Store) ListReadingHistory(ctx context.Context, userID string, limit int
 		limit = maxReadingHistoryLimit
 	}
 	rows, err := s.db.Query(ctx, `SELECT rp.story_id, rp.chapter_id, rp.scroll_percent, rp.last_read_at,
-  (SELECT count(*) FROM chapters earlier WHERE earlier.story_id=st.id AND earlier.position < saved_ch.position),
+  (SELECT count(*) FROM chapters earlier WHERE earlier.story_id=st.id AND earlier.published_at IS NOT NULL AND earlier.position < saved_ch.position),
   st.title, COALESCE(pp.username, st.author_name), COALESCE(st.cover_image_url,''), COALESCE(st.thumbnail_url,''), COUNT(c.id)
 FROM reading_progress rp
 JOIN stories st ON st.id=rp.story_id AND st.is_published
-JOIN chapters saved_ch ON saved_ch.id=rp.chapter_id
-JOIN chapters c ON c.story_id=st.id
+JOIN chapters saved_ch ON saved_ch.id=rp.chapter_id AND saved_ch.published_at IS NOT NULL
+JOIN chapters c ON c.story_id=st.id AND c.published_at IS NOT NULL
 LEFT JOIN public_profiles pp ON pp.user_id=st.owner_id
 WHERE rp.user_id=$1
 GROUP BY rp.user_id, rp.story_id, rp.chapter_id, rp.scroll_percent, rp.last_read_at, st.id, pp.username, saved_ch.position

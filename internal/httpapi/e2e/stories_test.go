@@ -589,6 +589,128 @@ func TestChapterWordLimit(t *testing.T) {
 	}).expect(http.StatusUnprocessableEntity)
 }
 
+func TestChapterPublication(t *testing.T) {
+	reset(t)
+	storyID := newStory(t, alice, "Serial")["id"].(string)
+	chapter := newChapter(t, alice, storyID, "One", 1)
+	if chapter["publishedAt"] != nil {
+		t.Fatalf("a new chapter should be a draft, publishedAt = %v", chapter["publishedAt"])
+	}
+	id := chapter["id"].(string)
+	rev := int64(chapter["revision"].(float64))
+	path := "/v1/stories/" + storyID + "/chapters/" + id + "/publication"
+	release, pull := map[string]any{"published": true}, map[string]any{"published": false}
+
+	call(t, "PUT", path, alice, release).expect(http.StatusPreconditionRequired)
+	call(t, "PUT", path, alice, release, ifMatch(rev+1)).expect(http.StatusConflict)
+	call(t, "PUT", path, alice, map[string]any{}, ifMatch(rev)).expect(http.StatusBadRequest)
+	call(t, "PUT", path, bob, release, ifMatch(rev)).expect(http.StatusForbidden)
+	call(t, "POST", path, alice, release, ifMatch(rev)).expect(http.StatusMethodNotAllowed)
+	call(t, "PUT", "/v1/stories/"+storyID+"/chapters/00000000-0000-4000-8000-000000000000/publication",
+		alice, release, ifMatch(rev)).expect(http.StatusNotFound)
+
+	released := call(t, "PUT", path, alice, release, ifMatch(rev)).expect(http.StatusOK).json()
+	if released["publishedAt"] == nil {
+		t.Fatal("released chapter has no publishedAt")
+	}
+	// The text did not change, so neither does the revision an open editor holds.
+	if int64(released["revision"].(float64)) != rev {
+		t.Errorf("release moved the revision: %d -> %v", rev, released["revision"])
+	}
+	again := call(t, "PUT", path, alice, release, ifMatch(rev)).expect(http.StatusOK).json()
+	if again["publishedAt"] != released["publishedAt"] {
+		t.Errorf("releasing twice moved publishedAt: %v -> %v", released["publishedAt"], again["publishedAt"])
+	}
+	if got := get(t, "/v1/stories/"+storyID+"/chapters/"+id, alice).expect(http.StatusOK).json(); got["publishedAt"] != released["publishedAt"] {
+		t.Errorf("chapter read publishedAt = %v", got["publishedAt"])
+	}
+
+	pulled := call(t, "PUT", path, alice, pull, ifMatch(rev)).expect(http.StatusOK).json()
+	if pulled["publishedAt"] != nil {
+		t.Errorf("pulled-back chapter kept publishedAt = %v", pulled["publishedAt"])
+	}
+
+	// An empty chapter has nothing to release.
+	empty := call(t, "POST", "/v1/stories/"+storyID+"/chapters", alice, map[string]any{
+		"title": "Blank", "content": "", "position": 2,
+	}).expect(http.StatusCreated).json()
+	res := call(t, "PUT", "/v1/stories/"+storyID+"/chapters/"+empty["id"].(string)+"/publication",
+		alice, release, ifMatch(int64(empty["revision"].(float64)))).expect(http.StatusUnprocessableEntity)
+	if !strings.Contains(string(res.Body), "write something") {
+		t.Errorf("empty-chapter refusal = %s", res.Body)
+	}
+}
+
+func TestChapterReleaseSpendsTheNextChapterDate(t *testing.T) {
+	reset(t)
+	storyID := newPublishedStory(t, alice, "Serial")["id"].(string)
+	nextWeek := time.Now().UTC().AddDate(0, 0, 7).Format(time.DateOnly)
+	call(t, "PUT", "/v1/stories/"+storyID+"/reader-update", alice, map[string]any{
+		"completionStatus": "ongoing", "nextChapterOn": nextWeek, "readerNote": "Fridays.",
+	}).expect(http.StatusOK)
+
+	// A draft is not the promised chapter yet.
+	chapter := newChapter(t, alice, storyID, "Two", 1)
+	if got := get(t, "/v1/stories/"+storyID, alice).expect(http.StatusOK).json(); got["nextChapterOn"] != nextWeek {
+		t.Fatalf("a draft cleared nextChapterOn: %v", got["nextChapterOn"])
+	}
+	releaseChapter(t, alice, chapter)
+	got := get(t, "/v1/stories/"+storyID, alice).expect(http.StatusOK).json()
+	if got["nextChapterOn"] != nil || got["readerNote"] != "Fridays." {
+		t.Errorf("after a release: nextChapterOn = %v, readerNote = %v", got["nextChapterOn"], got["readerNote"])
+	}
+}
+
+func TestPublishingAStoryReleasesItsWrittenChapters(t *testing.T) {
+	reset(t)
+	publish := func(story map[string]any, published bool) map[string]any {
+		t.Helper()
+		current := get(t, "/v1/stories/"+story["id"].(string), alice).expect(http.StatusOK).json()
+		return call(t, "PATCH", "/v1/stories/"+story["id"].(string), alice, map[string]any{
+			"title": story["title"], "description": "d", "authorName": "a", "tags": []string{"x"}, "published": published,
+		}, ifMatch(int64(current["revision"].(float64)))).expect(http.StatusOK).json()
+	}
+	publicTitles := func(storyID string) []string {
+		t.Helper()
+		titles := []string{}
+		for _, c := range get(t, publicStoryPath(storyID), "").expect(http.StatusOK).json()["chapters"].([]any) {
+			titles = append(titles, c.(map[string]any)["title"].(string))
+		}
+		return titles
+	}
+
+	// Nothing chosen: every chapter with text goes out, the empty one does not.
+	manuscript := newStory(t, alice, "Manuscript")
+	id := manuscript["id"].(string)
+	newChapter(t, alice, id, "One", 1)
+	newChapter(t, alice, id, "Two", 2)
+	publish(manuscript, true)
+	if got := publicTitles(id); len(got) != 2 || got[0] != "One" || got[1] != "Two" {
+		t.Errorf("published manuscript shows %v, want [One Two]", got)
+	}
+
+	// It happens once. Pulling everything back and editing the story must not
+	// release it all again.
+	for _, c := range get(t, "/v1/stories/"+id+"/chapters", alice).expect(http.StatusOK).list() {
+		call(t, "PUT", "/v1/stories/"+id+"/chapters/"+c["id"].(string)+"/publication", alice,
+			map[string]any{"published": false}, ifMatch(int64(c["revision"].(float64)))).expect(http.StatusOK)
+	}
+	publish(manuscript, true)
+	if got := publicTitles(id); len(got) != 0 {
+		t.Errorf("a story edit re-released %v", got)
+	}
+
+	// The author already chose: only that chapter goes out.
+	serial := newStory(t, alice, "Serial")
+	sid := serial["id"].(string)
+	releaseChapter(t, alice, newChapter(t, alice, sid, "Ready", 1))
+	newChapter(t, alice, sid, "Not Ready", 2)
+	publish(serial, true)
+	if got := publicTitles(sid); len(got) != 1 || got[0] != "Ready" {
+		t.Errorf("published serial shows %v, want [Ready]", got)
+	}
+}
+
 func TestChapterNotFoundForUnknownIDs(t *testing.T) {
 	reset(t)
 	story := newStory(t, alice, "Real")

@@ -37,10 +37,10 @@ func ValidCompletionStatus(v string) bool {
 	return v == CompletionOngoing || v == CompletionCompleted
 }
 
-// PutReaderUpdate deliberately leaves revision and updated_at alone. Discovery
-// orders by updated_at and the recommendations ingest re-reads on it, so a
-// note edit must not look like new writing; and with no revision bump it
-// cannot invalidate a story edit the author has open elsewhere.
+// PutReaderUpdate deliberately leaves revision and updated_at alone: with no
+// revision bump it cannot invalidate a story edit the author has open
+// elsewhere. Only a change of status moves public_updated_at, so finishing a
+// story resurfaces it in discovery and editing a note does not.
 func (s *Store) PutReaderUpdate(ctx context.Context, id, owner string, in ReaderUpdateInput) (Story, error) {
 	note := strings.TrimSpace(in.ReaderNote)
 	if !ValidCompletionStatus(in.CompletionStatus) || !validText(note, maxReaderNoteChars) {
@@ -57,7 +57,8 @@ func (s *Store) PutReaderUpdate(ctx context.Context, id, owner string, in Reader
 	}
 	row := s.db.QueryRow(ctx, `UPDATE stories SET completion_status=$1, next_chapter_on=$2::date,
   reader_note_updated_at=CASE WHEN $3='' THEN NULL WHEN reader_note IS DISTINCT FROM $3 THEN now() ELSE reader_note_updated_at END,
-  reader_note=$3
+  reader_note=$3,
+  public_updated_at=CASE WHEN completion_status IS DISTINCT FROM $1 THEN now() ELSE public_updated_at END
 WHERE id=$4 AND owner_id=$5
 RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), paragraph_style, revision, created_at, updated_at`+readerUpdateColumns,
 		in.CompletionStatus, nextOn, note, id, owner)

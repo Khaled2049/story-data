@@ -136,7 +136,9 @@ type Chapter struct {
 	Revision  int64     `json:"revision"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
-	Summary   string    `json:"summary,omitempty"`
+	// Nil while the chapter is a draft only its author can read.
+	PublishedAt *time.Time `json:"publishedAt,omitempty"`
+	Summary     string     `json:"summary,omitempty"`
 }
 type ChapterSummaryInput struct {
 	Summary string `json:"summary"`
@@ -398,7 +400,12 @@ func (s *Store) UpdateStory(ctx context.Context, id, owner string, rev int64, in
 		return Story{}, err
 	}
 	defer tx.Rollback(ctx)
-	row := tx.QueryRow(ctx, `UPDATE stories SET title=$1, description=$2, author_name=$3, is_published=$4, category=$5, target_audience=$6, language=$7, copyright=$8, cover_image_url=$9, thumbnail_url=$10, paragraph_style=COALESCE(NULLIF($14,''),paragraph_style), revision=revision+1, updated_at=now() WHERE id=$11 AND owner_id=$12 AND revision=$13 RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), paragraph_style, revision, created_at, updated_at`+readerUpdateColumns, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL), id, owner, rev, in.ParagraphStyle)
+	// A missing or foreign story leaves this false and is classified by the UPDATE.
+	var wasPublished bool
+	if err = tx.QueryRow(ctx, `SELECT is_published FROM stories WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, owner).Scan(&wasPublished); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Story{}, err
+	}
+	row := tx.QueryRow(ctx, `UPDATE stories SET title=$1, description=$2, author_name=$3, is_published=$4, category=$5, target_audience=$6, language=$7, copyright=$8, cover_image_url=$9, thumbnail_url=$10, paragraph_style=COALESCE(NULLIF($14,''),paragraph_style), revision=revision+1, updated_at=now(), public_updated_at=now() WHERE id=$11 AND owner_id=$12 AND revision=$13 RETURNING id, owner_id, title, description, author_name, is_published, COALESCE(category,''), COALESCE(target_audience,''), COALESCE(language,''), COALESCE(copyright,''), COALESCE(cover_image_url,''), COALESCE(thumbnail_url,''), paragraph_style, revision, created_at, updated_at`+readerUpdateColumns, in.Title, in.Description, in.AuthorName, in.Published, emptyToNull(in.Category), emptyToNull(in.TargetAudience), emptyToNull(in.Language), emptyToNull(in.Copyright), emptyToNull(in.CoverImageURL), emptyToNull(in.ThumbnailURL), id, owner, rev, in.ParagraphStyle)
 	story, err := scanStory(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Story{}, s.classifyWrite(ctx, "stories", id, owner)
@@ -410,6 +417,11 @@ func (s *Store) UpdateStory(ctx context.Context, id, owner string, rev int64, in
 		return Story{}, err
 	}
 	story.Tags = in.Tags
+	if in.Published && !wasPublished {
+		if err = releaseWrittenChapters(ctx, tx, id); err != nil {
+			return Story{}, err
+		}
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return Story{}, err
 	}
@@ -441,10 +453,11 @@ func (s *Store) DeleteStory(ctx context.Context, id, owner string, rev int64) er
 }
 
 func (s *Store) ListChapters(ctx context.Context, storyID, caller string) ([]Chapter, error) {
-	if _, err := s.GetStory(ctx, storyID, caller); err != nil {
+	story, err := s.GetStory(ctx, storyID, caller)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, story_id, title, content, position, word_count, revision, created_at, updated_at FROM chapters WHERE story_id=$1 ORDER BY position`, storyID)
+	rows, err := s.db.Query(ctx, `SELECT id, story_id, title, content, position, word_count, revision, created_at, updated_at, published_at FROM chapters WHERE story_id=$1`+draftFilter(story, caller)+` ORDER BY position`, storyID)
 	if err != nil {
 		return nil, err
 	}
@@ -456,10 +469,11 @@ func (s *Store) ListChapters(ctx context.Context, storyID, caller string) ([]Cha
 // only need the running order. Listing a 50-chapter book to read its titles
 // otherwise transfers every word of it.
 func (s *Store) ListChapterIndex(ctx context.Context, storyID, caller string) ([]Chapter, error) {
-	if _, err := s.GetStory(ctx, storyID, caller); err != nil {
+	story, err := s.GetStory(ctx, storyID, caller)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(ctx, `SELECT id, story_id, title, '' AS content, position, word_count, revision, created_at, updated_at FROM chapters WHERE story_id=$1 ORDER BY position`, storyID)
+	rows, err := s.db.Query(ctx, `SELECT id, story_id, title, '' AS content, position, word_count, revision, created_at, updated_at, published_at FROM chapters WHERE story_id=$1`+draftFilter(story, caller)+` ORDER BY position`, storyID)
 	if err != nil {
 		return nil, err
 	}
@@ -467,10 +481,11 @@ func (s *Store) ListChapterIndex(ctx context.Context, storyID, caller string) ([
 	return collectChapters(rows)
 }
 func (s *Store) GetChapter(ctx context.Context, storyID, id, caller string) (Chapter, error) {
-	if _, err := s.GetStory(ctx, storyID, caller); err != nil {
+	story, err := s.GetStory(ctx, storyID, caller)
+	if err != nil {
 		return Chapter{}, err
 	}
-	row := s.db.QueryRow(ctx, `SELECT c.id,c.story_id,c.title,c.content,c.position,c.word_count,c.revision,c.created_at,c.updated_at,COALESCE(cs.summary,'') FROM chapters c LEFT JOIN chapter_summaries cs ON cs.chapter_id=c.id WHERE c.story_id=$1 AND c.id=$2`, storyID, id)
+	row := s.db.QueryRow(ctx, `SELECT c.id,c.story_id,c.title,c.content,c.position,c.word_count,c.revision,c.created_at,c.updated_at,c.published_at,COALESCE(cs.summary,'') FROM chapters c LEFT JOIN chapter_summaries cs ON cs.chapter_id=c.id WHERE c.story_id=$1 AND c.id=$2`+draftFilter(story, caller), storyID, id)
 	chapter, err := scanChapterWithSummary(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Chapter{}, ErrNotFound
@@ -528,7 +543,7 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 	if count >= chapterLimit {
 		return Chapter{}, limitErrf("this story has reached the limit of %d chapters", chapterLimit)
 	}
-	row := tx.QueryRow(ctx, `INSERT INTO chapters (id, story_id, title, content, position, word_count) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, story_id, title, content, position, word_count, revision, created_at, updated_at`, id, storyID, in.Title, in.Content, in.Position, words)
+	row := tx.QueryRow(ctx, `INSERT INTO chapters (id, story_id, title, content, position, word_count) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, story_id, title, content, position, word_count, revision, created_at, updated_at, published_at`, id, storyID, in.Title, in.Content, in.Position, words)
 	chapter, err := scanChapter(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -541,7 +556,8 @@ func (s *Store) CreateChapter(ctx context.Context, storyID, owner string, in Cha
 	if err != nil {
 		return Chapter{}, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE stories SET updated_at=now() WHERE id=$1`, storyID); err != nil {
+	// A new chapter is a draft, so readers have nothing new to see yet.
+	if err = touchStory(ctx, tx, storyID, false); err != nil {
 		return Chapter{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -562,7 +578,7 @@ func (s *Store) UpdateChapter(ctx context.Context, storyID, id, owner string, re
 	if err = lockOwnedStory(ctx, tx, storyID, owner); err != nil {
 		return Chapter{}, err
 	}
-	row := tx.QueryRow(ctx, `UPDATE chapters c SET title=$1, content=$2, position=$3, word_count=$4, revision=c.revision+1, updated_at=now() FROM stories s WHERE c.id=$5 AND c.story_id=$6 AND c.story_id=s.id AND s.owner_id=$7 AND c.revision=$8 RETURNING c.id, c.story_id, c.title, c.content, c.position, c.word_count, c.revision, c.created_at, c.updated_at`, in.Title, in.Content, in.Position, wordCount(in.Content), id, storyID, owner, rev)
+	row := tx.QueryRow(ctx, `UPDATE chapters c SET title=$1, content=$2, position=$3, word_count=$4, revision=c.revision+1, updated_at=now() FROM stories s WHERE c.id=$5 AND c.story_id=$6 AND c.story_id=s.id AND s.owner_id=$7 AND c.revision=$8 RETURNING c.id, c.story_id, c.title, c.content, c.position, c.word_count, c.revision, c.created_at, c.updated_at, c.published_at`, in.Title, in.Content, in.Position, wordCount(in.Content), id, storyID, owner, rev)
 	chapter, err := scanChapter(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Chapter{}, s.classifyChapterWrite(ctx, storyID, id, owner)
@@ -574,7 +590,7 @@ func (s *Store) UpdateChapter(ctx context.Context, storyID, id, owner string, re
 	if err != nil {
 		return Chapter{}, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE stories SET updated_at=now() WHERE id=$1`, storyID); err != nil {
+	if err = touchStory(ctx, tx, storyID, chapter.PublishedAt != nil); err != nil {
 		return Chapter{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -592,9 +608,10 @@ func (s *Store) DeleteChapter(ctx context.Context, storyID, id, owner string, re
 	if err = lockOwnedStory(ctx, tx, storyID, owner); err != nil {
 		return err
 	}
-	row := tx.QueryRow(ctx, `DELETE FROM chapters c USING stories s WHERE c.id=$1 AND c.story_id=$2 AND c.story_id=s.id AND s.owner_id=$3 AND c.revision=$4 RETURNING c.id`, id, storyID, owner, rev)
+	row := tx.QueryRow(ctx, `DELETE FROM chapters c USING stories s WHERE c.id=$1 AND c.story_id=$2 AND c.story_id=s.id AND s.owner_id=$3 AND c.revision=$4 RETURNING c.id, c.published_at`, id, storyID, owner, rev)
 	var deleted string
-	if err := row.Scan(&deleted); errors.Is(err, pgx.ErrNoRows) {
+	var wasPublished *time.Time
+	if err := row.Scan(&deleted, &wasPublished); errors.Is(err, pgx.ErrNoRows) {
 		return s.classifyChapterWrite(ctx, storyID, id, owner)
 	} else if err != nil {
 		return err
@@ -603,10 +620,27 @@ func (s *Store) DeleteChapter(ctx context.Context, storyID, id, owner string, re
 	if err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE stories SET updated_at=now() WHERE id=$1`, storyID); err != nil {
+	if err = touchStory(ctx, tx, storyID, wasPublished != nil); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// touchStory records a chapter write on its story. updated_at always moves;
+// public_updated_at, which orders discovery, only when readers can see the change.
+func touchStory(ctx context.Context, tx pgx.Tx, storyID string, readerVisible bool) error {
+	_, err := tx.Exec(ctx, `UPDATE stories SET updated_at=now(), public_updated_at=CASE WHEN $2::boolean THEN now() ELSE public_updated_at END WHERE id=$1`, storyID, readerVisible)
+	return err
+}
+
+// draftFilter hides unreleased chapters from everyone but the story's owner.
+// GetStory lets any caller through for a published story, so each chapter read
+// has to apply this itself.
+func draftFilter(story Story, caller string) string {
+	if story.OwnerID == caller {
+		return ""
+	}
+	return " AND published_at IS NOT NULL"
 }
 
 // lockOwnedStory is the common first lock for chapter mutations. Besides
@@ -694,7 +728,7 @@ func replaceTags(ctx context.Context, tx pgx.Tx, storyID uuid.UUID, tags []strin
 func scanChapter(row pgx.Row) (Chapter, error) {
 	var x Chapter
 	var id, sid uuid.UUID
-	err := row.Scan(&id, &sid, &x.Title, &x.Content, &x.Position, &x.WordCount, &x.Revision, &x.CreatedAt, &x.UpdatedAt)
+	err := row.Scan(&id, &sid, &x.Title, &x.Content, &x.Position, &x.WordCount, &x.Revision, &x.CreatedAt, &x.UpdatedAt, &x.PublishedAt)
 	x.ID = id.String()
 	x.StoryID = sid.String()
 	return x, err
@@ -702,7 +736,7 @@ func scanChapter(row pgx.Row) (Chapter, error) {
 func scanChapterWithSummary(row pgx.Row) (Chapter, error) {
 	var x Chapter
 	var id, sid uuid.UUID
-	err := row.Scan(&id, &sid, &x.Title, &x.Content, &x.Position, &x.WordCount, &x.Revision, &x.CreatedAt, &x.UpdatedAt, &x.Summary)
+	err := row.Scan(&id, &sid, &x.Title, &x.Content, &x.Position, &x.WordCount, &x.Revision, &x.CreatedAt, &x.UpdatedAt, &x.PublishedAt, &x.Summary)
 	x.ID = id.String()
 	x.StoryID = sid.String()
 	return x, err
