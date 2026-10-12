@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func publicStoryPath(id string) string { return "/v1/public/stories/" + id }
@@ -289,6 +290,72 @@ func TestPublicListingFiltersByTagAndAuthor(t *testing.T) {
 	}
 	if none := pageStories(t, publicPage(t, "?author=nobody")); len(none) != 0 {
 		t.Errorf("an unknown author returned stories: %v", none)
+	}
+}
+
+func TestPublicListingFiltersByCompletionStatus(t *testing.T) {
+	reset(t)
+	ongoing := newPublishedStory(t, alice, "Still Going")["id"].(string)
+	finished := newPublishedStory(t, alice, "All Done")["id"].(string)
+	call(t, "PUT", "/v1/stories/"+finished+"/reader-update", alice,
+		map[string]any{"completionStatus": "completed"}).expect(http.StatusOK)
+	// A completed draft must not surface through the filter.
+	draft := newStory(t, alice, "Finished Draft")["id"].(string)
+	call(t, "PUT", "/v1/stories/"+draft+"/reader-update", alice,
+		map[string]any{"completionStatus": "completed"}).expect(http.StatusOK)
+
+	for status, want := range map[string]string{"ongoing": ongoing, "completed": finished} {
+		got := pageStories(t, publicPage(t, "?status="+status))
+		if len(got) != 1 || got[0]["id"] != want || got[0]["completionStatus"] != status {
+			t.Errorf("status=%s returned %v", status, got)
+		}
+	}
+	if all := pageStories(t, publicPage(t, "")); len(all) != 2 {
+		t.Errorf("unfiltered listing returned %d stories, want 2", len(all))
+	}
+	// No match is an empty array, never null.
+	raw := get(t, "/v1/public/stories?status=completed&category=nonexistent", "").expect(http.StatusOK)
+	if !strings.Contains(string(raw.Body), `"stories":[]`) {
+		t.Errorf("empty filtered page = %s", raw.Body)
+	}
+	get(t, "/v1/public/stories?status=hiatus", "").expect(http.StatusBadRequest)
+}
+
+func TestPublicStoryCarriesReaderUpdate(t *testing.T) {
+	reset(t)
+	id := newPublishedStory(t, alice, "Serial")["id"].(string)
+	publicStory := func() map[string]any {
+		t.Helper()
+		return get(t, publicStoryPath(id), "").expect(http.StatusOK).json()["story"].(map[string]any)
+	}
+	if got := publicStory(); got["completionStatus"] != "ongoing" {
+		t.Errorf("completionStatus = %v, want ongoing", got["completionStatus"])
+	}
+
+	tomorrow := time.Now().UTC().AddDate(0, 0, 1).Format(time.DateOnly)
+	call(t, "PUT", "/v1/stories/"+id+"/reader-update", alice, map[string]any{
+		"completionStatus": "ongoing", "nextChapterOn": tomorrow, "readerNote": "Back soon.",
+	}).expect(http.StatusOK)
+	got := publicStory()
+	if got["nextChapterOn"] != tomorrow || got["readerNote"] != "Back soon." || got["readerNoteUpdatedAt"] == nil {
+		t.Errorf("public reader update = %v", got)
+	}
+	listed := pageStories(t, publicPage(t, ""))[0]
+	if listed["nextChapterOn"] != tomorrow || listed["readerNote"] != "Back soon." {
+		t.Errorf("listing reader update = %v", listed)
+	}
+
+	// An overdue date reads as an abandoned story, so readers stop seeing it
+	// while the author still does.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE stories SET next_chapter_on = CURRENT_DATE - 3 WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if got := publicStory(); got["nextChapterOn"] != nil || got["readerNote"] != "Back soon." {
+		t.Errorf("overdue date still public: %v", got)
+	}
+	if owner := get(t, "/v1/stories/"+id, alice).expect(http.StatusOK).json(); owner["nextChapterOn"] == nil {
+		t.Error("the author should still see their overdue date")
 	}
 }
 

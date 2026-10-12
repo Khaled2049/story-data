@@ -54,11 +54,17 @@ func (s *Server) public(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "tag must be at most 100 characters")
 			return
 		}
+		status := r.URL.Query().Get("status")
+		if status != "" && !store.ValidCompletionStatus(status) {
+			writeError(w, http.StatusBadRequest, "status must be ongoing or completed")
+			return
+		}
 		x, err := s.store.ListPublicStories(r.Context(), store.PublicStoryFilter{
 			Category: r.URL.Query().Get("category"),
 			Search:   search,
 			Tag:      tag,
 			AuthorID: r.URL.Query().Get("author"),
+			Status:   status,
 		}, r.URL.Query().Get("cursor"), limit)
 		respondCacheable(w, r, x, err, publicStoryListCacheControl)
 		return

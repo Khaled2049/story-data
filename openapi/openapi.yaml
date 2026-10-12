@@ -54,9 +54,10 @@ paths:
         - { name: category, in: query, schema: { type: string } }
         - { name: tag, in: query, schema: { type: string, maxLength: 100, description: 'Tag in URL form: case-insensitive, spaces as hyphens' } }
         - { name: author, in: query, schema: { type: string, description: Owner user ID } }
+        - { name: status, in: query, schema: { type: string, enum: [ongoing, completed], description: Completion status } }
         - { name: cursor, in: query, schema: { type: string } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 24 } }
-      responses: { '200': { description: Cursor-paginated public story summaries, with ETag }, '304': { description: Matches If-None-Match } }
+      responses: { '200': { description: 'Cursor-paginated public story summaries, with ETag. Each carries completionStatus, plus readerNote and nextChapterOn when set; nextChapterOn is omitted once the date has passed.' }, '304': { description: Matches If-None-Match }, '400': { description: 'limit, q, tag or status is invalid' } }
   /v1/public/sitemap:
     get:
       summary: Page every published story as id, authorId, title and updatedAt
@@ -104,6 +105,18 @@ paths:
       security: [{ firebaseBearer: [] }]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [chapterId, scrollPercent] } } } }
       responses: { '200': { description: Saved progress } }
+  /v1/stories/{storyId}/reader-update:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    put:
+      summary: Set a story's completion status and the author's word to readers
+      description: >-
+        Owner only. Replaces all three values. Unlike PATCH on the story it
+        takes no If-Match and leaves revision and updatedAt unchanged, so a
+        note edit neither reorders discovery nor conflicts with an open story
+        edit.
+      security: [{ firebaseBearer: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ReaderUpdateInput' } } } }
+      responses: { '200': { description: The updated story }, '403': { description: Caller does not own the story }, '404': { description: Story does not exist }, '422': { description: 'Unknown status, malformed date, or note over 280 characters' } }
   /v1/public/stories/{storyId}:
     parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
     get:
@@ -390,6 +403,16 @@ components:
           type: string
           enum: [spaced, indented]
           description: Omit to default to spaced on create and keep the stored value on update.
+    ReaderUpdateInput:
+      type: object
+      required: [completionStatus]
+      properties:
+        completionStatus: { type: string, enum: [ongoing, completed] }
+        nextChapterOn:
+          type: string
+          format: date
+          description: Expected date of the next chapter. Empty clears it; ignored and cleared when completionStatus is completed.
+        readerNote: { type: string, maxLength: 280, description: Trimmed. Empty clears it. }
     AssistantThreadInput:
       type: object
       properties:

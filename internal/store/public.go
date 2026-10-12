@@ -38,6 +38,11 @@ type PublicStory struct {
 	RatingsCount   int       `json:"ratingsCount"`
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
+	// NextChapterOn is omitted once the date has passed; see publicNextChapterOn.
+	CompletionStatus    string     `json:"completionStatus"`
+	NextChapterOn       string     `json:"nextChapterOn,omitempty"`
+	ReaderNote          string     `json:"readerNote,omitempty"`
+	ReaderNoteUpdatedAt *time.Time `json:"readerNoteUpdatedAt,omitempty"`
 }
 
 type PublicChapter struct {
@@ -77,7 +82,8 @@ const publicStoryColumns = `s.id, s.owner_id, s.title, s.description, COALESCE(p
   (SELECT count(*) FROM story_ratings sr WHERE sr.story_id=s.id),
   COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM story_tags st WHERE st.story_id=s.id), '{}'),
   (SELECT count(*) FROM chapters c WHERE c.story_id=s.id),
-  s.paragraph_style`
+  s.paragraph_style,
+  s.completion_status, ` + publicNextChapterOn + `, s.reader_note, s.reader_note_updated_at`
 
 const publicStoryFrom = `
 FROM stories s
@@ -100,6 +106,8 @@ type PublicStoryFilter struct {
 	Search   string
 	Tag      string
 	AuthorID string
+	// Status is a completion status; anything else must be rejected by the caller.
+	Status string
 }
 
 // TagSlug is the URL form of a tag: lower-cased with spaces as hyphens. It must
@@ -146,6 +154,13 @@ func (s *Store) ListPublicStories(ctx context.Context, f PublicStoryFilter, curs
 	if author := strings.TrimSpace(f.AuthorID); author != "" {
 		args = append(args, author)
 		where += fmt.Sprintf(" AND s.owner_id=$%d", len(args))
+	}
+	if f.Status != "" {
+		if !ValidCompletionStatus(f.Status) {
+			return PublicStoryPage{}, ErrValidation
+		}
+		args = append(args, f.Status)
+		where += fmt.Sprintf(" AND s.completion_status=$%d", len(args))
 	}
 	if after != nil {
 		args = append(args, after.UpdatedAt, mustUUID(after.ID))
@@ -347,7 +362,7 @@ func (s *Store) publicChapters(ctx context.Context, storyID string, content bool
 func scanPublicStory(row pgx.Row, extra ...any) (PublicStory, error) {
 	var x PublicStory
 	var id uuid.UUID
-	dest := []any{&id, &x.AuthorID, &x.Title, &x.Description, &x.AuthorName, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Views, &x.CreatedAt, &x.UpdatedAt, &x.LikeCount, &x.AverageRating, &x.RatingsCount, &x.Tags, &x.ChapterCount, &x.ParagraphStyle}
+	dest := []any{&id, &x.AuthorID, &x.Title, &x.Description, &x.AuthorName, &x.Category, &x.TargetAudience, &x.Language, &x.Copyright, &x.CoverImageURL, &x.ThumbnailURL, &x.Views, &x.CreatedAt, &x.UpdatedAt, &x.LikeCount, &x.AverageRating, &x.RatingsCount, &x.Tags, &x.ChapterCount, &x.ParagraphStyle, &x.CompletionStatus, &x.NextChapterOn, &x.ReaderNote, &x.ReaderNoteUpdatedAt}
 	err := row.Scan(append(dest, extra...)...)
 	x.ID = id.String()
 	return x, err

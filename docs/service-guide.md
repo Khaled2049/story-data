@@ -249,6 +249,17 @@ have today.
   the same published set with the same cursor but returns only `id`,
   `authorId`, `title` and `updatedAt`, up to 1000 a page; the frontend's
   `seoRender` Function builds `sitemap.xml` from it.
+- `GET /v1/public/stories` filters by `?status=ongoing|completed` too. A
+  story's completion status is separate from `is_published`: a serial is public
+  long before it is finished. The author sets it, with an optional
+  `nextChapterOn` date and a `readerNote` of up to 280 characters, through
+  `PUT /v1/stories/{id}/reader-update` (`internal/store/reader_update.go`).
+  That endpoint is the one story write that takes no `If-Match` and bumps
+  neither `revision` nor `updated_at`: discovery orders by `updated_at` and the
+  recommendations ingest re-reads on it, so a note edit must not look like new
+  writing. A story `PATCH` does not carry these fields and cannot reset them.
+  Public responses omit `nextChapterOn` once the date is more than a day past
+  (the day of grace covers authors west of UTC); the owner still sees it.
 - Story, chapter, and worldbuilding mutations use optimistic concurrency.
   Clients send `If-Match: <revision>` for writes that update/delete an existing
   record. A stale revision returns `409 Conflict`.

@@ -148,7 +148,7 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Reader interactions and deletion remain available without a writer agreement.
-	workspace := len(p) == 1 || p[1] == "chapters" || p[1] == "characters" || p[1] == "places" || p[1] == "plots" || p[1] == "assistant-threads"
+	workspace := len(p) == 1 || p[1] == "reader-update" || p[1] == "chapters" || p[1] == "characters" || p[1] == "places" || p[1] == "plots" || p[1] == "assistant-threads"
 	if workspace && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
 		if err := s.store.RequireWriterAgreement(r.Context(), uid); err != nil {
 			respond(w, nil, err)
@@ -157,6 +157,19 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(p) == 1 {
 		s.storyResource(w, r, uid, p[0])
+		return
+	}
+	if p[1] == "reader-update" && len(p) == 2 {
+		if r.Method != http.MethodPut {
+			method(w)
+			return
+		}
+		var in store.ReaderUpdateInput
+		if !decode(w, r, &in) {
+			return
+		}
+		x, e := s.store.PutReaderUpdate(r.Context(), p[0], uid, in)
+		respond(w, x, e)
 		return
 	}
 	if p[1] == "context" && len(p) == 2 && r.Method == http.MethodGet {

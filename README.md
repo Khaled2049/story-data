@@ -50,6 +50,7 @@ and `INDEXING_WORKER_ENABLED=true`.
 - Public comment reads plus Firebase-authenticated likes, ratings, and comment mutations under `/v1/stories/{storyId}`
 - `GET, POST /v1/stories`
 - `GET, PATCH, DELETE /v1/stories/{storyId}`
+- `PUT /v1/stories/{storyId}/reader-update` (completion status, next-chapter date and note to readers)
 - `GET, POST /v1/stories/{storyId}/chapters`
 - `GET, PATCH, DELETE /v1/stories/{storyId}/chapters/{chapterId}`
 - Durable assistant threads and rich messages under `/v1/stories/{storyId}/assistant-threads`
