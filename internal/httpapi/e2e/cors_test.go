@@ -73,6 +73,25 @@ func TestPreflightFromUnknownOriginGetsNoGrant(t *testing.T) {
 	}
 }
 
+func TestBundledIOSOriginGetsAnExactGrant(t *testing.T) {
+	srv := corsServer(t, "tauri://localhost")
+	for _, origin := range []string{"tauri://localhost", "tauri://other-host", "null", "https://evil.example"} {
+		t.Run(origin, func(t *testing.T) {
+			res := preflight(t, srv, origin)
+			want := ""
+			if origin == "tauri://localhost" {
+				want = origin
+				if res.StatusCode != http.StatusNoContent {
+					t.Fatalf("status = %d, want 204", res.StatusCode)
+				}
+			}
+			if got := res.Header.Get("Access-Control-Allow-Origin"); got != want {
+				t.Fatalf("grant = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestActualRequestCarriesTheOriginHeader(t *testing.T) {
 	reset(t)
 	srv := corsServer(t, allowedOrigin)

@@ -18,5 +18,6 @@ variable "cors_origins" {
     "https://story-6f89f.web.app",
     "https://thetaletribe.com",
     "https://www.thetaletribe.com",
+    "tauri://localhost",
   ]
 }

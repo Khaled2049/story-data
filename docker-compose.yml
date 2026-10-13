@@ -19,6 +19,8 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/story_data?sslmode=disable
       AUTH_MODE: dev
+      # Standalone mobile development and the bundled iOS webview.
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,tauri://localhost
       # Lets the MCP server assert X-User-ID. Redundant under AUTH_MODE=dev,
       # which trusts that header anyway, but it means local runs exercise the
       # same code path production uses. Keep in sync with dev-new.sh.

@@ -527,3 +527,20 @@ attestation text in the frontend's `docs/legal` archive.
 Deploy the API/migration and frontend together. Older clients that create stories
 without first recording agreement will receive 403. Local seeding records
 agreement only for synthetic fixture accounts through the dev-auth API.
+
+## Standalone iOS reader CORS
+
+The bundled Tauri iOS reader uses `tauri://localhost`; it is an explicit allowed
+origin in Terraform defaults. Preserve the existing website origins when
+overriding `CORS_ORIGINS`. Never grant the opaque `null` origin or use a wildcard.
+Requests still require the normal Firebase bearer token for private data.
+
+Docker Compose also lists the standalone mobile dev server on 5174. For an
+isolated local bundled check without restarting the shared stack, start a
+separate API process on an unused port with `AUTH_MODE=production`, the project
+ID, `FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099`, and
+`CORS_ORIGINS=tauri://localhost`. This exercises token verification rather than
+the development user header; keep the emulator setting local only.
+
+These configuration changes do not update a running deployment or container.
+Apply the verified allowlists during the coordinated mobile cutover.
