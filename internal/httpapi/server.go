@@ -63,6 +63,12 @@ func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.
 	m.HandleFunc("/v1/me/token-balance", x.myCompetitions)
 	m.HandleFunc("/v1/me/token-faucet", x.myCompetitions)
 	m.HandleFunc("/v1/admin/token-grants", x.adminTokenGrants)
+	m.HandleFunc("/v1/admin/stories", x.adminStories)
+	m.HandleFunc("/v1/admin/stories/", x.adminStories)
+	m.HandleFunc("/v1/admin/competitions", x.adminCompetitions)
+	m.HandleFunc("/v1/admin/competitions/", x.adminCompetitions)
+	m.HandleFunc("/v1/admin/members", x.adminMembers)
+	m.HandleFunc("/v1/admin/members/", x.adminMemberUsage)
 	m.HandleFunc("/v1/competition-drafts", x.competitionDrafts)
 	m.HandleFunc("/v1/competition-publish", x.competitionPublish)
 	m.HandleFunc("/v1/me/follows", x.myFollows)
@@ -422,6 +428,22 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) (string, bool) {
 		return "", false
 	}
 	logUser(w, uid)
+	return uid, true
+}
+
+// admin authenticates a /v1/admin request with one revocation-checked
+// verification, answering 401 or 403 itself when it returns false.
+func (s *Server) admin(w http.ResponseWriter, r *http.Request) (string, bool) {
+	uid, admin, e := s.auth.Admin(r.Context(), r)
+	if e != nil {
+		writeError(w, http.StatusUnauthorized, e.Error())
+		return "", false
+	}
+	logUser(w, uid)
+	if !admin {
+		writeError(w, http.StatusForbidden, "admin only")
+		return "", false
+	}
 	return uid, true
 }
 func (s *Server) withJSON(next http.Handler) http.Handler {

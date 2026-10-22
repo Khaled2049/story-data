@@ -578,7 +578,10 @@ func (s *Store) PublishCompetition(ctx context.Context, id, user string) (Compet
 	return s.competition(ctx, id, user)
 }
 func (s *Store) DiscardCompetitionDraft(ctx context.Context, id, user string) error {
-	cmd, e := s.db.Exec(ctx, `DELETE FROM competitions WHERE id=$1 AND creator_id=$2 AND phase='draft'`, id, user)
+	return s.discardCompetitionDraft(ctx, s.db, id, user)
+}
+func (s *Store) discardCompetitionDraft(ctx context.Context, q execer, id, user string) error {
+	cmd, e := q.Exec(ctx, `DELETE FROM competitions WHERE id=$1 AND creator_id=$2 AND phase='draft'`, id, user)
 	if e != nil {
 		return e
 	}

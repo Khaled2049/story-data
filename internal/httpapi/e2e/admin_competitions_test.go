@@ -1,0 +1,106 @@
+package e2e
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+func TestAdminCompetitionRoutesRequireAdmin(t *testing.T) {
+	reset(t)
+	id := newDraft(t, alice, "Private contest", "0", "0")["id"].(string)
+	for _, route := range []struct{ method, path string }{
+		{"GET", "/v1/admin/competitions"},
+		{"GET", "/v1/admin/competitions/" + id},
+		{"DELETE", "/v1/admin/competitions/" + id},
+	} {
+		call(t, route.method, route.path, "", nil).expect(http.StatusUnauthorized)
+		call(t, route.method, route.path, alice, nil).expect(http.StatusForbidden)
+		call(t, route.method, route.path, bob, nil, map[string]string{"X-Admin": "true", "X-Service-Token": testServiceToken}).expect(http.StatusForbidden)
+	}
+}
+
+func TestAdminCompetitionListingAndDraftReview(t *testing.T) {
+	reset(t)
+	admin := map[string]string{"X-Admin": "true"}
+	empty := get(t, "/v1/admin/competitions", carol, admin).expect(http.StatusOK).json()
+	if len(empty["competitions"].([]any)) != 0 {
+		t.Fatal("expected empty array")
+	}
+	draft := newDraft(t, alice, "Secret competition", tale(5), "0")["id"].(string)
+	published := openCompetition(t, bob, "Public competition", tale(10), "0")
+	call(t, "PUT", "/v1/profiles/me", alice, map[string]any{"username": "PrivateHost"}).expect(http.StatusCreated)
+	if _, err := testPool.Exec(context.Background(), `UPDATE competitions SET created_at='2026-01-01'`); err != nil {
+		t.Fatal(err)
+	}
+	page := get(t, "/v1/admin/competitions?limit=1", carol, admin).expect(http.StatusOK).json()
+	first := page["competitions"].([]any)
+	cursor, _ := page["nextCursor"].(string)
+	if len(first) != 1 || cursor == "" {
+		t.Fatalf("bad first page: %v", page)
+	}
+	next := get(t, "/v1/admin/competitions?limit=1&cursor="+url.QueryEscape(cursor), carol, admin).expect(http.StatusOK).json()
+	second := next["competitions"].([]any)
+	if len(second) != 1 || first[0].(map[string]any)["id"] == second[0].(map[string]any)["id"] {
+		t.Fatalf("pagination skipped or duplicated: %v", next)
+	}
+	if next["nextCursor"] != nil {
+		t.Fatal("unexpected continuation")
+	}
+	for query, want := range map[string]string{"phase=draft": draft, "phase=open": published, "q=PRIVATEHOST": draft, "q=" + alice: draft, "q=" + draft: draft} {
+		res := get(t, "/v1/admin/competitions?"+query, carol, admin).expect(http.StatusOK)
+		if res.Header.Get("Cache-Control") != "no-store" {
+			t.Fatal("admin response must not be cached")
+		}
+		items := res.json()["competitions"].([]any)
+		if len(items) != 1 || items[0].(map[string]any)["id"] != want {
+			t.Fatalf("filter %s: %v", query, items)
+		}
+		if items[0].(map[string]any)["results"] != nil {
+			t.Fatal("unsettled results leaked")
+		}
+	}
+	got := get(t, "/v1/admin/competitions/"+draft, carol, admin).expect(http.StatusOK).json()
+	if got["title"] != "Secret competition" || got["creatorId"] != alice {
+		t.Fatalf("wrong detail: %v", got)
+	}
+	// The moderation exception must not relax visibility on reader routes.
+	get(t, "/v1/competitions/"+draft, carol, admin).expect(http.StatusNotFound)
+	get(t, "/v1/admin/competitions?phase=unknown", carol, admin).expect(http.StatusUnprocessableEntity)
+	get(t, "/v1/admin/competitions?cursor=invalid", carol, admin).expect(http.StatusUnprocessableEntity)
+	get(t, "/v1/admin/competitions?limit=0", carol, admin).expect(http.StatusBadRequest)
+}
+
+func TestAdminCompetitionDeletionIsDraftOnly(t *testing.T) {
+	reset(t)
+	admin := map[string]string{"X-Admin": "true"}
+	draft := newDraft(t, alice, "Delete draft", "0", "0")["id"].(string)
+	call(t, "DELETE", "/v1/admin/competitions/"+draft, carol, nil, admin).expect(http.StatusNoContent)
+	get(t, "/v1/admin/competitions/"+draft, carol, admin).expect(http.StatusNotFound)
+	published := openCompetition(t, alice, "Funded contest", tale(10), "0")
+	before := get(t, "/v1/me/token-balance", alice).expect(http.StatusOK).json()["balance"]
+	call(t, "DELETE", "/v1/admin/competitions/"+published, carol, nil, admin).expect(http.StatusConflict)
+	after := get(t, "/v1/me/token-balance", alice).expect(http.StatusOK).json()["balance"]
+	if before != after {
+		t.Fatal("rejected deletion moved funds")
+	}
+	get(t, "/v1/admin/competitions/"+published, carol, admin).expect(http.StatusOK)
+}
+
+func TestAdminCompetitionReviewAndDeletionAreAudited(t *testing.T) {
+	reset(t)
+	admin := map[string]string{"X-Admin": "true"}
+	draft := newDraft(t, alice, "Audited draft", "0", "0")["id"].(string)
+	get(t, "/v1/admin/competitions/"+draft, carol, admin).expect(http.StatusOK)
+	call(t, "DELETE", "/v1/admin/competitions/"+draft, carol, nil, admin).expect(http.StatusNoContent)
+	published := openCompetition(t, alice, "Not deletable", tale(10), "0")
+	call(t, "DELETE", "/v1/admin/competitions/"+published, carol, nil, admin).expect(http.StatusConflict)
+	if got := auditTrail(t, draft); strings.Join(got, ",") != carol+" competition.view,"+carol+" competition.delete" {
+		t.Fatalf("draft audit = %v", got)
+	}
+	if got := auditTrail(t, published); len(got) != 0 {
+		t.Fatalf("refused deletion was audited: %v", got)
+	}
+}

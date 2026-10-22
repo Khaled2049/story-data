@@ -122,7 +122,59 @@ permissions. Never trust client-supplied owner IDs.
 `X-Admin: true` so scripts can exercise protected routes without external
 token verification.
 
+### Story moderation
+
+`/v1/admin/*` requires a verified Firebase `admin: true` claim on every
+request (or `X-Admin: true` with a user ID in local dev auth). These routes
+verify the ID token with the revocation check, so `npm run unset-admin` (which
+also revokes the user's sessions) cuts access off immediately rather than when
+the token expires; it costs one Firebase Auth lookup per admin request. It lists stories
+from every author, including drafts, with cursor pagination, `q` search and
+`status=draft|ongoing|completed` filtering. The detail and chapter routes below
+it let an admin review private content; ordinary story and public reader routes
+keep their existing visibility rules. Moderation reads return `Cache-Control:
+no-store`. Service-token callers cannot claim admin access.
+
+`DELETE /v1/admin/stories/{id}` requires the current story `If-Match` revision
+and reuses owner deletion, including the active competition entry restriction
+and cascading cleanup.
+
+Admin access to other users' content is recorded in `admin_audit` (actor uid,
+action, target ID, JSON detail, time): `story.view`, `chapter.view`,
+`competition.view`, `story.delete` and `competition.delete`. A delete writes its
+row in the same transaction, so a refused delete leaves none; a view returns no
+content if its row cannot be written. Listings are not recorded. The frontend provides `/admin/stories`
+and `/admin/stories/{id}` (`/admin` redirects to the story list), with an Admin
+link shown only to admins and explicit
+confirmation before permanent deletion. This MVP provides story review and
+deletion for investigating reports; it does not create a report inbox.
+
+### Member directory for admins
+
+`GET /v1/admin/members` lists every member with a public profile, newest
+first, with `q` (username or name substring, or exact user ID), `limit` and
+`cursor`. Each row carries `storyCount`, which includes drafts, and
+`publishedStoryCount`. It reads `public_profiles` only: emails and the admin
+claim live in Firebase Auth and are not returned. The frontend page is
+`/admin/members`.
+
+`GET /v1/admin/members/{userId}/usage?from=&to=` returns that member's daily
+AI counters kept here, counts only: `indexingPasses` (`indexing_usage`) and
+`recsSearches`/`recsExplains` (`recommendations.llm_usage`). Inclusive UTC
+days, the last 30 by default, at most 90 (`422` otherwise), every day present.
+The admin AI usage page combines it with creditProxy's ledger.
+
 ### Competition read visibility
+
+The dedicated moderation routes `/v1/admin/competitions` and
+`/v1/admin/competitions/{id}` allow verified admins to list and review all
+competitions, including drafts. These routes return `Cache-Control: no-store`
+and preserve the embargo on unsettled vote tallies. The list accepts `q`,
+`phase`, `limit` and `cursor`, returning `{competitions,nextCursor}`. Admins may
+delete an unpublished draft through `DELETE /v1/admin/competitions/{id}`;
+published competitions return `409` and must use the existing cancellation and
+refund flow. `/admin/competitions` is the matching protected frontend table.
+These explicit moderation exceptions do not change ordinary reader visibility:
 
 A published competition is readable by anyone, including anonymous callers —
 that is the public contest page. A **draft** is its author's private working

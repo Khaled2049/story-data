@@ -38,6 +38,14 @@ resource "google_secret_manager_secret_iam_member" "service_token" {
   member    = "serviceAccount:${data.google_service_account.runtime.email}"
 }
 
+# /v1/admin/* verifies tokens with the revocation check, which looks the user up
+# in Firebase Auth; without this every admin request fails with 401.
+resource "google_project_iam_member" "runtime_firebase_auth_viewer" {
+  project = var.project_id
+  role    = "roles/firebaseauth.viewer"
+  member  = "serviceAccount:${data.google_service_account.runtime.email}"
+}
+
 resource "google_cloud_run_v2_service" "api" {
   name     = "novelsync-story-data"
   location = var.region

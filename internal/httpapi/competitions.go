@@ -198,15 +198,11 @@ func (s *Server) myCompetitions(w http.ResponseWriter, r *http.Request) {
 	notFound(w)
 }
 func (s *Server) adminTokenGrants(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.user(w, r); !ok {
+	if _, ok := s.admin(w, r); !ok {
 		return
 	}
 	if r.Method != http.MethodPost {
 		method(w)
-		return
-	}
-	if !s.isAdmin(r) {
-		writeError(w, http.StatusForbidden, "admin only")
 		return
 	}
 	var in struct {
