@@ -106,3 +106,22 @@ func TestDevPathUnchanged(t *testing.T) {
 		t.Fatalf("dev mode should still honor X-Admin; got %v, %v", admin, err)
 	}
 }
+
+func TestAdminReturnsUIDWithClaimAndNeverTrustsServicePath(t *testing.T) {
+	v := New("production", "proj", token)
+	uid, admin, err := v.Admin(context.Background(), request(map[string]string{
+		"X-Service-Token": token,
+		"X-User-ID":       "user-42",
+		"X-Admin":         "true",
+	}))
+	if err != nil || uid != "user-42" || admin {
+		t.Fatalf("service path got %q, %v, %v; want user-42 without admin", uid, admin, err)
+	}
+	uid, admin, err = New("dev", "", token).Admin(context.Background(), request(map[string]string{
+		"X-User-ID": "dev-user",
+		"X-Admin":   "true",
+	}))
+	if err != nil || uid != "dev-user" || !admin {
+		t.Fatalf("dev path got %q, %v, %v; want dev-user with admin", uid, admin, err)
+	}
+}

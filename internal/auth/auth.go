@@ -26,12 +26,12 @@ func New(mode, projectID, serviceToken string) *Verifier {
 }
 
 func (v *Verifier) UserID(ctx context.Context, r *http.Request) (string, error) {
-	uid, _, err := v.identity(ctx, r)
+	uid, _, err := v.identity(ctx, r, false)
 	return uid, err
 }
 
 func (v *Verifier) IsAdmin(ctx context.Context, r *http.Request) (bool, error) {
-	_, claims, err := v.identity(ctx, r)
+	_, claims, err := v.identity(ctx, r, false)
 	if err != nil {
 		return false, err
 	}
@@ -39,7 +39,18 @@ func (v *Verifier) IsAdmin(ctx context.Context, r *http.Request) (bool, error) {
 	return admin, nil
 }
 
-func (v *Verifier) identity(ctx context.Context, r *http.Request) (string, map[string]any, error) {
+// Admin verifies once for the /v1/admin routes and also checks that the token
+// was not revoked, so removing the claim and revoking sessions takes effect now.
+func (v *Verifier) Admin(ctx context.Context, r *http.Request) (string, bool, error) {
+	uid, claims, err := v.identity(ctx, r, true)
+	if err != nil {
+		return "", false, err
+	}
+	admin, _ := claims["admin"].(bool)
+	return uid, admin, nil
+}
+
+func (v *Verifier) identity(ctx context.Context, r *http.Request, checkRevoked bool) (string, map[string]any, error) {
 	// A trusted backend (the MCP server) holds the caller's uid but not their
 	// Firebase token, so it presents a shared secret and asserts the uid. Checked
 	// before the mode split so it works identically in dev and production.
@@ -74,7 +85,11 @@ func (v *Verifier) identity(ctx context.Context, r *http.Request) (string, map[s
 	if err := v.ensure(); err != nil {
 		return "", nil, err
 	}
-	verified, err := v.client.VerifyIDToken(ctx, token)
+	verify := v.client.VerifyIDToken
+	if checkRevoked {
+		verify = v.client.VerifyIDTokenAndCheckRevoked
+	}
+	verified, err := verify(ctx, token)
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid Firebase bearer token")
 	}
