@@ -170,7 +170,10 @@ The dedicated moderation routes `/v1/admin/competitions` and
 `/v1/admin/competitions/{id}` allow verified admins to list and review all
 competitions, including drafts. These routes return `Cache-Control: no-store`
 and preserve the embargo on unsettled vote tallies. The list accepts `q`,
-`phase`, `limit` and `cursor`, returning `{competitions,nextCursor}`. Admins may
+`phase`, `limit` and `cursor`, returning `{competitions,nextCursor}`. Besides
+the phases, `phase=awaiting-settlement` lists competitions in `voting` past their
+voting deadline: the ones settle-on-read has not reached because nobody has
+opened them. Admin reads never settle, so that list stays accurate. Admins may
 delete an unpublished draft through `DELETE /v1/admin/competitions/{id}`;
 published competitions return `409` and must use the existing cancellation and
 refund flow. `/admin/competitions` is the matching protected frontend table.

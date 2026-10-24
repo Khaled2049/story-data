@@ -104,3 +104,35 @@ func TestAdminCompetitionReviewAndDeletionAreAudited(t *testing.T) {
 		t.Fatalf("refused deletion was audited: %v", got)
 	}
 }
+
+// Settlement happens on read, so a competition nobody opens after its voting
+// deadline stays unsettled. Admins find those with this filter, and their own
+// reads must not settle them, or the list would empty itself on sight.
+func TestAdminCompetitionsAwaitingSettlement(t *testing.T) {
+	reset(t)
+	admin := map[string]string{"X-Admin": "true"}
+	due := dueWithAWinner(t, "Overdue")
+	grantInitial(t, carol)
+	stillVoting := openCompetition(t, alice, "Still voting", tale(10), "0")
+	enter(t, carol, stillVoting)
+	advance(t, alice, stillVoting, "voting")
+	openCompetition(t, alice, "Still open", tale(10), "0")
+
+	items := get(t, "/v1/admin/competitions?phase=awaiting-settlement", carol, admin).
+		expect(http.StatusOK).json()["competitions"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["id"] != due {
+		t.Fatalf("awaiting settlement = %v, want only %s", items, due)
+	}
+
+	get(t, "/v1/admin/competitions/"+due, carol, admin).expect(http.StatusOK)
+	if got := dbPhase(t, due); got != "voting" {
+		t.Errorf("an admin read settled the competition: phase %s", got)
+	}
+
+	get(t, "/v1/competitions/"+due, "").expect(http.StatusOK)
+	after := get(t, "/v1/admin/competitions?phase=awaiting-settlement", carol, admin).
+		expect(http.StatusOK).json()["competitions"].([]any)
+	if len(after) != 0 {
+		t.Errorf("a settled competition is still listed: %v", after)
+	}
+}

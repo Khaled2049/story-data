@@ -6,6 +6,11 @@ import (
 	"time"
 )
 
+// AwaitingSettlement is an admin list filter rather than a phase: voting has
+// closed but nothing has settled the competition, because settlement happens
+// on read and nobody has opened it since the deadline.
+const AwaitingSettlement = "awaiting-settlement"
+
 type AdminCompetitionPage struct {
 	Competitions []Competition `json:"competitions"`
 	NextCursor   string        `json:"nextCursor,omitempty"`
@@ -20,7 +25,7 @@ func (s *Store) ListAdminCompetitions(ctx context.Context, admin bool, search, p
 		return AdminCompetitionPage{}, ErrValidation
 	}
 	switch phase {
-	case "", "draft", "scheduled", "open", "voting", "settling", "settled", "cancelled":
+	case "", "draft", "scheduled", "open", "voting", "settling", "settled", "cancelled", AwaitingSettlement:
 	default:
 		return AdminCompetitionPage{}, ErrValidation
 	}
@@ -42,7 +47,7 @@ func (s *Store) ListAdminCompetitions(ctx context.Context, admin bool, search, p
 	rows, err := s.db.Query(ctx, competitionSelect+` WHERE
 		($1='' OR strpos(lower(title),lower($1))>0 OR strpos(lower(creator_name),lower($1))>0 OR creator_id=$1 OR id::text=$1
 		 OR EXISTS(SELECT 1 FROM public_profiles p WHERE p.user_id=competitions.creator_id AND strpos(lower(p.username),lower($1))>0))
-		AND ($2='' OR phase=$2)
+		AND ($2='' OR phase=$2 OR ($2='awaiting-settlement' AND phase='voting' AND voting_deadline_at<=now()))
 		AND ($3::timestamptz IS NULL OR (created_at,id)<($3,$4::uuid))
 		ORDER BY created_at DESC,id DESC LIMIT $5`, search, phase, afterTime, afterID, limit+1)
 	if err != nil {

@@ -13,7 +13,7 @@ paths:
       security: [{ firebaseBearer: [] }]
       parameters:
         - { name: q, in: query, schema: { type: string, maxLength: 500, description: 'Title, host name or username substring, or exact competition ID or creator ID' } }
-        - { name: phase, in: query, schema: { type: string, enum: [draft, scheduled, open, voting, settling, settled, cancelled] } }
+        - { name: phase, in: query, schema: { type: string, enum: [draft, scheduled, open, voting, settling, settled, cancelled, awaiting-settlement] }, description: "A phase, or awaiting-settlement for competitions in voting past their voting deadline." }
         - { name: cursor, in: query, schema: { type: string } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 24 } }
       responses: { '200': { description: Paginated competition page }, '400': { description: Invalid limit }, '401': { description: Authentication required }, '403': { description: Admin claim required }, '422': { description: Invalid filter or cursor } }
