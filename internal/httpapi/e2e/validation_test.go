@@ -132,7 +132,7 @@ func TestCompetitionAndClubFieldCeilings(t *testing.T) {
 	call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
 		"title": "T", "description": huge, "category": "flash-fiction",
 		"tags": []string{"x"}, "creatorName": "Alice",
-	}).expect(http.StatusUnprocessableEntity)
+	}, asAdmin).expect(http.StatusUnprocessableEntity)
 
 	tags := make([]string, 21)
 	for i := range tags {
@@ -141,7 +141,7 @@ func TestCompetitionAndClubFieldCeilings(t *testing.T) {
 	call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
 		"title": "T", "description": "d", "category": "flash-fiction",
 		"tags": tags, "creatorName": "Alice",
-	}).expect(http.StatusUnprocessableEntity)
+	}, asAdmin).expect(http.StatusUnprocessableEntity)
 
 	call(t, "POST", "/v1/book-clubs", alice, map[string]any{
 		"name": "Club", "description": huge, "image": "",

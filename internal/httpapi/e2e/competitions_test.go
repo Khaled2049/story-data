@@ -30,6 +30,9 @@ const (
 
 // tale renders a whole-token count as the 18-decimal integer string the API
 // returns, so tests can be written in units a human can check.
+// asAdmin marks a request as an admin's. Only admins may host a competition.
+var asAdmin = map[string]string{"X-Admin": "true"}
+
 func tale(n int64) string { return fmt.Sprintf("%d000000000000000000", n) }
 
 func platformAccount() string        { return "platform:treasury" }
@@ -66,7 +69,7 @@ func newDraft(t *testing.T, uid, title string, prize, fee string) map[string]any
 		"creatorName": "Alice",
 
 		"votingDeadline": now.Add(2 * time.Hour).Format(time.RFC3339),
-	}).expect(http.StatusCreated).json()
+	}, asAdmin).expect(http.StatusCreated).json()
 }
 
 // openCompetition drafts and publishes in one step, returning the id. The
@@ -78,7 +81,7 @@ func openCompetition(t *testing.T, uid, title, prize, fee string) string {
 	draft := newDraft(t, uid, title, prize, fee)
 	id := draft["id"].(string)
 	published := call(t, "POST", "/v1/competition-publish", uid,
-		map[string]any{"competitionId": id}).expect(http.StatusOK).json()
+		map[string]any{"competitionId": id}, asAdmin).expect(http.StatusOK).json()
 	if published["phase"] != "open" {
 		t.Fatalf("expected a competition starting in the past to publish as open, got %v",
 			published["phase"])
@@ -350,7 +353,7 @@ func TestCompetitionDraftIsPrivateUntilPublished(t *testing.T) {
 	}
 
 	call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": draft["id"]}).expect(http.StatusOK)
+		map[string]any{"competitionId": draft["id"]}, asAdmin).expect(http.StatusOK)
 
 	if listed := get(t, "/v1/competitions", bob).expect(http.StatusOK).list(); len(listed) != 1 {
 		t.Errorf("published competition should be publicly listed, got %d", len(listed))
@@ -433,18 +436,18 @@ func TestCompetitionDraftValidation(t *testing.T) {
 	reset(t)
 
 	call(t, "POST", "/v1/competition-drafts", alice,
-		map[string]any{"title": "   ", "tags": []string{}}).
+		map[string]any{"title": "   ", "tags": []string{}}, asAdmin).
 		expect(http.StatusUnprocessableEntity)
 
 	// A negative or non-numeric prize is rejected before it can reach the ledger.
 	for _, bad := range []string{"-1", "abc", "1.5"} {
 		call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
 			"title": "Bad money", "tags": []string{}, "prizeAmount": bad,
-		}).expect(http.StatusUnprocessableEntity)
+		}, asAdmin).expect(http.StatusUnprocessableEntity)
 	}
 
 	call(t, "POST", "/v1/competition-drafts", "",
-		map[string]any{"title": "x", "tags": []string{}}).expect(http.StatusUnauthorized)
+		map[string]any{"title": "x", "tags": []string{}}, asAdmin).expect(http.StatusUnauthorized)
 }
 
 func TestCompetitionPublishRequiresOrderedDatesAndAPrize(t *testing.T) {
@@ -455,9 +458,9 @@ func TestCompetitionPublishRequiresOrderedDatesAndAPrize(t *testing.T) {
 	// No dates at all.
 	bare := call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
 		"title": "Undated", "tags": []string{}, "prizeAmount": tale(10),
-	}).expect(http.StatusCreated).json()
+	}, asAdmin).expect(http.StatusCreated).json()
 	call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": bare["id"]}).expect(http.StatusUnprocessableEntity)
+		map[string]any{"competitionId": bare["id"]}, asAdmin).expect(http.StatusUnprocessableEntity)
 
 	// Voting closing before the deadline is out of order.
 	backwards := call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
@@ -465,14 +468,14 @@ func TestCompetitionPublishRequiresOrderedDatesAndAPrize(t *testing.T) {
 		"startDate":      now.Format(time.RFC3339),
 		"deadline":       now.Add(2 * time.Hour).Format(time.RFC3339),
 		"votingDeadline": now.Add(time.Hour).Format(time.RFC3339),
-	}).expect(http.StatusCreated).json()
+	}, asAdmin).expect(http.StatusCreated).json()
 	call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": backwards["id"]}).expect(http.StatusUnprocessableEntity)
+		map[string]any{"competitionId": backwards["id"]}, asAdmin).expect(http.StatusUnprocessableEntity)
 
 	// A zero prize means there is nothing to escrow and nothing to win.
 	free := newDraft(t, alice, "No prize", "0", "0")
 	call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": free["id"]}).expect(http.StatusUnprocessableEntity)
+		map[string]any{"competitionId": free["id"]}, asAdmin).expect(http.StatusUnprocessableEntity)
 
 	// None of the rejected publishes moved money.
 	assertBalance(t, userAccount(alice), tale(initialGrantTale))
@@ -495,7 +498,7 @@ func TestCompetitionPublishRefusesInsufficientBalance(t *testing.T) {
 	// More than the opening allowance.
 	draft := newDraft(t, alice, "Too rich", tale(initialGrantTale+1), "0")
 	call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": draft["id"]}).
+		map[string]any{"competitionId": draft["id"]}, asAdmin).
 		expect(http.StatusUnprocessableEntity)
 
 	got := get(t, "/v1/competitions/"+draft["id"].(string), alice).
@@ -513,11 +516,44 @@ func TestCompetitionPublishIsCreatorOnly(t *testing.T) {
 	draft := newDraft(t, alice, "Alice's prize", tale(100), "0")
 
 	call(t, "POST", "/v1/competition-publish", bob,
-		map[string]any{"competitionId": draft["id"]}).expect(http.StatusForbidden)
+		map[string]any{"competitionId": draft["id"]}, asAdmin).expect(http.StatusForbidden)
 	// Bob's balance is untouched — the escrow must never be charged to the
 	// caller rather than the creator.
 	assertBalance(t, userAccount(bob), tale(initialGrantTale))
 	assertBalance(t, escrowAccount(draft["id"].(string)), "0")
+}
+
+// The frontend only offers hosting to admins, so the API must refuse anyone
+// else who calls it directly.
+func TestOnlyAdminsCanHostCompetitions(t *testing.T) {
+	reset(t)
+	grantInitial(t, alice)
+	now := time.Now().UTC()
+	body := map[string]any{
+		"title": "Self-hosted", "description": "d", "category": "flash-fiction",
+		"tags":           []string{"x"},
+		"startDate":      now.Add(-time.Hour).Format(time.RFC3339),
+		"deadline":       now.Add(time.Hour).Format(time.RFC3339),
+		"votingDeadline": now.Add(2 * time.Hour).Format(time.RFC3339),
+		"prizeAmount":    tale(100), "creatorName": "Alice",
+	}
+
+	call(t, "POST", "/v1/competition-drafts", alice, body).expect(http.StatusForbidden)
+	if n := len(get(t, "/v1/me/competitions/drafts", alice).expect(http.StatusOK).list()); n != 0 {
+		t.Fatalf("a refused draft was saved: %d drafts", n)
+	}
+
+	// A draft an admin saved still cannot be published without admin rights.
+	id := call(t, "POST", "/v1/competition-drafts", alice, body, asAdmin).
+		expect(http.StatusCreated).json()["id"].(string)
+	call(t, "POST", "/v1/competition-publish", alice,
+		map[string]any{"competitionId": id}).expect(http.StatusForbidden)
+	assertBalance(t, userAccount(alice), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), "0")
+
+	call(t, "POST", "/v1/competition-publish", alice,
+		map[string]any{"competitionId": id}, asAdmin).expect(http.StatusOK)
+	assertBalance(t, escrowAccount(id), tale(100))
 }
 
 // ── joining and submitting ──────────────────────────────────────────────────
@@ -532,10 +568,10 @@ func TestCompetitionJoinRespectsMaxParticipants(t *testing.T) {
 		"startDate":       now.Add(-time.Hour).Format(time.RFC3339),
 		"deadline":        now.Add(time.Hour).Format(time.RFC3339),
 		"votingDeadline":  now.Add(2 * time.Hour).Format(time.RFC3339),
-	}).expect(http.StatusCreated).json()
+	}, asAdmin).expect(http.StatusCreated).json()
 	id := draft["id"].(string)
 	call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": id}).expect(http.StatusOK)
+		map[string]any{"competitionId": id}, asAdmin).expect(http.StatusOK)
 
 	call(t, "PUT", "/v1/competitions/"+id+"/join", bob, nil).expect(http.StatusNoContent)
 	// Re-joining is idempotent and must not consume the second seat.
@@ -604,6 +640,44 @@ func TestCompetitionSubmitIsRefusedOutsideTheOpenPhase(t *testing.T) {
 	advance(t, alice, id, "voting")
 	call(t, "POST", "/v1/competitions/"+id+"/submissions/me", bob,
 		map[string]any{"storyId": story["id"]}).expect(http.StatusForbidden)
+}
+
+// A paid entry racing a cancel used to read the phase as open, charge the fee,
+// and only then wait for the cancel's lock, stranding the fee in the escrow of
+// a cancelled competition. The test holds the row lock and cancels in its own
+// transaction, standing in for CancelCompetition, which takes the same lock.
+func TestPaidEntryWaitingOnACancelIsRefused(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	id := openCompetition(t, alice, "Cancelled mid-entry", tale(100), tale(10))
+	grantInitial(t, bob)
+	story := newStory(t, bob, "Late entry")
+	call(t, "PUT", "/v1/competitions/"+id+"/join", bob, nil).expect(http.StatusNoContent)
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT 1 FROM competitions WHERE id=$1::uuid FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan response, 1)
+	go func() {
+		done <- call(t, "POST", "/v1/competitions/"+id+"/submissions/me", bob,
+			map[string]any{"storyId": story["id"]})
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if _, err = tx.Exec(ctx, `UPDATE competitions SET phase='cancelled' WHERE id=$1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	(<-done).expect(http.StatusForbidden)
+	assertBalance(t, userAccount(bob), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), tale(100))
 }
 
 func TestCompetitionEntryFeeIsEscrowedAndRefundedOnWithdraw(t *testing.T) {
@@ -818,6 +892,39 @@ func TestBallotHonorsMaxVotesPerUser(t *testing.T) {
 		expect(http.StatusNoContent)
 }
 
+// The competition stays in "voting" until it settles, so the phase alone kept
+// the ballot box open past the deadline the UI shows readers.
+func TestBallotClosesAtTheVotingDeadline(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Closing time", tale(100), "0")
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	enter(t, carol, id)
+	registerVoter(t, dave, id)
+	advance(t, alice, id, "voting")
+	setVotingDeadline := func(at string) {
+		t.Helper()
+		if _, err := testPool.Exec(context.Background(),
+			`UPDATE competitions SET voting_deadline_at=`+at+` WHERE id=$1::uuid`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ballot := "/v1/competitions/" + id + "/ballots/me"
+	setVotingDeadline("now()+interval '1 minute'")
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{bob}}).
+		expect(http.StatusNoContent)
+
+	setVotingDeadline("now()")
+	call(t, "PUT", ballot, dave, map[string]any{"submissionIds": []string{carol}}).
+		expect(http.StatusUnprocessableEntity)
+
+	got := get(t, ballot, dave).expect(http.StatusOK).json()
+	if choices := got["submissionIds"].([]any); len(choices) != 1 || choices[0] != bob {
+		t.Errorf("a refused late recast changed the ballot to %v", choices)
+	}
+}
+
 // ── settlement ──────────────────────────────────────────────────────────────
 
 func TestCompetitionSettlementPaysWinnerAndHost(t *testing.T) {
@@ -832,6 +939,7 @@ func TestCompetitionSettlementPaysWinnerAndHost(t *testing.T) {
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
 
+	passTime(t, id, "voting_deadline_at")
 	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
 		expect(http.StatusOK).json()
 	if settled["phase"] != "settled" {
@@ -876,6 +984,7 @@ func TestCompetitionSettlementIsIdempotent(t *testing.T) {
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
 
+	passTime(t, id, "voting_deadline_at")
 	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
 	before := dbBalance(t, userAccount(bob))
 	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
@@ -894,6 +1003,7 @@ func TestCompetitionSettlementWithNoVotesReturnsThePrize(t *testing.T) {
 	enter(t, bob, id)
 	advance(t, alice, id, "voting")
 
+	passTime(t, id, "voting_deadline_at")
 	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
 
 	// With no votes there is no winner, so the prize goes back to the host
@@ -911,10 +1021,39 @@ func TestCompetitionSettlementIsCreatorOrAdminOnly(t *testing.T) {
 	enter(t, bob, id)
 	advance(t, alice, id, "voting")
 
+	passTime(t, id, "voting_deadline_at")
 	call(t, "POST", "/v1/competitions/"+id+"/settle", bob, nil).expect(http.StatusForbidden)
 	// X-Admin is honoured in dev auth mode.
 	call(t, "POST", "/v1/competitions/"+id+"/settle", bob, nil,
 		map[string]string{"X-Admin": "true"}).expect(http.StatusOK)
+	assertLedgerIntact(t)
+}
+
+// Settling at zero ballots returns the prize and the host's fee share to the
+// creator, so letting them settle the moment voting opened let them keep the
+// entry fees. Admins get no override either; cancel is the escape hatch.
+func TestCompetitionSettlementRefusedBeforeTheVotingDeadline(t *testing.T) {
+	reset(t)
+	id := openCompetition(t, alice, "Not over yet", tale(100), tale(10))
+	grantInitial(t, bob)
+	enter(t, bob, id)
+	advance(t, alice, id, "voting")
+
+	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusUnprocessableEntity)
+	call(t, "POST", "/v1/competitions/"+id+"/settle", bob, nil,
+		map[string]string{"X-Admin": "true"}).expect(http.StatusUnprocessableEntity)
+	if got := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json(); got["phase"] != "voting" {
+		t.Fatalf("an early settle left phase %v, want voting", got["phase"])
+	}
+	assertBalance(t, escrowAccount(id), tale(110))
+
+	passTime(t, id, "voting_deadline_at")
+	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
+		expect(http.StatusOK).json()
+	if settled["phase"] != "settled" {
+		t.Fatalf("phase = %v, want settled", settled["phase"])
+	}
 	assertLedgerIntact(t)
 }
 
@@ -928,10 +1067,9 @@ func TestCompetitionSettlementRefusedBeforeVoting(t *testing.T) {
 }
 
 // Settlement builds one ledger transfer, and ledger_postings is keyed
-// (transfer_key, account_id). The two scenarios below are the ones where the
-// same account is credited twice in that transfer — the returned prize plus
-// the host's cut of the entry fees. Before the postings were merged, both
-// aborted the transfer on a duplicate-key violation, after the phase had
+// (transfer_key, account_id). With no winner the same account is credited
+// twice in that transfer — the returned prize plus the host's cut of the entry
+// fees. Before the postings were merged, this aborted the transfer on a duplicate-key violation, after the phase had
 // already been committed as "settling" on a separate connection: settle then
 // re-entered the same failure forever and cancel refused the phase outright,
 // so the escrow was unreachable by any code path.
@@ -943,6 +1081,7 @@ func TestCompetitionSettlementWithFeesAndNoWinnerPaysTheHostOnce(t *testing.T) {
 	enter(t, carol, id)
 	advance(t, alice, id, "voting")
 
+	passTime(t, id, "voting_deadline_at")
 	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
 		expect(http.StatusOK).json()
 	if settled["phase"] != "settled" {
@@ -960,25 +1099,84 @@ func TestCompetitionSettlementWithFeesAndNoWinnerPaysTheHostOnce(t *testing.T) {
 	assertLedgerIntact(t)
 }
 
-func TestCompetitionSettlementWhenTheHostsOwnEntryWins(t *testing.T) {
+// The host takes the fee share and gets the prize back when nobody wins, so a
+// host who could also enter or vote could steer the result toward themselves.
+func TestCompetitionCreatorCannotJoinOrVote(t *testing.T) {
 	reset(t)
-	id := openCompetition(t, alice, "Host wins", tale(100), tale(10))
-	grantInitial(t, bob, dave)
-	enter(t, alice, id)
+	id := openCompetition(t, alice, "Hands off", tale(100), "0")
+	grantInitial(t, bob)
 	enter(t, bob, id)
+
+	call(t, "PUT", "/v1/competitions/"+id+"/join", alice, nil).
+		expect(http.StatusForbidden)
+	agedProfile(t, alice)
+	advance(t, alice, id, "voting")
+	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", alice,
+		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusForbidden)
+
+	got := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if got["participants"].(float64) != 1 || got["ballotCount"].(float64) != 0 {
+		t.Errorf("participants %v, ballots %v; want only bob and no ballots",
+			got["participants"], got["ballotCount"])
+	}
+}
+
+// Two settles that both read the competition before either committed used to
+// both run: the payout was caught by its idempotency key, but the loser still
+// rewrote competition_results and moved settled_at.
+func TestConcurrentSettlesSettleOnce(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	id := openCompetition(t, alice, "Photo finish", tale(100), tale(10))
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	enter(t, carol, id)
 	registerVoter(t, dave, id)
 	advance(t, alice, id, "voting")
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
-		map[string]any{"submissionIds": []string{alice}}).expect(http.StatusNoContent)
+		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
+	passTime(t, id, "voting_deadline_at")
 
-	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
+	// Hold the row so both settles get past their first read, then queue up.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT 1 FROM competitions WHERE id=$1::uuid FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan response, 2)
+	for _, uid := range []string{alice, alice} {
+		go func() {
+			done <- call(t, "POST", "/v1/competitions/"+id+"/settle", uid, nil)
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if got := (<-done).expect(http.StatusOK).json(); got["phase"] != "settled" {
+			t.Errorf("phase = %v, want settled", got["phase"])
+		}
+	}
 
-	// alice escrowed 100 and paid a 10 entry fee, then took the 100 prize and
-	// 18 of the 20 in fees.
-	assertBalance(t, userAccount(alice), tale(initialGrantTale-100-10+100+18))
-	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
-	assertBalance(t, platformAccount(), tale(2))
-	assertBalance(t, escrowAccount(id), "0")
+	// settled_at and the payout share one transaction clock only if no later
+	// settle rewrote the competition after the one that paid.
+	var transfers int
+	var same bool
+	if err = testPool.QueryRow(ctx, `
+		SELECT count(*), bool_and(t.created_at = c.settled_at)
+		FROM ledger_transfers t JOIN competitions c ON c.id = t.competition_id
+		WHERE t.idempotency_key = $1`, "escrow:release:"+id).Scan(&transfers, &same); err != nil {
+		t.Fatal(err)
+	}
+	if transfers != 1 || !same {
+		t.Errorf("payout transfers = %d, settled_at matches payout = %v; want 1 and true",
+			transfers, same)
+	}
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10+100))
 	assertLedgerIntact(t)
 }
 
@@ -1002,6 +1200,7 @@ func TestFailedSettlementLeavesTheCompetitionRetryable(t *testing.T) {
 		`UPDATE token_accounts SET balance=0 WHERE account_id=$1`, escrowAccount(id)); err != nil {
 		t.Fatal(err)
 	}
+	passTime(t, id, "voting_deadline_at")
 	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
 		expect(http.StatusUnprocessableEntity)
 
@@ -1048,6 +1247,7 @@ func TestSettlementResumesFromTheSettlingPhase(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	passTime(t, id, "voting_deadline_at")
 	settled := call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).
 		expect(http.StatusOK).json()
 	if settled["phase"] != "settled" {
@@ -1104,6 +1304,7 @@ func TestCompetitionCancelIsIdempotentAndBlockedAfterSettlement(t *testing.T) {
 	advance(t, alice, other, "voting")
 	call(t, "PUT", "/v1/competitions/"+other+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{carol}}).expect(http.StatusNoContent)
+	passTime(t, other, "voting_deadline_at")
 	call(t, "POST", "/v1/competitions/"+other+"/settle", alice, nil).expect(http.StatusOK)
 	call(t, "POST", "/v1/competitions/"+other+"/cancel", alice,
 		map[string]any{"reason": "too late"}).expect(http.StatusUnprocessableEntity)
@@ -1201,6 +1402,7 @@ func TestCompetitionListingKeepsJoinedAndResults(t *testing.T) {
 	advance(t, alice, id, "voting")
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
 		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
+	passTime(t, id, "voting_deadline_at")
 	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
 
 	listed := get(t, "/v1/competitions", bob).expect(http.StatusOK).list()
@@ -1236,13 +1438,13 @@ func TestCompetitionDraftsAreRateLimited(t *testing.T) {
 	call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
 		"title": "One too many", "description": "d", "category": "flash-fiction",
 		"tags": []string{"x"}, "prizeAmount": tale(1), "creatorName": "Alice",
-	}).expect(http.StatusTooManyRequests)
+	}, asAdmin).expect(http.StatusTooManyRequests)
 
 	// Revising an existing draft still works — the budget is on creation.
 	call(t, "POST", "/v1/competition-drafts?competitionId="+last, alice, map[string]any{
 		"title": "Revised", "description": "d", "category": "flash-fiction",
 		"tags": []string{"x"}, "prizeAmount": tale(1), "creatorName": "Alice",
-	}).expect(http.StatusCreated)
+	}, asAdmin).expect(http.StatusCreated)
 }
 
 // ── phase machine and routing ───────────────────────────────────────────────
@@ -1290,7 +1492,7 @@ func TestAdvanceCannotOpenAnUnfundedDraft(t *testing.T) {
 
 	// Publishing is the door that funds it.
 	call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": id}).expect(http.StatusOK)
+		map[string]any{"competitionId": id}, asAdmin).expect(http.StatusOK)
 	assertBalance(t, escrowAccount(id), tale(500))
 	assertLedgerIntact(t)
 }
@@ -1334,10 +1536,10 @@ func TestAdvanceOnlyFollowsTheClock(t *testing.T) {
 		"deadline":    now.Add(2 * time.Hour).Format(time.RFC3339),
 		"prizeAmount": tale(10), "creatorName": "Alice",
 		"votingDeadline": now.Add(3 * time.Hour).Format(time.RFC3339),
-	}).expect(http.StatusCreated).json()
+	}, asAdmin).expect(http.StatusCreated).json()
 	id := draft["id"].(string)
 	published := call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": id}).expect(http.StatusOK).json()
+		map[string]any{"competitionId": id}, asAdmin).expect(http.StatusOK).json()
 	if published["phase"] != "scheduled" {
 		t.Fatalf("a future start should publish as scheduled, got %v", published["phase"])
 	}
@@ -1376,10 +1578,10 @@ func scheduleCompetition(t *testing.T, uid, title string) string {
 		"deadline":    now.Add(2 * time.Hour).Format(time.RFC3339),
 		"prizeAmount": tale(10), "creatorName": "Alice",
 		"votingDeadline": now.Add(3 * time.Hour).Format(time.RFC3339),
-	}).expect(http.StatusCreated).json()
+	}, asAdmin).expect(http.StatusCreated).json()
 	id := draft["id"].(string)
 	published := call(t, "POST", "/v1/competition-publish", uid,
-		map[string]any{"competitionId": id}).expect(http.StatusOK).json()
+		map[string]any{"competitionId": id}, asAdmin).expect(http.StatusOK).json()
 	if published["phase"] != "scheduled" {
 		t.Fatalf("a future start should publish as scheduled, got %v", published["phase"])
 	}
@@ -1536,7 +1738,7 @@ func TestCompetitionFullLifecycle(t *testing.T) {
 		"prizeAmount":    tale(100),
 		"entryFee":       tale(10),
 		"creatorName":    "Alice",
-	}).expect(http.StatusCreated).json()
+	}, asAdmin).expect(http.StatusCreated).json()
 	id := draft["id"].(string)
 	path := "/v1/competitions/" + id
 	expectPhase("draft", draft, "draft")
@@ -1545,7 +1747,7 @@ func TestCompetitionFullLifecycle(t *testing.T) {
 	assertBalance(t, escrowAccount(id), "0")
 
 	published := call(t, "POST", "/v1/competition-publish", alice,
-		map[string]any{"competitionId": id}).expect(http.StatusOK).json()
+		map[string]any{"competitionId": id}, asAdmin).expect(http.StatusOK).json()
 	expectPhase("publish", published, "scheduled")
 	expectPhase("scheduled read", get(t, path, bob).expect(http.StatusOK).json(), "scheduled")
 	assertBalance(t, userAccount(alice), tale(initialGrantTale-100))
@@ -1596,6 +1798,7 @@ func TestCompetitionFullLifecycle(t *testing.T) {
 	}
 	assertBalance(t, escrowAccount(id), tale(120))
 
+	passTime(t, id, "voting_deadline_at")
 	settled := call(t, "POST", path+"/settle", alice, nil).expect(http.StatusOK).json()
 	expectPhase("settle", settled, "settled")
 	if settled["resultsDigest"] == "" || settled["resultsDigest"] == nil {

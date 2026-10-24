@@ -55,6 +55,8 @@ type Competition struct {
 	// createdAt backs the listing cursor. Unexported because it is ordering
 	// state, not part of the record the API promises.
 	createdAt time.Time
+	// Only the admin read fills this in: a host's reason may not be meant for readers.
+	CancellationReason string `json:"cancellationReason,omitempty"`
 }
 type TokenAmount struct {
 	AssetID  string `json:"assetId"`
@@ -499,7 +501,13 @@ func (s *Store) ListDrafts(ctx context.Context, user string) ([]Competition, err
 	}
 	return out, rows.Err()
 }
-func (s *Store) SaveDraft(ctx context.Context, user string, id string, in CompetitionInput) (Competition, error) {
+
+// SaveDraft and PublishCompetition are admin-only: a host holds the prize
+// escrow and takes a share of entry fees, so hosting is not open to everyone.
+func (s *Store) SaveDraft(ctx context.Context, user string, admin bool, id string, in CompetitionInput) (Competition, error) {
+	if !admin {
+		return Competition{}, ErrForbidden
+	}
 	if strings.TrimSpace(in.Title) == "" || !validCompetitionInput(in) {
 		return Competition{}, ErrValidation
 	}
@@ -550,7 +558,10 @@ func (s *Store) SaveDraft(ctx context.Context, user string, id string, in Compet
 	}
 	return s.competition(ctx, id, user)
 }
-func (s *Store) PublishCompetition(ctx context.Context, id, user string) (Competition, error) {
+func (s *Store) PublishCompetition(ctx context.Context, id, user string, admin bool) (Competition, error) {
+	if !admin {
+		return Competition{}, ErrForbidden
+	}
 	c, e := s.competition(ctx, id, user)
 	if e != nil {
 		return c, e
@@ -654,15 +665,20 @@ func (s *Store) JoinCompetition(ctx context.Context, id, user string) error {
 		return e
 	}
 	defer tx.Rollback(ctx)
-	var phase string
+	var phase, creator string
 	var max *int
 	var n int
-	e = tx.QueryRow(ctx, `SELECT phase,max_participants,participants_count FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &max, &n)
+	e = tx.QueryRow(ctx, `SELECT phase,creator_id,max_participants,participants_count FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &creator, &max, &n)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if e != nil {
 		return e
+	}
+	// The host keeps the fee share and gets the prize back with no winner, so
+	// they may neither enter nor vote; joining is the gate for both.
+	if user == creator {
+		return ErrForbidden
 	}
 	if phase != "open" && phase != "scheduled" {
 		return ErrValidation
@@ -702,11 +718,13 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 	if _, z := uuid.Parse(storyID); z != nil {
 		return ErrNotFound
 	}
+	// Locked so a cancel or phase change in flight finishes first and this sees
+	// it; reading the phase unlocked let a fee land in a cancelled escrow.
 	// $2 is the story, referenced once: an earlier version bound the caller's
 	// id as an extra parameter the SQL never used, which PostgreSQL cannot
 	// type-infer — it made every submission fail with a 500.
 	var prize, escrowed string
-	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text,c.prize_amount::text,COALESCE((SELECT a.balance::text FROM token_accounts a WHERE a.account_id=$3),'0') FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1`, id, storyID, escrow(id)).Scan(&phase, &owner, &title, &author, &cover, &fee, &prize, &escrowed)
+	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text,c.prize_amount::text,COALESCE((SELECT a.balance::text FROM token_accounts a WHERE a.account_id=$3),'0') FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1 FOR UPDATE OF c`, id, storyID, escrow(id)).Scan(&phase, &owner, &title, &author, &cover, &fee, &prize, &escrowed)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -829,6 +847,33 @@ func (s *Store) WithdrawCompetitionSubmission(ctx context.Context, id, user stri
 	return tx.Commit(ctx)
 }
 func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bool, reason string) (Competition, error) {
+	return s.cancelCompetition(ctx, id, user, admin, reason, nil)
+}
+
+// CancelAdminCompetition is CancelCompetition from the admin page. A reason is
+// required, and the cancellation is recorded in admin_audit in the same
+// transaction as the refund.
+func (s *Store) CancelAdminCompetition(ctx context.Context, admin bool, actor, id, reason string) (Competition, error) {
+	if !admin {
+		return Competition{}, ErrForbidden
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" || len(reason) > 500 {
+		return Competition{}, ErrValidation
+	}
+	return s.cancelCompetition(ctx, id, actor, true, reason, func(ctx context.Context, tx pgx.Tx, c Competition) error {
+		return writeAdminAudit(ctx, tx, actor, "competition.cancel", c.ID, map[string]any{
+			"creatorId": c.CreatorID, "phase": c.Phase, "reason": reason,
+		})
+	})
+}
+
+// cancelCompetition refunds the prize to the host and every held entry fee to
+// whoever paid it, and marks the competition cancelled, all in one transaction
+// behind a lock on the competition row, so a crash cannot leave money refunded
+// on a competition that still reads open, and a concurrent settle cannot pay out
+// from the same escrow. before, when set, runs just before commit.
+func (s *Store) cancelCompetition(ctx context.Context, id, user string, admin bool, reason string, before func(context.Context, pgx.Tx, Competition) error) (Competition, error) {
 	c, e := s.competition(ctx, id, user)
 	if e != nil {
 		return c, e
@@ -836,14 +881,22 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 	if !admin && c.CreatorID != user {
 		return c, ErrForbidden
 	}
+	tx, e := s.db.Begin(ctx)
+	if e != nil {
+		return c, e
+	}
+	defer tx.Rollback(ctx)
+	if e = tx.QueryRow(ctx, `SELECT phase,prize_amount::text FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&c.Phase, &c.PrizePool.Amount); e != nil {
+		return c, e
+	}
 	if c.Phase == "settled" || c.Phase == "settling" {
 		return c, ErrValidation
 	}
 	if c.Phase == "cancelled" {
-		return c, nil
+		return s.competition(ctx, id, user)
 	}
 	posts := map[string]*big.Int{account(c.CreatorID): new(big.Int)}
-	rows, e := s.db.Query(ctx, `SELECT user_id,amount::text FROM competition_contributions WHERE competition_id=$1 AND state='held'`, id)
+	rows, e := tx.Query(ctx, `SELECT user_id,amount::text FROM competition_contributions WHERE competition_id=$1 AND state='held'`, id)
 	if e != nil {
 		return c, e
 	}
@@ -860,6 +913,9 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 		posts[account(u)].Add(posts[account(u)], n)
 	}
 	rows.Close()
+	if e = rows.Err(); e != nil {
+		return c, e
+	}
 	seed, _ := new(big.Int).SetString(c.PrizePool.Amount, 10)
 	posts[account(c.CreatorID)].Add(posts[account(c.CreatorID)], seed)
 	total := new(big.Int)
@@ -873,16 +929,22 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 		}
 	}
 	if total.Sign() > 0 {
-		if e = s.transfer(ctx, "escrow:refund:competition:"+id, "escrow:refund", id, ps); e != nil {
+		if e = s.transferTx(ctx, tx, "escrow:refund:competition:"+id, "escrow:refund", id, ps); e != nil {
 			return c, e
 		}
 	}
-	_, e = s.db.Exec(ctx, `UPDATE competitions SET phase='cancelled',entry_fees_held=0,cancellation_reason=$1,updated_at=now() WHERE id=$2`, reason, id)
-	if e != nil {
+	if _, e = tx.Exec(ctx, `UPDATE competitions SET phase='cancelled',entry_fees_held=0,cancellation_reason=$1,updated_at=now() WHERE id=$2`, reason, id); e != nil {
 		return c, e
 	}
-	_, e = s.db.Exec(ctx, `UPDATE competition_contributions SET state='refunded',updated_at=now() WHERE competition_id=$1 AND state='held'`, id)
-	if e != nil {
+	if _, e = tx.Exec(ctx, `UPDATE competition_contributions SET state='refunded',updated_at=now() WHERE competition_id=$1 AND state='held'`, id); e != nil {
+		return c, e
+	}
+	if before != nil {
+		if e = before(ctx, tx, c); e != nil {
+			return c, e
+		}
+	}
+	if e = tx.Commit(ctx); e != nil {
 		return c, e
 	}
 	return s.competition(ctx, id, user)
@@ -996,14 +1058,17 @@ func (s *Store) CastBallot(ctx context.Context, id, user string, choices []strin
 	defer tx.Rollback(ctx)
 	var phase string
 	var maxVotes int
-	e = tx.QueryRow(ctx, `SELECT phase,max_votes_per_user FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &maxVotes)
+	var closed bool
+	// The ballot box shuts at voting_deadline_at, judged on the database clock
+	// that SweepDuePhases uses, even while the competition still reads `voting`.
+	e = tx.QueryRow(ctx, `SELECT phase,max_votes_per_user,COALESCE(now()>=voting_deadline_at,false) FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &maxVotes, &closed)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if e != nil {
 		return e
 	}
-	if phase != "voting" {
+	if phase != "voting" || closed {
 		return ErrValidation
 	}
 	// The per-competition ceiling, which the host sets; the hard-coded 3 this
@@ -1077,6 +1142,71 @@ WHERE (phase='scheduled' AND start_at <= now())
 	return e
 }
 
+// ListDueSettlements returns the competitions whose voting deadline has
+// passed and that still need settling, oldest deadline first.
+func (s *Store) ListDueSettlements(ctx context.Context) ([]string, error) {
+	rows, e := s.db.Query(ctx, `SELECT id::text FROM competitions WHERE phase='voting' AND voting_deadline_at<=now() ORDER BY voting_deadline_at,id`)
+	if e != nil {
+		return nil, e
+	}
+	ids, e := pgx.CollectRows(rows, pgx.RowTo[string])
+	if ids == nil {
+		ids = []string{}
+	}
+	return ids, e
+}
+
+// SettleIfDue settles c when it is in voting past its voting deadline, and
+// reports whether it did. SettleCompetition re-checks the deadline on the
+// database clock, so the pre-check here only skips the call when nothing is due.
+func (s *Store) SettleIfDue(ctx context.Context, c Competition) (bool, error) {
+	if c.Phase != "voting" || c.VotingDeadline == nil || time.Now().Before(*c.VotingDeadline) {
+		return false, nil
+	}
+	if _, e := s.SettleCompetition(ctx, c.ID, "system", true); e != nil {
+		return false, e
+	}
+	return true, nil
+}
+
+type SettleDueResult struct {
+	Settled []string `json:"settled"`
+	Failed  []string `json:"failed"`
+	errs    []error
+}
+
+// Err joins every per-competition failure, for logging; nil when none failed.
+func (r SettleDueResult) Err() error { return errors.Join(r.errs...) }
+
+// SettleDue settles every competition whose voting deadline has passed, each
+// in its own transaction, so one failure does not hold up the rest. It sweeps
+// first: open -> voting otherwise waits for someone to request the competition.
+// A non-empty actor records each settlement in admin_audit. The error is only
+// for a sweep or listing that failed; per-competition failures are in the result.
+func (s *Store) SettleDue(ctx context.Context, actor string) (SettleDueResult, error) {
+	r := SettleDueResult{Settled: []string{}, Failed: []string{}}
+	if e := s.SweepDuePhases(ctx); e != nil {
+		return r, e
+	}
+	ids, e := s.ListDueSettlements(ctx)
+	if e != nil {
+		return r, e
+	}
+	var audit func(context.Context, pgx.Tx, Competition) error
+	if actor != "" {
+		audit = settleAudit(actor, map[string]any{"via": "settle-due"})
+	}
+	for _, id := range ids {
+		if _, e = s.settleCompetition(ctx, id, "system", true, audit); e != nil {
+			r.Failed = append(r.Failed, id)
+			r.errs = append(r.errs, fmt.Errorf("settle %s: %w", id, e))
+			continue
+		}
+		r.Settled = append(r.Settled, id)
+	}
+	return r, nil
+}
+
 func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string, admin bool) (Competition, error) {
 	c, e := s.competition(ctx, id, user)
 	if e != nil {
@@ -1128,18 +1258,38 @@ func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string,
 	return s.competition(ctx, id, user)
 }
 func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bool) (Competition, error) {
+	return s.settleCompetition(ctx, id, user, admin, nil)
+}
+
+// SettleAdminCompetition is SettleCompetition from the admin page, recorded in
+// admin_audit in the same transaction as the payout.
+func (s *Store) SettleAdminCompetition(ctx context.Context, admin bool, actor, id string) (Competition, error) {
+	if !admin {
+		return Competition{}, ErrForbidden
+	}
+	return s.settleCompetition(ctx, id, actor, true, settleAudit(actor, nil))
+}
+
+// settleAudit records a settlement as actor's admin action.
+func settleAudit(actor string, detail map[string]any) func(context.Context, pgx.Tx, Competition) error {
+	return func(ctx context.Context, tx pgx.Tx, c Competition) error {
+		d := map[string]any{"creatorId": c.CreatorID, "prize": c.PrizePool.Amount, "entryFeesHeld": c.EntryFeesHeld}
+		for k, v := range detail {
+			d[k] = v
+		}
+		return writeAdminAudit(ctx, tx, actor, "competition.settle", c.ID, d)
+	}
+}
+
+// settleCompetition runs before, when set, inside the settlement transaction
+// just before it commits, and only when this call actually settles.
+func (s *Store) settleCompetition(ctx context.Context, id, user string, admin bool, before func(context.Context, pgx.Tx, Competition) error) (Competition, error) {
 	c, e := s.competition(ctx, id, user)
 	if e != nil {
 		return c, e
 	}
 	if !admin && c.CreatorID != user {
 		return c, ErrForbidden
-	}
-	if c.Phase == "settled" {
-		return c, nil
-	}
-	if c.Phase != "voting" && c.Phase != "settling" {
-		return c, ErrValidation
 	}
 	// Everything below — the settling claim, the payout, the results rows and
 	// the final settled phase — commits or rolls back together. Claiming the
@@ -1151,6 +1301,24 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 		return c, e
 	}
 	defer tx.Rollback(ctx)
+	// Re-read under the row lock: a concurrent settle that committed while this
+	// one waited must turn it into a no-op, not a second rewrite of the results.
+	var open bool
+	e = tx.QueryRow(ctx, `SELECT phase,prize_amount::text,entry_fees_held::text,fee_bps,COALESCE(now()<voting_deadline_at,false) FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&c.Phase, &c.PrizePool.Amount, &c.EntryFeesHeld, &c.FeeBps, &open)
+	if e != nil {
+		return c, e
+	}
+	if c.Phase == "settled" {
+		return s.competition(ctx, id, user)
+	}
+	if c.Phase != "voting" && c.Phase != "settling" {
+		return c, ErrValidation
+	}
+	// Nobody, admin included, may settle while voting is still open: an early
+	// settle at zero ballots hands the host the prize and their fee share.
+	if open {
+		return c, ErrValidation
+	}
 	_, e = tx.Exec(ctx, `UPDATE competitions SET phase='settling',settlement_claimed_at=COALESCE(settlement_claimed_at,now()) WHERE id=$1 AND phase IN ('voting','settling')`, id)
 	if e != nil {
 		return c, e
@@ -1226,6 +1394,11 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 	_, e = tx.Exec(ctx, `UPDATE competitions SET phase='settled',entry_fees_held=0,results_digest=$1,settled_at=now(),updated_at=now() WHERE id=$2`, hex.EncodeToString(d[:]), id)
 	if e != nil {
 		return c, e
+	}
+	if before != nil {
+		if e = before(ctx, tx, c); e != nil {
+			return c, e
+		}
 	}
 	if e = tx.Commit(ctx); e != nil {
 		return c, e

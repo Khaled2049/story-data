@@ -26,6 +26,18 @@ func (s *Server) sweepDuePhases(r *http.Request) {
 	}
 }
 
+// settleOnRead settles a competition the reader finds past its voting deadline,
+// so results appear without a scheduler. It runs once per competition: after
+// that it is settled. Failures are logged and swallowed for the same reason as
+// the sweep; the competition stays in voting and the next read retries.
+func (s *Server) settleOnRead(r *http.Request, c store.Competition) bool {
+	settled, e := s.store.SettleIfDue(r.Context(), c)
+	if e != nil {
+		slog.Error("settling a due competition on read failed", "competition", c.ID, "error", e)
+	}
+	return settled
+}
+
 func (s *Server) competitions(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/v1/competitions" {
 		notFound(w)
@@ -44,6 +56,17 @@ func (s *Server) competitions(w http.ResponseWriter, r *http.Request) {
 	if e != nil {
 		respond(w, nil, e)
 		return
+	}
+	settled := false
+	for _, c := range page.Competitions {
+		settled = s.settleOnRead(r, c) || settled
+	}
+	if settled {
+		page, e = s.store.ListCompetitions(r.Context(), s.optionalUser(r), r.URL.Query().Get("cursor"), limit)
+		if e != nil {
+			respond(w, nil, e)
+			return
+		}
 	}
 	// The body stays a bare array — the frontend maps over it directly — so the
 	// continuation token rides in a header rather than wrapping the payload in
@@ -87,6 +110,9 @@ func (s *Server) competition(w http.ResponseWriter, r *http.Request) {
 	if len(p) == 1 {
 		if r.Method == http.MethodGet {
 			x, e := s.store.GetCompetition(r.Context(), id, s.optionalUser(r))
+			if e == nil && s.settleOnRead(r, x) {
+				x, e = s.store.GetCompetition(r.Context(), id, s.optionalUser(r))
+			}
 			respond(w, x, e)
 			return
 		}
@@ -230,7 +256,7 @@ func (s *Server) competitionDrafts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("competitionId")
-	x, e := s.store.SaveDraft(r.Context(), uid, id, in)
+	x, e := s.store.SaveDraft(r.Context(), uid, s.isAdmin(r), id, in)
 	if e == nil {
 		write(w, http.StatusCreated, x)
 	} else {
@@ -248,7 +274,7 @@ func (s *Server) competitionPublish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost || !decode(w, r, &in) {
 		return
 	}
-	x, e := s.store.PublishCompetition(r.Context(), in.CompetitionID, uid)
+	x, e := s.store.PublishCompetition(r.Context(), in.CompetitionID, uid, s.isAdmin(r))
 	respond(w, x, e)
 }
 func (s *Server) isAdmin(r *http.Request) bool {

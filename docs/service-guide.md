@@ -180,7 +180,21 @@ The dedicated moderation routes `/v1/admin/competitions` and
 `/v1/admin/competitions/{id}` allow verified admins to list and review all
 competitions, including drafts. These routes return `Cache-Control: no-store`
 and preserve the embargo on unsettled vote tallies. The list accepts `q`,
-`phase`, `limit` and `cursor`, returning `{competitions,nextCursor}`. Admins may
+`phase`, `limit` and `cursor`, returning `{competitions,nextCursor}`. Besides
+the phases, `phase=awaiting-settlement` lists competitions in `voting` past their
+voting deadline: the ones settle-on-read has not reached because nobody has
+opened them. Admin reads never settle, so that list stays accurate.
+`POST /v1/admin/competitions/{id}/settle` settles one (still refused before the
+voting deadline), and `POST /v1/admin/competitions/settle-due` settles every
+overdue one, returning `{settled,failed}` as ids only; failure detail goes to
+the log. Each settlement writes a `competition.settle` row to `admin_audit` in
+the same transaction as the payout, so a refused or failed settle leaves no
+audit row and a payout never lacks one.
+`POST /v1/admin/competitions/{id}/cancel` with `{reason}` cancels a competition
+that has not settled: a reason of 1 to 500 characters is required, and the
+refund, the cancelled phase and a `competition.cancel` audit row commit
+together. Only the admin read returns `cancellationReason`; readers never see
+it. Admins may
 delete an unpublished draft through `DELETE /v1/admin/competitions/{id}`;
 published competitions return `409` and must use the existing cancellation and
 refund flow. `/admin/competitions` is the matching protected frontend table.
@@ -197,6 +211,16 @@ directory. The guard lives in `GetCompetition`/`ListSubmissions`, not in the
 internal `competition()` helper, which every store method uses with the acting
 user and must keep working for an admin operating on someone else's record.
 
+### Who may host
+
+Only admins may host a competition. `POST /v1/competition-drafts` and
+`POST /v1/competition-publish` return `403` to anyone else; the check is in
+`SaveDraft` and `PublishCompetition`. A host holds the prize escrow and takes a
+share of entry fees, so the frontend hiding its host controls from non-admins is
+not enough on its own. Admin comes from the Firebase `admin` claim in
+production and from `X-Admin: true` under `AUTH_MODE=dev`. Every other host
+action is already limited to a draft's creator, so it inherits the rule.
+
 ### Competition voter eligibility
 
 Casting a competition ballot needs more than a valid token, because a ballot
@@ -207,6 +231,63 @@ do — and must hold a **public profile** at least `VOTER_MIN_PROFILE_AGE` old
 freshly seeded account can vote; a malformed value fails startup rather than
 silently reverting to the default. Ballot size is capped per competition by
 `competitions.max_votes_per_user`.
+
+The **creator** may not join their own competition (`403`), and so can neither
+enter nor vote in it. They keep the host share of entry fees and get the prize
+back when nobody wins, so they must have no say in the result.
+
+### Competition voting deadline
+
+`voting_deadline_at` is enforced, judged on the database clock. A competition
+stays in `voting` until it is settled, so the phase alone does not say whether
+voting is open:
+
+- `CastBallot` refuses (`422`) once `now() >= voting_deadline_at`, including a
+  recast of an existing ballot.
+- `SettleCompetition` refuses (`422`) while `now() < voting_deadline_at`, for
+  the creator and admins alike. Settling early at zero ballots would return the
+  prize and the host's fee share to the creator; `CancelCompetition`, which
+  refunds every fee, is the way to end a competition early.
+
+Settlement re-reads the competition under a row lock inside its transaction,
+so it is idempotent under a race as well as on retry: a settle that waited on
+one which committed returns the settled competition and writes nothing.
+
+### Settling due competitions
+
+`SweepDuePhases` deliberately stops at `voting`: settling tallies ballots and
+moves money, so it does not run against every competition before every request.
+Nothing runs on a schedule either. A competition settles in one of three ways:
+
+- **On read.** `GET /v1/competitions/{id}` and `GET /v1/competitions` settle any
+  competition they are about to return that is in `voting` past its
+  `voting_deadline_at` (`Store.SettleIfDue`, called from `settleOnRead` in
+  `internal/httpapi/competitions.go`), then re-read it, so the first reader after
+  the deadline sees the results. The list settles only the page it returns. It
+  happens once per competition; concurrent readers are safe because settlement
+  is idempotent under a race. A failure is logged and the read still succeeds
+  with the competition in `voting`; the next read retries it.
+- **By the creator or an admin,** through `POST /v1/competitions/{id}/settle`,
+  once the deadline has passed. The frontend offers this as a button.
+- **From the admin page,** one at a time or all overdue at once, through the
+  admin routes in "Competition read visibility" above. These are audited.
+- **By hand,** with the `settle-due` command, for competitions nobody has
+  opened since their deadline:
+
+  ```bash
+  story-data settle-due      # or: go run ./cmd/api settle-due
+  ```
+
+  `Store.SettleDue` sweeps first, since a competition nobody has requested since
+  its entry deadline still reads `open`. It then settles every competition in
+  `voting` whose `voting_deadline_at` has passed (`ListDueSettlements`), each in
+  its own transaction. A failure is logged and skipped, the rest still settle,
+  and the command exits non-zero. A second run with nothing due changes nothing.
+
+Settling on read means a winner is paid only once someone looks at the
+competition or the list after the deadline. That trades payout latency for
+having no scheduled job keeping the database awake. If timing matters more
+later, run `settle-due` on a schedule; the command is ready for it.
 
 ## Errors, logging and lifecycle
 

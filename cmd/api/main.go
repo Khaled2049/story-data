@@ -28,8 +28,10 @@ const (
 	// A full re-derivation of the reader signals. Generous because it scans the
 	// social tables end to end, but bounded so a scheduled run cannot hang.
 	syncRecsTimeout = 10 * time.Minute
-	maxConns        = 10
-	migrateLockID   = 82104231
+	// Each settlement is one short transaction; this only bounds a backlog.
+	settleDueTimeout = 5 * time.Minute
+	maxConns         = 10
+	migrateLockID    = 82104231
 
 	// Without these the server runs on a zero-value http.Server, where a
 	// client that opens a connection and dribbles headers holds a goroutine
@@ -92,6 +94,24 @@ func main() {
 		}
 		slog.Info("recommendation signals synced",
 			"interactions", stats.Interactions, "views", stats.Views)
+		return
+	}
+	// Settle every competition whose voting deadline has passed, then exit.
+	// Kept out of SweepDuePhases: settling tallies and moves money per row.
+	if len(os.Args) > 1 && os.Args[1] == "settle-due" {
+		settleCtx, cancelSettle := context.WithTimeout(context.Background(), settleDueTimeout)
+		defer cancelSettle()
+		res, e := st.SettleDue(settleCtx, "")
+		if e != nil {
+			log.Fatal(e)
+		}
+		for _, id := range res.Settled {
+			slog.Info("competition settled", "competition", id)
+		}
+		slog.Info("settle-due finished", "settled", len(res.Settled), "failed", len(res.Failed))
+		if e = res.Err(); e != nil {
+			log.Fatal(e)
+		}
 		return
 	}
 	if cfg.VoterMinProfileAge != nil {
