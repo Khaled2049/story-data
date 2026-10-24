@@ -187,6 +187,16 @@ directory. The guard lives in `GetCompetition`/`ListSubmissions`, not in the
 internal `competition()` helper, which every store method uses with the acting
 user and must keep working for an admin operating on someone else's record.
 
+### Who may host
+
+Only admins may host a competition. `POST /v1/competition-drafts` and
+`POST /v1/competition-publish` return `403` to anyone else; the check is in
+`SaveDraft` and `PublishCompetition`. A host holds the prize escrow and takes a
+share of entry fees, so the frontend hiding its host controls from non-admins is
+not enough on its own. Admin comes from the Firebase `admin` claim in
+production and from `X-Admin: true` under `AUTH_MODE=dev`. Every other host
+action is already limited to a draft's creator, so it inherits the rule.
+
 ### Competition voter eligibility
 
 Casting a competition ballot needs more than a valid token, because a ballot

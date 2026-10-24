@@ -39,7 +39,11 @@ func TestInvalidInputIsNot500(t *testing.T) {
 			map[string]any{"rating": 99}},
 	}
 	for _, c := range cases {
-		got := call(t, c.method, c.path, alice, c.body)
+		var headers []map[string]string
+		if strings.HasPrefix(c.path, "/v1/competition-") {
+			headers = append(headers, asAdmin)
+		}
+		got := call(t, c.method, c.path, alice, c.body, headers...)
 		if got.Status >= 500 {
 			t.Errorf("%s = %d, want a 4xx — body: %s", c.name, got.Status, got.Body)
 		}
@@ -58,7 +62,7 @@ func TestInvalidInputIsNot500(t *testing.T) {
 	// it succeeds rather than turning into a 422.
 	created := call(t, "POST", "/v1/competition-drafts", alice, map[string]any{
 		"title": "No tags", "description": "d", "category": "c", "creatorName": "Alice",
-	}).expect(http.StatusCreated).json()
+	}, asAdmin).expect(http.StatusCreated).json()
 	if tags, ok := created["tags"].([]any); !ok || len(tags) != 0 {
 		t.Errorf("tags = %v, want an empty array", created["tags"])
 	}

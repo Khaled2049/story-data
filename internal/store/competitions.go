@@ -499,7 +499,13 @@ func (s *Store) ListDrafts(ctx context.Context, user string) ([]Competition, err
 	}
 	return out, rows.Err()
 }
-func (s *Store) SaveDraft(ctx context.Context, user string, id string, in CompetitionInput) (Competition, error) {
+
+// SaveDraft and PublishCompetition are admin-only: a host holds the prize
+// escrow and takes a share of entry fees, so hosting is not open to everyone.
+func (s *Store) SaveDraft(ctx context.Context, user string, admin bool, id string, in CompetitionInput) (Competition, error) {
+	if !admin {
+		return Competition{}, ErrForbidden
+	}
 	if strings.TrimSpace(in.Title) == "" || !validCompetitionInput(in) {
 		return Competition{}, ErrValidation
 	}
@@ -550,7 +556,10 @@ func (s *Store) SaveDraft(ctx context.Context, user string, id string, in Compet
 	}
 	return s.competition(ctx, id, user)
 }
-func (s *Store) PublishCompetition(ctx context.Context, id, user string) (Competition, error) {
+func (s *Store) PublishCompetition(ctx context.Context, id, user string, admin bool) (Competition, error) {
+	if !admin {
+		return Competition{}, ErrForbidden
+	}
 	c, e := s.competition(ctx, id, user)
 	if e != nil {
 		return c, e

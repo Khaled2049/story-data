@@ -256,7 +256,7 @@ func (s *Server) competitionDrafts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("competitionId")
-	x, e := s.store.SaveDraft(r.Context(), uid, id, in)
+	x, e := s.store.SaveDraft(r.Context(), uid, s.isAdmin(r), id, in)
 	if e == nil {
 		write(w, http.StatusCreated, x)
 	} else {
@@ -274,7 +274,7 @@ func (s *Server) competitionPublish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost || !decode(w, r, &in) {
 		return
 	}
-	x, e := s.store.PublishCompetition(r.Context(), in.CompetitionID, uid)
+	x, e := s.store.PublishCompetition(r.Context(), in.CompetitionID, uid, s.isAdmin(r))
 	respond(w, x, e)
 }
 func (s *Server) isAdmin(r *http.Request) bool {
