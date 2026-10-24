@@ -37,8 +37,9 @@ migrations at startup, under a PostgreSQL advisory lock.
 recommendations workflow rather than by the API process.
 
 `go run ./cmd/api settle-due` settles every competition whose voting deadline
-has passed, then exits. See "Settling due competitions" in
-`docs/service-guide.md`.
+has passed, then exits. Production runs it hourly as the
+`novelsync-story-data-settle-due` Cloud Run Job, started by Cloud Scheduler.
+See "Settling due competitions" in `docs/service-guide.md`.
 
 For pgvector local development, use `docker compose up --build`; the bundled
 database image includes the `vector` extension. Then run agents with
