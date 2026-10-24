@@ -1099,6 +1099,19 @@ func (s *Store) ListDueSettlements(ctx context.Context) ([]string, error) {
 	return ids, e
 }
 
+// SettleIfDue settles c when it is in voting past its voting deadline, and
+// reports whether it did. SettleCompetition re-checks the deadline on the
+// database clock, so the pre-check here only skips the call when nothing is due.
+func (s *Store) SettleIfDue(ctx context.Context, c Competition) (bool, error) {
+	if c.Phase != "voting" || c.VotingDeadline == nil || time.Now().Before(*c.VotingDeadline) {
+		return false, nil
+	}
+	if _, e := s.SettleCompetition(ctx, c.ID, "system", true); e != nil {
+		return false, e
+	}
+	return true, nil
+}
+
 // SettleDue settles every competition whose voting deadline has passed, each
 // in its own transaction, so one failure does not hold up the rest. It sweeps
 // first: open -> voting otherwise waits for someone to request the competition.

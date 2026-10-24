@@ -222,23 +222,36 @@ one which committed returns the settled competition and writes nothing.
 ### Settling due competitions
 
 `SweepDuePhases` deliberately stops at `voting`: settling tallies ballots and
-moves money, so it does not belong in a sweep that runs before every request.
-The `settle-due` command does it instead:
+moves money, so it does not run against every competition before every request.
+Nothing runs on a schedule either. A competition settles in one of three ways:
 
-```bash
-story-data settle-due      # or: go run ./cmd/api settle-due
-```
+- **On read.** `GET /v1/competitions/{id}` and `GET /v1/competitions` settle any
+  competition they are about to return that is in `voting` past its
+  `voting_deadline_at` (`Store.SettleIfDue`, called from `settleOnRead` in
+  `internal/httpapi/competitions.go`), then re-read it, so the first reader after
+  the deadline sees the results. The list settles only the page it returns. It
+  happens once per competition; concurrent readers are safe because settlement
+  is idempotent under a race. A failure is logged and the read still succeeds
+  with the competition in `voting`; the next read retries it.
+- **By the creator or an admin,** through `POST /v1/competitions/{id}/settle`,
+  once the deadline has passed. The frontend offers this as a button.
+- **By hand,** with the `settle-due` command, for competitions nobody has
+  opened since their deadline:
 
-`Store.SettleDue` sweeps first, since a competition nobody has requested since
-its entry deadline still reads `open`. It then settles every competition in
-`voting` whose `voting_deadline_at` has passed (`ListDueSettlements`), each in
-its own transaction through `SettleCompetition` as an admin. A failure is logged
-and skipped, the rest still settle, and the command exits non-zero. The failed
-competition stays in `voting` and is retried by the next run. A second run with
-nothing due changes nothing.
+  ```bash
+  story-data settle-due      # or: go run ./cmd/api settle-due
+  ```
 
-The creator or an admin can still call `POST /v1/competitions/{id}/settle` once
-the deadline has passed.
+  `Store.SettleDue` sweeps first, since a competition nobody has requested since
+  its entry deadline still reads `open`. It then settles every competition in
+  `voting` whose `voting_deadline_at` has passed (`ListDueSettlements`), each in
+  its own transaction. A failure is logged and skipped, the rest still settle,
+  and the command exits non-zero. A second run with nothing due changes nothing.
+
+Settling on read means a winner is paid only once someone looks at the
+competition or the list after the deadline. That trades payout latency for
+having no scheduled job keeping the database awake. If timing matters more
+later, run `settle-due` on a schedule; the command is ready for it.
 
 ## Errors, logging and lifecycle
 
