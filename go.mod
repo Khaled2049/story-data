@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	firebase.google.com/go/v4 v4.20.0
 	github.com/google/uuid v1.6.0
-	github.com/jackc/pgx/v5 v5.8.0
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/pressly/goose/v3 v3.25.0
 	golang.org/x/time v0.15.0
 )
