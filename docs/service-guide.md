@@ -219,8 +219,26 @@ Settlement re-reads the competition under a row lock inside its transaction,
 so it is idempotent under a race as well as on retry: a settle that waited on
 one which committed returns the settled competition and writes nothing.
 
-Nothing settles a competition automatically yet; the creator or an admin calls
-`POST /v1/competitions/{id}/settle` after the deadline.
+### Settling due competitions
+
+`SweepDuePhases` deliberately stops at `voting`: settling tallies ballots and
+moves money, so it does not belong in a sweep that runs before every request.
+The `settle-due` command does it instead:
+
+```bash
+story-data settle-due      # or: go run ./cmd/api settle-due
+```
+
+`Store.SettleDue` sweeps first, since a competition nobody has requested since
+its entry deadline still reads `open`. It then settles every competition in
+`voting` whose `voting_deadline_at` has passed (`ListDueSettlements`), each in
+its own transaction through `SettleCompetition` as an admin. A failure is logged
+and skipped, the rest still settle, and the command exits non-zero. The failed
+competition stays in `voting` and is retried by the next run. A second run with
+nothing due changes nothing.
+
+The creator or an admin can still call `POST /v1/competitions/{id}/settle` once
+the deadline has passed.
 
 ## Errors, logging and lifecycle
 

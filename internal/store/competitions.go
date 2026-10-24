@@ -1085,6 +1085,44 @@ WHERE (phase='scheduled' AND start_at <= now())
 	return e
 }
 
+// ListDueSettlements returns the competitions whose voting deadline has
+// passed and that still need settling, oldest deadline first.
+func (s *Store) ListDueSettlements(ctx context.Context) ([]string, error) {
+	rows, e := s.db.Query(ctx, `SELECT id::text FROM competitions WHERE phase='voting' AND voting_deadline_at<=now() ORDER BY voting_deadline_at,id`)
+	if e != nil {
+		return nil, e
+	}
+	ids, e := pgx.CollectRows(rows, pgx.RowTo[string])
+	if ids == nil {
+		ids = []string{}
+	}
+	return ids, e
+}
+
+// SettleDue settles every competition whose voting deadline has passed, each
+// in its own transaction, so one failure does not hold up the rest. It sweeps
+// first: open -> voting otherwise waits for someone to request the competition.
+// It returns the ids it settled and every failure, joined.
+func (s *Store) SettleDue(ctx context.Context) ([]string, error) {
+	if e := s.SweepDuePhases(ctx); e != nil {
+		return nil, e
+	}
+	ids, e := s.ListDueSettlements(ctx)
+	if e != nil {
+		return nil, e
+	}
+	settled := []string{}
+	var failed []error
+	for _, id := range ids {
+		if _, e = s.SettleCompetition(ctx, id, "system", true); e != nil {
+			failed = append(failed, fmt.Errorf("settle %s: %w", id, e))
+			continue
+		}
+		settled = append(settled, id)
+	}
+	return settled, errors.Join(failed...)
+}
+
 func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string, admin bool) (Competition, error) {
 	c, e := s.competition(ctx, id, user)
 	if e != nil {

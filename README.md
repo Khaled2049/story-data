@@ -36,6 +36,10 @@ migrations at startup, under a PostgreSQL advisory lock.
 `novelsync-story-data-sync-recs` Cloud Run Job; it is invoked by the ordered
 recommendations workflow rather than by the API process.
 
+`go run ./cmd/api settle-due` settles every competition whose voting deadline
+has passed, then exits. See "Settling due competitions" in
+`docs/service-guide.md`.
+
 For pgvector local development, use `docker compose up --build`; the bundled
 database image includes the `vector` extension. Then run agents with
 `STORY_DATA_DATABASE_URL=postgres://postgres:postgres@localhost:5433/story_data`
