@@ -198,6 +198,22 @@ freshly seeded account can vote; a malformed value fails startup rather than
 silently reverting to the default. Ballot size is capped per competition by
 `competitions.max_votes_per_user`.
 
+### Competition voting deadline
+
+`voting_deadline_at` is enforced, judged on the database clock. A competition
+stays in `voting` until it is settled, so the phase alone does not say whether
+voting is open:
+
+- `CastBallot` refuses (`422`) once `now() >= voting_deadline_at`, including a
+  recast of an existing ballot.
+- `SettleCompetition` refuses (`422`) while `now() < voting_deadline_at`, for
+  the creator and admins alike. Settling early at zero ballots would return the
+  prize and the host's fee share to the creator; `CancelCompetition`, which
+  refunds every fee, is the way to end a competition early.
+
+Nothing settles a competition automatically yet; the creator or an admin calls
+`POST /v1/competitions/{id}/settle` after the deadline.
+
 ## Errors, logging and lifecycle
 
 **Error mapping** lives in `respond` (`internal/httpapi/server.go`). The store's

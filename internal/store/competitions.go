@@ -996,14 +996,17 @@ func (s *Store) CastBallot(ctx context.Context, id, user string, choices []strin
 	defer tx.Rollback(ctx)
 	var phase string
 	var maxVotes int
-	e = tx.QueryRow(ctx, `SELECT phase,max_votes_per_user FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &maxVotes)
+	var closed bool
+	// The ballot box shuts at voting_deadline_at, judged on the database clock
+	// that SweepDuePhases uses, even while the competition still reads `voting`.
+	e = tx.QueryRow(ctx, `SELECT phase,max_votes_per_user,COALESCE(now()>=voting_deadline_at,false) FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &maxVotes, &closed)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if e != nil {
 		return e
 	}
-	if phase != "voting" {
+	if phase != "voting" || closed {
 		return ErrValidation
 	}
 	// The per-competition ceiling, which the host sets; the hard-coded 3 this
@@ -1139,6 +1142,15 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 		return c, nil
 	}
 	if c.Phase != "voting" && c.Phase != "settling" {
+		return c, ErrValidation
+	}
+	// Nobody, admin included, may settle while voting is still open: an early
+	// settle at zero ballots hands the host the prize and their fee share.
+	var open bool
+	if e = s.db.QueryRow(ctx, `SELECT COALESCE(now()<voting_deadline_at,false) FROM competitions WHERE id=$1`, id).Scan(&open); e != nil {
+		return c, e
+	}
+	if open {
 		return c, ErrValidation
 	}
 	// Everything below — the settling claim, the payout, the results rows and
