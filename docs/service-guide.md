@@ -164,6 +164,16 @@ AI counters kept here, counts only: `indexingPasses` (`indexing_usage`) and
 days, the last 30 by default, at most 90 (`422` otherwise), every day present.
 The admin AI usage page combines it with creditProxy's ledger.
 
+`PUT /v1/admin/members/{userId}/ban` (`{reason}`, at most 500 characters) and
+`DELETE` on the same path ban a member and lift the ban (`user_bans`). Every
+route that resolves the caller through `Server.user` checks the table, one
+primary-key lookup, and answers `403 account suspended`, including the MCP
+server's service-token path. Public reads stay open, and the member's published
+stories stay up. An admin cannot ban themselves (`422`). The frontend's
+`setUserBan` Function also disables the Firebase account and revokes its
+sessions; this table is what refuses the ID token they already hold, which
+stays valid for up to an hour.
+
 ### Competition read visibility
 
 The dedicated moderation routes `/v1/admin/competitions` and

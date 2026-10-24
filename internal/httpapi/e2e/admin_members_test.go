@@ -96,3 +96,25 @@ func TestAdminMemberUsageCountsPerDay(t *testing.T) {
 	get(t, "/v1/admin/members/"+alice+"/usage?from=2026-01-01&to=2026-10-22", carol, admin).expect(http.StatusUnprocessableEntity)
 	get(t, "/v1/admin/members/"+alice+"/other", carol, admin).expect(http.StatusNotFound)
 }
+
+func TestAdminBanRefusesTheMemberUntilLifted(t *testing.T) {
+	reset(t)
+	admin := map[string]string{"X-Admin": "true"}
+	path := "/v1/admin/members/" + alice + "/ban"
+	newProfile(t, alice, "alice_writes", "everyone")
+	call(t, "PUT", path, bob, map[string]any{"reason": "spam"}).expect(http.StatusForbidden)
+	call(t, "PUT", path, bob, map[string]any{}, map[string]string{"X-Admin": "true", "X-Service-Token": testServiceToken}).expect(http.StatusForbidden)
+	call(t, "PUT", "/v1/admin/members/"+carol+"/ban", carol, map[string]any{}, admin).expect(http.StatusUnprocessableEntity)
+	call(t, "POST", path, carol, map[string]any{}, admin).expect(http.StatusMethodNotAllowed)
+
+	call(t, "PUT", path, carol, map[string]any{"reason": "spam"}, admin).expect(http.StatusNoContent)
+	call(t, "PUT", path, carol, map[string]any{"reason": "repeat"}, admin).expect(http.StatusNoContent)
+	get(t, "/v1/stories", alice).expect(http.StatusForbidden)
+	// The MCP server's service-token path names the member too, so it is refused as well.
+	get(t, "/v1/stories", alice, map[string]string{"X-Service-Token": testServiceToken}).expect(http.StatusForbidden)
+	get(t, "/v1/stories", bob).expect(http.StatusOK)
+
+	call(t, "DELETE", path, carol, nil, admin).expect(http.StatusNoContent)
+	call(t, "DELETE", path, carol, nil, admin).expect(http.StatusNoContent)
+	get(t, "/v1/stories", alice).expect(http.StatusOK)
+}

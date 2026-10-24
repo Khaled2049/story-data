@@ -50,6 +50,20 @@ paths:
         - { name: from, in: query, schema: { type: string, format: date } }
         - { name: to, in: query, schema: { type: string, format: date } }
       responses: { '200': { description: '{userId,from,to,days:[{day,indexingPasses,recsSearches,recsExplains}]}' }, '401': { description: Authentication required }, '403': { description: Admin claim required }, '422': { description: Invalid range (order, format or more than 90 days) } }
+  /v1/admin/members/{userId}/ban:
+    parameters:
+      - { name: userId, in: path, required: true, schema: { type: string, maxLength: 128 } }
+    put:
+      summary: Ban a member from every authenticated route
+      description: Requires a verified admin=true claim. Replaces any existing ban. Every authenticated request by the member, including through the service token, then answers 403 "account suspended". Public reads are unaffected. Disabling the Firebase account is the caller's job (the setUserBan Function).
+      security: [{ firebaseBearer: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false, properties: { reason: { type: string, maxLength: 500 } } } } } }
+      responses: { '204': { description: Banned }, '401': { description: Authentication required }, '403': { description: Admin claim required }, '422': { description: Reason too long, or an admin banning themselves } }
+    delete:
+      summary: Lift a member's ban
+      description: Idempotent; lifting a ban that is not there succeeds.
+      security: [{ firebaseBearer: [] }]
+      responses: { '204': { description: Not banned }, '401': { description: Authentication required }, '403': { description: Admin claim required } }
   /v1/admin/stories:
     get:
       summary: Admin moderation listing, including private drafts from every author
