@@ -37,6 +37,15 @@ paths:
       description: Refused before the voting deadline. A settlement is recorded in admin_audit in the same transaction as the payout; settling an already settled competition returns it unchanged.
       security: [{ firebaseBearer: [] }]
       responses: { '200': { description: The settled competition }, '401': { description: Authentication required }, '403': { description: Admin claim required }, '404': { description: Competition not found }, '422': { description: Voting has not closed, the competition is not in voting, or the payout failed } }
+  /v1/admin/competitions/{competitionId}/cancel:
+    parameters:
+      - { name: competitionId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      summary: Admin cancellation of a competition, with a reason
+      description: Refunds the prize to the host and every held entry fee to whoever paid it, marks the competition cancelled and records it in admin_audit, all in one transaction. Cancelling an already cancelled competition returns it unchanged.
+      security: [{ firebaseBearer: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string, minLength: 1, maxLength: 500 } } } } } }
+      responses: { '200': { description: The cancelled competition }, '401': { description: Authentication required }, '403': { description: Admin claim required }, '404': { description: Competition not found }, '422': { description: Missing or too long reason, or the competition has settled } }
   /v1/admin/competitions/settle-due:
     post:
       summary: Admin settlement of every competition past its voting deadline

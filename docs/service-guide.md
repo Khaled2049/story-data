@@ -179,7 +179,12 @@ voting deadline), and `POST /v1/admin/competitions/settle-due` settles every
 overdue one, returning `{settled,failed}` as ids only; failure detail goes to
 the log. Each settlement writes a `competition.settle` row to `admin_audit` in
 the same transaction as the payout, so a refused or failed settle leaves no
-audit row and a payout never lacks one. Admins may
+audit row and a payout never lacks one.
+`POST /v1/admin/competitions/{id}/cancel` with `{reason}` cancels a competition
+that has not settled: a reason of 1 to 500 characters is required, and the
+refund, the cancelled phase and a `competition.cancel` audit row commit
+together. Only the admin read returns `cancellationReason`; readers never see
+it. Admins may
 delete an unpublished draft through `DELETE /v1/admin/competitions/{id}`;
 published competitions return `409` and must use the existing cancellation and
 refund flow. `/admin/competitions` is the matching protected frontend table.

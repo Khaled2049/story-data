@@ -55,6 +55,8 @@ type Competition struct {
 	// createdAt backs the listing cursor. Unexported because it is ordering
 	// state, not part of the record the API promises.
 	createdAt time.Time
+	// Only the admin read fills this in: a host's reason may not be meant for readers.
+	CancellationReason string `json:"cancellationReason,omitempty"`
 }
 type TokenAmount struct {
 	AssetID  string `json:"assetId"`
@@ -843,6 +845,33 @@ func (s *Store) WithdrawCompetitionSubmission(ctx context.Context, id, user stri
 	return tx.Commit(ctx)
 }
 func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bool, reason string) (Competition, error) {
+	return s.cancelCompetition(ctx, id, user, admin, reason, nil)
+}
+
+// CancelAdminCompetition is CancelCompetition from the admin page. A reason is
+// required, and the cancellation is recorded in admin_audit in the same
+// transaction as the refund.
+func (s *Store) CancelAdminCompetition(ctx context.Context, admin bool, actor, id, reason string) (Competition, error) {
+	if !admin {
+		return Competition{}, ErrForbidden
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" || len(reason) > 500 {
+		return Competition{}, ErrValidation
+	}
+	return s.cancelCompetition(ctx, id, actor, true, reason, func(ctx context.Context, tx pgx.Tx, c Competition) error {
+		return writeAdminAudit(ctx, tx, actor, "competition.cancel", c.ID, map[string]any{
+			"creatorId": c.CreatorID, "phase": c.Phase, "reason": reason,
+		})
+	})
+}
+
+// cancelCompetition refunds the prize to the host and every held entry fee to
+// whoever paid it, and marks the competition cancelled, all in one transaction
+// behind a lock on the competition row, so a crash cannot leave money refunded
+// on a competition that still reads open, and a concurrent settle cannot pay out
+// from the same escrow. before, when set, runs just before commit.
+func (s *Store) cancelCompetition(ctx context.Context, id, user string, admin bool, reason string, before func(context.Context, pgx.Tx, Competition) error) (Competition, error) {
 	c, e := s.competition(ctx, id, user)
 	if e != nil {
 		return c, e
@@ -850,14 +879,22 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 	if !admin && c.CreatorID != user {
 		return c, ErrForbidden
 	}
+	tx, e := s.db.Begin(ctx)
+	if e != nil {
+		return c, e
+	}
+	defer tx.Rollback(ctx)
+	if e = tx.QueryRow(ctx, `SELECT phase,prize_amount::text FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&c.Phase, &c.PrizePool.Amount); e != nil {
+		return c, e
+	}
 	if c.Phase == "settled" || c.Phase == "settling" {
 		return c, ErrValidation
 	}
 	if c.Phase == "cancelled" {
-		return c, nil
+		return s.competition(ctx, id, user)
 	}
 	posts := map[string]*big.Int{account(c.CreatorID): new(big.Int)}
-	rows, e := s.db.Query(ctx, `SELECT user_id,amount::text FROM competition_contributions WHERE competition_id=$1 AND state='held'`, id)
+	rows, e := tx.Query(ctx, `SELECT user_id,amount::text FROM competition_contributions WHERE competition_id=$1 AND state='held'`, id)
 	if e != nil {
 		return c, e
 	}
@@ -874,6 +911,9 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 		posts[account(u)].Add(posts[account(u)], n)
 	}
 	rows.Close()
+	if e = rows.Err(); e != nil {
+		return c, e
+	}
 	seed, _ := new(big.Int).SetString(c.PrizePool.Amount, 10)
 	posts[account(c.CreatorID)].Add(posts[account(c.CreatorID)], seed)
 	total := new(big.Int)
@@ -887,16 +927,22 @@ func (s *Store) CancelCompetition(ctx context.Context, id, user string, admin bo
 		}
 	}
 	if total.Sign() > 0 {
-		if e = s.transfer(ctx, "escrow:refund:competition:"+id, "escrow:refund", id, ps); e != nil {
+		if e = s.transferTx(ctx, tx, "escrow:refund:competition:"+id, "escrow:refund", id, ps); e != nil {
 			return c, e
 		}
 	}
-	_, e = s.db.Exec(ctx, `UPDATE competitions SET phase='cancelled',entry_fees_held=0,cancellation_reason=$1,updated_at=now() WHERE id=$2`, reason, id)
-	if e != nil {
+	if _, e = tx.Exec(ctx, `UPDATE competitions SET phase='cancelled',entry_fees_held=0,cancellation_reason=$1,updated_at=now() WHERE id=$2`, reason, id); e != nil {
 		return c, e
 	}
-	_, e = s.db.Exec(ctx, `UPDATE competition_contributions SET state='refunded',updated_at=now() WHERE competition_id=$1 AND state='held'`, id)
-	if e != nil {
+	if _, e = tx.Exec(ctx, `UPDATE competition_contributions SET state='refunded',updated_at=now() WHERE competition_id=$1 AND state='held'`, id); e != nil {
+		return c, e
+	}
+	if before != nil {
+		if e = before(ctx, tx, c); e != nil {
+			return c, e
+		}
+	}
+	if e = tx.Commit(ctx); e != nil {
 		return c, e
 	}
 	return s.competition(ctx, id, user)

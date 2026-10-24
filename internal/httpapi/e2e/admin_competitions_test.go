@@ -17,6 +17,7 @@ func TestAdminCompetitionRoutesRequireAdmin(t *testing.T) {
 		{"DELETE", "/v1/admin/competitions/" + id},
 		{"POST", "/v1/admin/competitions/" + id + "/settle"},
 		{"POST", "/v1/admin/competitions/settle-due"},
+		{"POST", "/v1/admin/competitions/" + id + "/cancel"},
 	} {
 		call(t, route.method, route.path, "", nil).expect(http.StatusUnauthorized)
 		call(t, route.method, route.path, alice, nil).expect(http.StatusForbidden)
@@ -211,4 +212,65 @@ func TestAdminSettleDueReportsWhatItSettledAndWhatFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertLedgerIntact(t)
+}
+
+// An admin cancels with a reason. The refund, the cancelled phase and the
+// audit row commit together, and only admins ever see the reason.
+func TestAdminCancelRequiresAReasonAndIsAudited(t *testing.T) {
+	reset(t)
+	admin := map[string]string{"X-Admin": "true"}
+	id := openCompetition(t, alice, "Called off", tale(100), tale(10))
+	grantInitial(t, bob)
+	enter(t, bob, id)
+	path := "/v1/admin/competitions/" + id + "/cancel"
+
+	for _, reason := range []string{"", "   ", strings.Repeat("x", 501)} {
+		call(t, "POST", path, carol, map[string]any{"reason": reason}, admin).
+			expect(http.StatusUnprocessableEntity)
+	}
+	if got := dbPhase(t, id); got != "open" {
+		t.Fatalf("a refused cancel changed the phase to %s", got)
+	}
+
+	got := call(t, "POST", path, carol, map[string]any{"reason": "  Duplicate of another contest  "}, admin).
+		expect(http.StatusOK).json()
+	if got["phase"] != "cancelled" {
+		t.Fatalf("phase = %v, want cancelled", got["phase"])
+	}
+	call(t, "POST", path, carol, map[string]any{"reason": "again"}, admin).expect(http.StatusOK)
+	if trail := auditTrail(t, id); strings.Join(trail, ",") != carol+" competition.cancel" {
+		t.Fatalf("audit = %v, want one cancel by %s", trail, carol)
+	}
+	var reason string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT detail->>'reason' FROM admin_audit WHERE target_id=$1::uuid AND action='competition.cancel'`, id).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if reason != "Duplicate of another contest" {
+		t.Errorf("audited reason = %q", reason)
+	}
+
+	assertBalance(t, userAccount(alice), tale(initialGrantTale))
+	assertBalance(t, userAccount(bob), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), "0")
+	assertLedgerIntact(t)
+
+	if r := get(t, "/v1/admin/competitions/"+id, carol, admin).expect(http.StatusOK).json(); r["cancellationReason"] != "Duplicate of another contest" {
+		t.Errorf("admin read reason = %v", r["cancellationReason"])
+	}
+	if _, ok := get(t, "/v1/competitions/"+id, "").expect(http.StatusOK).json()["cancellationReason"]; ok {
+		t.Error("the public read exposed the cancellation reason")
+	}
+}
+
+func TestAdminCancelRefusesASettledCompetition(t *testing.T) {
+	reset(t)
+	admin := map[string]string{"X-Admin": "true"}
+	id := dueWithAWinner(t, "Already decided")
+	get(t, "/v1/competitions/"+id, "").expect(http.StatusOK)
+	call(t, "POST", "/v1/admin/competitions/"+id+"/cancel", carol,
+		map[string]any{"reason": "too late"}, admin).expect(http.StatusUnprocessableEntity)
+	if trail := auditTrail(t, id); len(trail) != 0 {
+		t.Errorf("a refused cancel was audited: %v", trail)
+	}
 }

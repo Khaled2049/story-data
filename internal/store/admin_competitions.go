@@ -87,6 +87,9 @@ func (s *Store) GetAdminCompetition(ctx context.Context, admin bool, actor, id s
 	if err != nil {
 		return Competition{}, err
 	}
+	if err = s.db.QueryRow(ctx, `SELECT COALESCE(cancellation_reason,'') FROM competitions WHERE id=$1`, id).Scan(&c.CancellationReason); err != nil {
+		return Competition{}, err
+	}
 	return c, writeAdminAudit(ctx, s.db, actor, "competition.view", id, map[string]any{"creatorId": c.CreatorID, "phase": c.Phase})
 }
 

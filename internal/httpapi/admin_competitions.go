@@ -55,6 +55,21 @@ func (s *Server) adminCompetitions(w http.ResponseWriter, r *http.Request) {
 		respond(w, c, err)
 		return
 	}
+	if action == "cancel" {
+		if r.Method != http.MethodPost {
+			method(w)
+			return
+		}
+		var in struct {
+			Reason string `json:"reason"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		c, err := s.store.CancelAdminCompetition(r.Context(), true, uid, id, in.Reason)
+		respond(w, c, err)
+		return
+	}
 	if action != "" {
 		notFound(w)
 		return
