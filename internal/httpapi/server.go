@@ -68,7 +68,7 @@ func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.
 	m.HandleFunc("/v1/admin/competitions", x.adminCompetitions)
 	m.HandleFunc("/v1/admin/competitions/", x.adminCompetitions)
 	m.HandleFunc("/v1/admin/members", x.adminMembers)
-	m.HandleFunc("/v1/admin/members/", x.adminMemberUsage)
+	m.HandleFunc("/v1/admin/members/", x.adminMember)
 	m.HandleFunc("/v1/competition-drafts", x.competitionDrafts)
 	m.HandleFunc("/v1/competition-publish", x.competitionPublish)
 	m.HandleFunc("/v1/me/follows", x.myFollows)
@@ -428,6 +428,16 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) (string, bool) {
 		return "", false
 	}
 	logUser(w, uid)
+	// A banned member's ID token stays valid for up to an hour; this refuses it now.
+	banned, e := s.store.IsBanned(r.Context(), uid)
+	if e != nil {
+		respond(w, nil, e)
+		return "", false
+	}
+	if banned {
+		writeError(w, http.StatusForbidden, "account suspended")
+		return "", false
+	}
 	return uid, true
 }
 
