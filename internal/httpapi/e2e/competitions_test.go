@@ -642,6 +642,44 @@ func TestCompetitionSubmitIsRefusedOutsideTheOpenPhase(t *testing.T) {
 		map[string]any{"storyId": story["id"]}).expect(http.StatusForbidden)
 }
 
+// A paid entry racing a cancel used to read the phase as open, charge the fee,
+// and only then wait for the cancel's lock, stranding the fee in the escrow of
+// a cancelled competition. The test holds the row lock and cancels in its own
+// transaction, standing in for CancelCompetition, which takes the same lock.
+func TestPaidEntryWaitingOnACancelIsRefused(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	id := openCompetition(t, alice, "Cancelled mid-entry", tale(100), tale(10))
+	grantInitial(t, bob)
+	story := newStory(t, bob, "Late entry")
+	call(t, "PUT", "/v1/competitions/"+id+"/join", bob, nil).expect(http.StatusNoContent)
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT 1 FROM competitions WHERE id=$1::uuid FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan response, 1)
+	go func() {
+		done <- call(t, "POST", "/v1/competitions/"+id+"/submissions/me", bob,
+			map[string]any{"storyId": story["id"]})
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if _, err = tx.Exec(ctx, `UPDATE competitions SET phase='cancelled' WHERE id=$1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	(<-done).expect(http.StatusForbidden)
+	assertBalance(t, userAccount(bob), tale(initialGrantTale))
+	assertBalance(t, escrowAccount(id), tale(100))
+}
+
 func TestCompetitionEntryFeeIsEscrowedAndRefundedOnWithdraw(t *testing.T) {
 	reset(t)
 	id := openCompetition(t, alice, "Paid entry", tale(100), tale(10))

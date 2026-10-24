@@ -718,11 +718,13 @@ func (s *Store) SubmitCompetition(ctx context.Context, id, user, storyID string)
 	if _, z := uuid.Parse(storyID); z != nil {
 		return ErrNotFound
 	}
+	// Locked so a cancel or phase change in flight finishes first and this sees
+	// it; reading the phase unlocked let a fee land in a cancelled escrow.
 	// $2 is the story, referenced once: an earlier version bound the caller's
 	// id as an extra parameter the SQL never used, which PostgreSQL cannot
 	// type-infer — it made every submission fail with a 500.
 	var prize, escrowed string
-	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text,c.prize_amount::text,COALESCE((SELECT a.balance::text FROM token_accounts a WHERE a.account_id=$3),'0') FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1`, id, storyID, escrow(id)).Scan(&phase, &owner, &title, &author, &cover, &fee, &prize, &escrowed)
+	e = tx.QueryRow(ctx, `SELECT c.phase,s.owner_id,s.title,COALESCE(s.author_name,''),COALESCE(s.cover_image_url,''),c.entry_fee::text,c.prize_amount::text,COALESCE((SELECT a.balance::text FROM token_accounts a WHERE a.account_id=$3),'0') FROM competitions c JOIN stories s ON s.id=$2 WHERE c.id=$1 FOR UPDATE OF c`, id, storyID, escrow(id)).Scan(&phase, &owner, &title, &author, &cover, &fee, &prize, &escrowed)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
