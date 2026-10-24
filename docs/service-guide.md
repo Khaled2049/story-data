@@ -237,10 +237,7 @@ and skipped, the rest still settle, and the command exits non-zero. The failed
 competition stays in `voting` and is retried by the next run. A second run with
 nothing due changes nothing.
 
-In production it runs hourly as the `novelsync-story-data-settle-due` Cloud Run
-Job (see "Deployment"), so results land up to an hour after a voting deadline;
-the UI labels the voting deadline as an estimate for that reason. The creator
-or an admin can still call `POST /v1/competitions/{id}/settle` once
+The creator or an admin can still call `POST /v1/competitions/{id}/settle` once
 the deadline has passed.
 
 ## Errors, logging and lifecycle
@@ -601,22 +598,6 @@ gcloud run jobs execute novelsync-story-data-sync-recs \
 The job performs a transactional full derivation and is safe to retry. Do not
 run overlapping executions: they do redundant full scans and contend while
 replacing the same interaction rows.
-
-Terraform also deploys `novelsync-story-data-settle-due`, the same shape of job
-running `settle-due`, and a Cloud Scheduler trigger of the same name that starts
-it hourly (`settle_due_schedule`, UTC cron). Scheduler calls the Cloud Run Jobs
-API as `novelsync-settle-due-scheduler`, which holds `roles/run.invoker` on this
-job only. The job has no retries: a failed settlement stays in `voting` and the
-next hourly run tries it again. Overlapping runs are harmless, because
-settlement is idempotent under a race. To settle without waiting:
-
-```sh
-gcloud run jobs execute novelsync-story-data-settle-due \
-  --project=story-6f89f --region=us-central1 --wait
-```
-
-A non-zero exit means at least one competition could not settle; the job's logs
-name each one. Nothing alerts on it yet.
 
 ## Writer agreement
 

@@ -21,9 +21,3 @@ variable "cors_origins" {
     "tauri://localhost",
   ]
 }
-
-# Results land up to one interval after a voting deadline.
-variable "settle_due_schedule" {
-  type    = string
-  default = "0 * * * *"
-}
