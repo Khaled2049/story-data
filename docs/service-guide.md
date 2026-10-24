@@ -173,7 +173,13 @@ and preserve the embargo on unsettled vote tallies. The list accepts `q`,
 `phase`, `limit` and `cursor`, returning `{competitions,nextCursor}`. Besides
 the phases, `phase=awaiting-settlement` lists competitions in `voting` past their
 voting deadline: the ones settle-on-read has not reached because nobody has
-opened them. Admin reads never settle, so that list stays accurate. Admins may
+opened them. Admin reads never settle, so that list stays accurate.
+`POST /v1/admin/competitions/{id}/settle` settles one (still refused before the
+voting deadline), and `POST /v1/admin/competitions/settle-due` settles every
+overdue one, returning `{settled,failed}` as ids only; failure detail goes to
+the log. Each settlement writes a `competition.settle` row to `admin_audit` in
+the same transaction as the payout, so a refused or failed settle leaves no
+audit row and a payout never lacks one. Admins may
 delete an unpublished draft through `DELETE /v1/admin/competitions/{id}`;
 published competitions return `409` and must use the existing cancellation and
 refund flow. `/admin/competitions` is the matching protected frontend table.
@@ -248,6 +254,8 @@ Nothing runs on a schedule either. A competition settles in one of three ways:
   with the competition in `voting`; the next read retries it.
 - **By the creator or an admin,** through `POST /v1/competitions/{id}/settle`,
   once the deadline has passed. The frontend offers this as a button.
+- **From the admin page,** one at a time or all overdue at once, through the
+  admin routes in "Competition read visibility" above. These are audited.
 - **By hand,** with the `settle-due` command, for competitions nobody has
   opened since their deadline:
 

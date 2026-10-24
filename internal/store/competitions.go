@@ -1121,28 +1121,42 @@ func (s *Store) SettleIfDue(ctx context.Context, c Competition) (bool, error) {
 	return true, nil
 }
 
+type SettleDueResult struct {
+	Settled []string `json:"settled"`
+	Failed  []string `json:"failed"`
+	errs    []error
+}
+
+// Err joins every per-competition failure, for logging; nil when none failed.
+func (r SettleDueResult) Err() error { return errors.Join(r.errs...) }
+
 // SettleDue settles every competition whose voting deadline has passed, each
 // in its own transaction, so one failure does not hold up the rest. It sweeps
 // first: open -> voting otherwise waits for someone to request the competition.
-// It returns the ids it settled and every failure, joined.
-func (s *Store) SettleDue(ctx context.Context) ([]string, error) {
+// A non-empty actor records each settlement in admin_audit. The error is only
+// for a sweep or listing that failed; per-competition failures are in the result.
+func (s *Store) SettleDue(ctx context.Context, actor string) (SettleDueResult, error) {
+	r := SettleDueResult{Settled: []string{}, Failed: []string{}}
 	if e := s.SweepDuePhases(ctx); e != nil {
-		return nil, e
+		return r, e
 	}
 	ids, e := s.ListDueSettlements(ctx)
 	if e != nil {
-		return nil, e
+		return r, e
 	}
-	settled := []string{}
-	var failed []error
+	var audit func(context.Context, pgx.Tx, Competition) error
+	if actor != "" {
+		audit = settleAudit(actor, map[string]any{"via": "settle-due"})
+	}
 	for _, id := range ids {
-		if _, e = s.SettleCompetition(ctx, id, "system", true); e != nil {
-			failed = append(failed, fmt.Errorf("settle %s: %w", id, e))
+		if _, e = s.settleCompetition(ctx, id, "system", true, audit); e != nil {
+			r.Failed = append(r.Failed, id)
+			r.errs = append(r.errs, fmt.Errorf("settle %s: %w", id, e))
 			continue
 		}
-		settled = append(settled, id)
+		r.Settled = append(r.Settled, id)
 	}
-	return settled, errors.Join(failed...)
+	return r, nil
 }
 
 func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string, admin bool) (Competition, error) {
@@ -1196,6 +1210,32 @@ func (s *Store) AdvanceCompetition(ctx context.Context, id, user, target string,
 	return s.competition(ctx, id, user)
 }
 func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bool) (Competition, error) {
+	return s.settleCompetition(ctx, id, user, admin, nil)
+}
+
+// SettleAdminCompetition is SettleCompetition from the admin page, recorded in
+// admin_audit in the same transaction as the payout.
+func (s *Store) SettleAdminCompetition(ctx context.Context, admin bool, actor, id string) (Competition, error) {
+	if !admin {
+		return Competition{}, ErrForbidden
+	}
+	return s.settleCompetition(ctx, id, actor, true, settleAudit(actor, nil))
+}
+
+// settleAudit records a settlement as actor's admin action.
+func settleAudit(actor string, detail map[string]any) func(context.Context, pgx.Tx, Competition) error {
+	return func(ctx context.Context, tx pgx.Tx, c Competition) error {
+		d := map[string]any{"creatorId": c.CreatorID, "prize": c.PrizePool.Amount, "entryFeesHeld": c.EntryFeesHeld}
+		for k, v := range detail {
+			d[k] = v
+		}
+		return writeAdminAudit(ctx, tx, actor, "competition.settle", c.ID, d)
+	}
+}
+
+// settleCompetition runs before, when set, inside the settlement transaction
+// just before it commits, and only when this call actually settles.
+func (s *Store) settleCompetition(ctx context.Context, id, user string, admin bool, before func(context.Context, pgx.Tx, Competition) error) (Competition, error) {
 	c, e := s.competition(ctx, id, user)
 	if e != nil {
 		return c, e
@@ -1306,6 +1346,11 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 	_, e = tx.Exec(ctx, `UPDATE competitions SET phase='settled',entry_fees_held=0,results_digest=$1,settled_at=now(),updated_at=now() WHERE id=$2`, hex.EncodeToString(d[:]), id)
 	if e != nil {
 		return c, e
+	}
+	if before != nil {
+		if e = before(ctx, tx, c); e != nil {
+			return c, e
+		}
 	}
 	if e = tx.Commit(ctx); e != nil {
 		return c, e

@@ -78,10 +78,11 @@ func TestSettleDueSettlesEachDueCompetitionOnce(t *testing.T) {
 		t.Fatalf("setup: stale competition is %s, want open", got)
 	}
 
-	settled, err := st.SettleDue(ctx)
-	if err != nil {
-		t.Fatalf("settle-due: %v", err)
+	res, err := st.SettleDue(ctx, "")
+	if err != nil || res.Err() != nil {
+		t.Fatalf("settle-due: %v, %v", err, res.Err())
 	}
+	settled := res.Settled
 	slices.Sort(settled)
 	want := []string{due, stale}
 	slices.Sort(want)
@@ -101,9 +102,9 @@ func TestSettleDueSettlesEachDueCompetitionOnce(t *testing.T) {
 	assertBalance(t, userAccount(bob), tale(initialGrantTale+10))
 	dueAt := dbSettledAt(t, due)
 
-	again, err := st.SettleDue(ctx)
-	if err != nil || len(again) != 0 {
-		t.Errorf("second run settled %v, err %v; want nothing", again, err)
+	again, err := st.SettleDue(ctx, "")
+	if err != nil || len(again.Settled) != 0 || len(again.Failed) != 0 {
+		t.Errorf("second run = %+v, err %v; want nothing", again, err)
 	}
 	if got := dbSettledAt(t, due); !got.Equal(dueAt) {
 		t.Errorf("second run moved settled_at: %v then %v", dueAt, got)
@@ -130,12 +131,15 @@ func TestSettleDueKeepsGoingPastAFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	settled, err := store.New(testPool).SettleDue(ctx)
-	if err == nil {
-		t.Fatal("settle-due reported no error for a competition it could not settle")
+	res, err := store.New(testPool).SettleDue(ctx, "")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !slices.Equal(settled, []string{ok}) {
-		t.Errorf("settled %v, want only %s", settled, ok)
+	if res.Err() == nil || !slices.Equal(res.Failed, []string{broken}) {
+		t.Fatalf("failed = %v, err %v; want %s reported", res.Failed, res.Err(), broken)
+	}
+	if !slices.Equal(res.Settled, []string{ok}) {
+		t.Errorf("settled %v, want only %s", res.Settled, ok)
 	}
 	if got := dbPhase(t, broken); got != "voting" {
 		t.Errorf("failed competition is %s, want voting so the next run retries it", got)

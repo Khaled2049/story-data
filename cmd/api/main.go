@@ -101,12 +101,15 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "settle-due" {
 		settleCtx, cancelSettle := context.WithTimeout(context.Background(), settleDueTimeout)
 		defer cancelSettle()
-		settled, e := st.SettleDue(settleCtx)
-		for _, id := range settled {
+		res, e := st.SettleDue(settleCtx, "")
+		if e != nil {
+			log.Fatal(e)
+		}
+		for _, id := range res.Settled {
 			slog.Info("competition settled", "competition", id)
 		}
-		slog.Info("settle-due finished", "settled", len(settled))
-		if e != nil {
+		slog.Info("settle-due finished", "settled", len(res.Settled), "failed", len(res.Failed))
+		if e = res.Err(); e != nil {
 			log.Fatal(e)
 		}
 		return

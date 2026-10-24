@@ -29,6 +29,20 @@ paths:
       description: Published competitions must use the existing cancellation and refund flow. Successful deletion is recorded in admin_audit.
       security: [{ firebaseBearer: [] }]
       responses: { '204': { description: Draft deleted }, '401': { description: Authentication required }, '403': { description: Admin claim required }, '404': { description: Competition not found }, '409': { description: Published competitions cannot be deleted } }
+  /v1/admin/competitions/{competitionId}/settle:
+    parameters:
+      - { name: competitionId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      summary: Admin settlement of one competition
+      description: Refused before the voting deadline. A settlement is recorded in admin_audit in the same transaction as the payout; settling an already settled competition returns it unchanged.
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: The settled competition }, '401': { description: Authentication required }, '403': { description: Admin claim required }, '404': { description: Competition not found }, '422': { description: Voting has not closed, the competition is not in voting, or the payout failed } }
+  /v1/admin/competitions/settle-due:
+    post:
+      summary: Admin settlement of every competition past its voting deadline
+      description: Sweeps due phases, then settles each overdue competition in its own transaction, auditing each. Failures are reported by id only.
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: '{settled, failed}, both arrays of competition ids' }, '401': { description: Authentication required }, '403': { description: Admin claim required } }
   /v1/admin/members:
     get:
       summary: Admin listing of every member with a public profile
