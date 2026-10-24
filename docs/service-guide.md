@@ -198,6 +198,10 @@ freshly seeded account can vote; a malformed value fails startup rather than
 silently reverting to the default. Ballot size is capped per competition by
 `competitions.max_votes_per_user`.
 
+The **creator** may not join their own competition (`403`), and so can neither
+enter nor vote in it. They keep the host share of entry fees and get the prize
+back when nobody wins, so they must have no say in the result.
+
 ### Competition voting deadline
 
 `voting_deadline_at` is enforced, judged on the database clock. A competition
@@ -210,6 +214,10 @@ voting is open:
   the creator and admins alike. Settling early at zero ballots would return the
   prize and the host's fee share to the creator; `CancelCompetition`, which
   refunds every fee, is the way to end a competition early.
+
+Settlement re-reads the competition under a row lock inside its transaction,
+so it is idempotent under a race as well as on retry: a settle that waited on
+one which committed returns the settled competition and writes nothing.
 
 Nothing settles a competition automatically yet; the creator or an admin calls
 `POST /v1/competitions/{id}/settle` after the deadline.

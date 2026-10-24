@@ -654,15 +654,20 @@ func (s *Store) JoinCompetition(ctx context.Context, id, user string) error {
 		return e
 	}
 	defer tx.Rollback(ctx)
-	var phase string
+	var phase, creator string
 	var max *int
 	var n int
-	e = tx.QueryRow(ctx, `SELECT phase,max_participants,participants_count FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &max, &n)
+	e = tx.QueryRow(ctx, `SELECT phase,creator_id,max_participants,participants_count FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&phase, &creator, &max, &n)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if e != nil {
 		return e
+	}
+	// The host keeps the fee share and gets the prize back with no winner, so
+	// they may neither enter nor vote; joining is the gate for both.
+	if user == creator {
+		return ErrForbidden
 	}
 	if phase != "open" && phase != "scheduled" {
 		return ErrValidation
@@ -1138,21 +1143,6 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 	if !admin && c.CreatorID != user {
 		return c, ErrForbidden
 	}
-	if c.Phase == "settled" {
-		return c, nil
-	}
-	if c.Phase != "voting" && c.Phase != "settling" {
-		return c, ErrValidation
-	}
-	// Nobody, admin included, may settle while voting is still open: an early
-	// settle at zero ballots hands the host the prize and their fee share.
-	var open bool
-	if e = s.db.QueryRow(ctx, `SELECT COALESCE(now()<voting_deadline_at,false) FROM competitions WHERE id=$1`, id).Scan(&open); e != nil {
-		return c, e
-	}
-	if open {
-		return c, ErrValidation
-	}
 	// Everything below — the settling claim, the payout, the results rows and
 	// the final settled phase — commits or rolls back together. Claiming the
 	// phase on its own connection used to survive a failed payout, leaving the
@@ -1163,6 +1153,24 @@ func (s *Store) SettleCompetition(ctx context.Context, id, user string, admin bo
 		return c, e
 	}
 	defer tx.Rollback(ctx)
+	// Re-read under the row lock: a concurrent settle that committed while this
+	// one waited must turn it into a no-op, not a second rewrite of the results.
+	var open bool
+	e = tx.QueryRow(ctx, `SELECT phase,prize_amount::text,entry_fees_held::text,fee_bps,COALESCE(now()<voting_deadline_at,false) FROM competitions WHERE id=$1 FOR UPDATE`, id).Scan(&c.Phase, &c.PrizePool.Amount, &c.EntryFeesHeld, &c.FeeBps, &open)
+	if e != nil {
+		return c, e
+	}
+	if c.Phase == "settled" {
+		return s.competition(ctx, id, user)
+	}
+	if c.Phase != "voting" && c.Phase != "settling" {
+		return c, ErrValidation
+	}
+	// Nobody, admin included, may settle while voting is still open: an early
+	// settle at zero ballots hands the host the prize and their fee share.
+	if open {
+		return c, ErrValidation
+	}
 	_, e = tx.Exec(ctx, `UPDATE competitions SET phase='settling',settlement_claimed_at=COALESCE(settlement_claimed_at,now()) WHERE id=$1 AND phase IN ('voting','settling')`, id)
 	if e != nil {
 		return c, e

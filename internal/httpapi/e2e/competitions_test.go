@@ -993,10 +993,9 @@ func TestCompetitionSettlementRefusedBeforeVoting(t *testing.T) {
 }
 
 // Settlement builds one ledger transfer, and ledger_postings is keyed
-// (transfer_key, account_id). The two scenarios below are the ones where the
-// same account is credited twice in that transfer — the returned prize plus
-// the host's cut of the entry fees. Before the postings were merged, both
-// aborted the transfer on a duplicate-key violation, after the phase had
+// (transfer_key, account_id). With no winner the same account is credited
+// twice in that transfer — the returned prize plus the host's cut of the entry
+// fees. Before the postings were merged, this aborted the transfer on a duplicate-key violation, after the phase had
 // already been committed as "settling" on a separate connection: settle then
 // re-entered the same failure forever and cancel refused the phase outright,
 // so the escrow was unreachable by any code path.
@@ -1026,26 +1025,84 @@ func TestCompetitionSettlementWithFeesAndNoWinnerPaysTheHostOnce(t *testing.T) {
 	assertLedgerIntact(t)
 }
 
-func TestCompetitionSettlementWhenTheHostsOwnEntryWins(t *testing.T) {
+// The host takes the fee share and gets the prize back when nobody wins, so a
+// host who could also enter or vote could steer the result toward themselves.
+func TestCompetitionCreatorCannotJoinOrVote(t *testing.T) {
 	reset(t)
-	id := openCompetition(t, alice, "Host wins", tale(100), tale(10))
-	grantInitial(t, bob, dave)
-	enter(t, alice, id)
+	id := openCompetition(t, alice, "Hands off", tale(100), "0")
+	grantInitial(t, bob)
 	enter(t, bob, id)
+
+	call(t, "PUT", "/v1/competitions/"+id+"/join", alice, nil).
+		expect(http.StatusForbidden)
+	agedProfile(t, alice)
+	advance(t, alice, id, "voting")
+	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", alice,
+		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusForbidden)
+
+	got := get(t, "/v1/competitions/"+id, alice).expect(http.StatusOK).json()
+	if got["participants"].(float64) != 1 || got["ballotCount"].(float64) != 0 {
+		t.Errorf("participants %v, ballots %v; want only bob and no ballots",
+			got["participants"], got["ballotCount"])
+	}
+}
+
+// Two settles that both read the competition before either committed used to
+// both run: the payout was caught by its idempotency key, but the loser still
+// rewrote competition_results and moved settled_at.
+func TestConcurrentSettlesSettleOnce(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	id := openCompetition(t, alice, "Photo finish", tale(100), tale(10))
+	grantInitial(t, bob, carol, dave)
+	enter(t, bob, id)
+	enter(t, carol, id)
 	registerVoter(t, dave, id)
 	advance(t, alice, id, "voting")
 	call(t, "PUT", "/v1/competitions/"+id+"/ballots/me", dave,
-		map[string]any{"submissionIds": []string{alice}}).expect(http.StatusNoContent)
-
+		map[string]any{"submissionIds": []string{bob}}).expect(http.StatusNoContent)
 	passTime(t, id, "voting_deadline_at")
-	call(t, "POST", "/v1/competitions/"+id+"/settle", alice, nil).expect(http.StatusOK)
 
-	// alice escrowed 100 and paid a 10 entry fee, then took the 100 prize and
-	// 18 of the 20 in fees.
-	assertBalance(t, userAccount(alice), tale(initialGrantTale-100-10+100+18))
-	assertBalance(t, userAccount(bob), tale(initialGrantTale-10))
-	assertBalance(t, platformAccount(), tale(2))
-	assertBalance(t, escrowAccount(id), "0")
+	// Hold the row so both settles get past their first read, then queue up.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT 1 FROM competitions WHERE id=$1::uuid FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan response, 2)
+	for _, uid := range []string{alice, alice} {
+		go func() {
+			done <- call(t, "POST", "/v1/competitions/"+id+"/settle", uid, nil)
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if got := (<-done).expect(http.StatusOK).json(); got["phase"] != "settled" {
+			t.Errorf("phase = %v, want settled", got["phase"])
+		}
+	}
+
+	// settled_at and the payout share one transaction clock only if no later
+	// settle rewrote the competition after the one that paid.
+	var transfers int
+	var same bool
+	if err = testPool.QueryRow(ctx, `
+		SELECT count(*), bool_and(t.created_at = c.settled_at)
+		FROM ledger_transfers t JOIN competitions c ON c.id = t.competition_id
+		WHERE t.idempotency_key = $1`, "escrow:release:"+id).Scan(&transfers, &same); err != nil {
+		t.Fatal(err)
+	}
+	if transfers != 1 || !same {
+		t.Errorf("payout transfers = %d, settled_at matches payout = %v; want 1 and true",
+			transfers, same)
+	}
+	assertBalance(t, userAccount(bob), tale(initialGrantTale-10+100))
 	assertLedgerIntact(t)
 }
 
