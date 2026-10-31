@@ -106,7 +106,9 @@ Migration groups correspond to product domains:
 story or null (unassigned); the store checks this before writing. Deleting a
 chapter unassigns its events and bumps their revision, so a client still
 holding the old `chapterId` gets a 409. `status` is `planned`, `in_progress` or
-`written`, set only by the writer.
+`written`, set only by the writer. Reordering or deleting events moves
+positions without bumping event revisions: order is guarded by the plot line's
+revision, and a bump would refuse content saves already in flight.
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an

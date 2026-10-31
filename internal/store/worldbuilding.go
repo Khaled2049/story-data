@@ -855,8 +855,10 @@ func (s *Store) renumberEvents(ctx context.Context, tx pgx.Tx, lineID string, fi
 			next = append(next, id)
 		}
 	}
+	// Position only, no revision bump: order is guarded by the plot line's
+	// revision, and bumping events would 409 their in-flight content saves.
 	for i, id := range next {
-		if _, e = tx.Exec(ctx, `UPDATE plot_events SET position=$1,revision=revision+1,updated_at=now() WHERE id=$2`, i+1000000, id); e != nil {
+		if _, e = tx.Exec(ctx, `UPDATE plot_events SET position=$1 WHERE id=$2`, i+1000000, id); e != nil {
 			return e
 		}
 	}

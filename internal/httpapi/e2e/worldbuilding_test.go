@@ -601,3 +601,39 @@ func TestPlotEventChapterLinkAndStatus(t *testing.T) {
 		t.Errorf("status lost on chapter delete: %v", after["status"])
 	}
 }
+
+// Reordering and deleting only move positions. Event revisions stay put, so a
+// content save already in flight for a sibling is not refused with a 409.
+func TestPlotEventOrderChangesKeepEventRevisions(t *testing.T) {
+	reset(t)
+	story := newStory(t, alice, "Order")
+	id := story["id"].(string)
+	line := newPlotLine(t, alice, id, "Main")
+	lineID := line["id"].(string)
+	events := worldPath(id, "plots") + "/" + lineID + "/events"
+	a := newEvent(t, alice, id, lineID, "A")
+	b := newEvent(t, alice, id, lineID, "B")
+	c := newEvent(t, alice, id, lineID, "C")
+
+	reordered := call(t, "POST", events+"/reorder", alice, map[string]any{
+		"orderedIds": []string{c["id"].(string), b["id"].(string), a["id"].(string)},
+	}, ifMatch(rev(t, line))).expect(http.StatusOK).list()
+	for _, e := range reordered {
+		if rev(t, e) != 1 {
+			t.Errorf("reorder bumped %v to revision %d", e["name"], rev(t, e))
+		}
+	}
+
+	after := call(t, "DELETE", events+"/"+c["id"].(string), alice, nil,
+		ifMatch(rev(t, c))).expect(http.StatusOK).list()
+	for _, e := range after {
+		if rev(t, e) != 1 {
+			t.Errorf("delete bumped %v to revision %d", e["name"], rev(t, e))
+		}
+	}
+
+	// A save carrying the revision from before the reorder still lands.
+	call(t, "PATCH", events+"/"+a["id"].(string), alice, map[string]any{
+		"name": "A, edited", "content": "c",
+	}, ifMatch(rev(t, a))).expect(http.StatusOK)
+}
