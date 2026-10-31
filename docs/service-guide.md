@@ -676,6 +676,44 @@ The job performs a transactional full derivation and is safe to retry. Do not
 run overlapping executions: they do redundant full scans and contend while
 replacing the same interaction rows.
 
+## Private story voice profile
+
+`GET /v1/stories/{id}/voice-profile` returns the owner's prose preferences,
+or an empty default profile at revision 0. `PUT` replaces point of view,
+tense, the passive-learning switch, up to three chapter reference ranges, and
+at most 12 structured notes with `If-Match: 0` for creation or the
+latest revision for an update. Notes carry stable UUIDs, text, origin and pin
+state. New notes are writer-authored; an existing note's origin cannot change.
+Migration `000041` preserves the first slice's free-text note as a writer note.
+Each reference identifies a chapter, its revision, and a range of at most 1600
+characters. The API validates story ownership, revision and range at save;
+prose tools ignore the reference if its source later changes or disappears.
+
+`GET /v1/stories/{id}/voice-profile/history` lists the latest 20 changes with
+before/after snapshots; the table retains the latest 50. `POST` to
+`/history/{changeId}/undo` with the current `If-Match` restores only the most
+recent change, as a new revision. This prevents an old undo from erasing later
+writer edits. History and profile are story-scoped, owner-only, use
+`Cache-Control: no-store`, and cascade on story deletion. An agent may call
+`POST /v1/stories/{id}/voice-profile/agent-note` with a verified service token,
+asserted owner, current If-Match revision and story-scoped UUID idempotency
+key. It can add, revise or retire only an agent-authored note, never change
+writer notes, pin state, references, narration settings or the learning switch.
+Passive updates additionally need three current evidence ranges from at least
+two chapters and are refused when learning is off. History records the actor,
+reason and evidence and permits undo of the latest agent change. They are omitted
+from public and reader APIs. Prose tools may read the profile through the
+authenticated service API. After a successful editor save, the authenticated
+Functions gateway can start a bounded learning pass through the agents service,
+forwarding the writer's Firebase identity and BYOK choice to creditProxy. A
+preflight checks chapter revisions, the learning switch, evidence availability
+and the rate cap before consuming AI quota. The service enforces 30-minute
+spacing and three analyses per story per UTC day. Migration `000043` also
+records delayed chapter-save jobs for an optional local recovery worker; that
+worker is off by default and should not be enabled where Firebase identity and
+BYOK choice are required for creditProxy. Malformed, weak or stale proposals
+leave the profile unchanged.
+
 ## Writer agreement
 
 `GET /v1/me/writer-agreement` returns the current terms/privacy/attestation
