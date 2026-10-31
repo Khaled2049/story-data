@@ -419,6 +419,99 @@ paths:
     get:
       security: [{ firebaseBearer: [] }]
       responses: { '200': { description: Current story and chapters for AI context } }
+  /v1/stories/{storyId}/voice-profile:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      summary: Get the owner's private story voice profile
+      description: A missing profile returns defaults with revision 0. Responses use Cache-Control no-store.
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Voice profile }, '404': { description: Story unavailable } }
+    put:
+      summary: Replace the owner's story voice profile
+      description: Supply If-Match 0 to create a profile, or its current revision to replace it. Responses use Cache-Control no-store.
+      security: [{ firebaseBearer: [] }]
+      parameters: [{ name: If-Match, in: header, required: true, schema: { type: integer, minimum: 0 } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [pointOfView, tense, notes, learnFromWriting, references]
+              properties:
+                pointOfView: { type: string, enum: [unspecified, first, close_third, omniscient, varies] }
+                tense: { type: string, enum: [unspecified, past, present, varies] }
+                learnFromWriting: { type: boolean, description: 'Controls passive learning from saved chapters; explicit story-wide instructions still apply.' }
+                references:
+                  type: array
+                  maxItems: 3
+                  description: 'Owner-selected chapter ranges. A changed or deleted source is ignored by prose tools.'
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [chapterId, sourceRevision, start, end]
+                    properties:
+                      chapterId: { type: string, format: uuid }
+                      sourceRevision: { type: integer, minimum: 1 }
+                      start: { type: integer, minimum: 0 }
+                      end: { type: integer, minimum: 1, description: 'At most 1600 characters after start.' }
+                notes:
+                  type: array
+                  maxItems: 12
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [id, text, origin, pinned]
+                    properties:
+                      id: { type: string, format: uuid }
+                      text: { type: string, minLength: 1, maxLength: 2000 }
+                      origin: { type: string, enum: [writer, agent], description: 'A new note must have writer origin; existing origins cannot change.' }
+                      pinned: { type: boolean }
+      responses: { '200': { description: Saved profile }, '404': { description: Story unavailable }, '409': { description: Stale profile revision }, '422': { description: Invalid input } }
+  /v1/stories/{storyId}/voice-profile/agent-note:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      summary: Add, revise or retire one assistant-authored note
+      description: 'Service-token callers only. The asserted owner and story are checked, If-Match is required, and idempotencyKey is scoped to the story. Writer notes and profile settings cannot be changed.'
+      security: [{ serviceToken: [] }]
+      parameters:
+        - { name: If-Match, in: header, required: true, schema: { type: integer, minimum: 0 } }
+        - { name: X-User-ID, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [operation, reason, source, evidence, idempotencyKey]
+              properties:
+                operation: { type: string, enum: [add, revise, retire] }
+                noteId: { type: string, format: uuid }
+                text: { type: string, maxLength: 240 }
+                reason: { type: string, minLength: 8, maxLength: 500 }
+                source: { type: string, enum: [explicit, passive] }
+                evidence: { type: array, maxItems: 6, description: 'Passive updates need at least three current ranges across two chapters.' }
+                idempotencyKey: { type: string, format: uuid }
+      responses: { '200': { description: Applied or no-op result with revision and change ID }, '403': { description: Service identity or target note forbidden }, '404': { description: Story or note unavailable }, '409': { description: Stale revision or idempotency conflict }, '422': { description: Invalid evidence or operation } }
+  /v1/stories/{storyId}/voice-profile/history:
+    parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      summary: List the owner's last 20 voice changes, newest first
+      description: Includes before and after snapshots, with Cache-Control no-store. The server retains the latest 50 changes.
+      security: [{ firebaseBearer: [] }]
+      responses: { '200': { description: Voice change history }, '404': { description: Story unavailable } }
+  /v1/stories/{storyId}/voice-profile/history/{changeId}/undo:
+    parameters:
+      - { name: storyId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: changeId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      summary: Undo the latest voice change
+      description: Restores its prior snapshot as a new revision and records the undo in history. Older changes cannot be undone over newer edits.
+      security: [{ firebaseBearer: [] }]
+      parameters: [{ name: If-Match, in: header, required: true, schema: { type: integer, minimum: 1 } }]
+      responses: { '200': { description: Restored voice profile }, '404': { description: Change or story unavailable }, '409': { description: Stale revision or change is not latest } }
   /v1/stories/{storyId}/assistant-threads:
     parameters: [{ name: storyId, in: path, required: true, schema: { type: string, format: uuid } }]
     get:
@@ -535,6 +628,7 @@ paths:
 components:
   securitySchemes:
     firebaseBearer: { type: http, scheme: bearer, bearerFormat: Firebase-ID-token }
+    serviceToken: { type: apiKey, in: header, name: X-Service-Token }
   schemas:
     WriterAgreement:
       type: object

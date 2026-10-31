@@ -154,7 +154,7 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Reader interactions and deletion remain available without a writer agreement.
-	workspace := len(p) == 1 || p[1] == "reader-update" || p[1] == "chapters" || p[1] == "characters" || p[1] == "places" || p[1] == "plots" || p[1] == "assistant-threads"
+	workspace := len(p) == 1 || p[1] == "reader-update" || p[1] == "chapters" || p[1] == "characters" || p[1] == "places" || p[1] == "plots" || p[1] == "assistant-threads" || p[1] == "voice-profile"
 	if workspace && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
 		if err := s.store.RequireWriterAgreement(r.Context(), uid); err != nil {
 			respond(w, nil, err)
@@ -213,6 +213,10 @@ func (s *Server) story(w http.ResponseWriter, r *http.Request) {
 	}
 	if p[1] == "assistant-threads" {
 		s.assistantThreads(w, r, uid, p[0], p)
+		return
+	}
+	if p[1] == "voice-profile" {
+		s.storyVoice(w, r, uid, p[0], p)
 		return
 	}
 	if p[1] == "comments" {
