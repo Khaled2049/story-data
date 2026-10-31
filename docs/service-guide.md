@@ -129,6 +129,12 @@ change order:
 
 Both return every plot line.
 
+Template creation uses `POST /v1/stories/{id}/plots/{lineId}/events/batch`
+with `{events: [...]}` to append 1–50 events, or
+`POST /v1/stories/{id}/plots/with-events` with `{line, events}` to create a
+line and up to 50 events. Each request writes its events and indexing outbox
+entries in one transaction. A failed event leaves no part of the batch behind.
+
 **Requirements.** An event's `dependencies` are the events it requires, each
 `{eventId, relationshipType: "requires", outOfOrderOk}`; `dependents` (the
 events it enables) is derived on read, across plot lines. A save is refused

@@ -154,6 +154,26 @@ func (s *Server) plots(w http.ResponseWriter, r *http.Request, uid, sid string, 
 		return
 	}
 	// Ahead of uuidPath: "chapter-order" is a word, not a plot line id.
+	if len(p) == 1 && p[0] == "with-events" {
+		if r.Method != http.MethodPost {
+			method(w)
+			return
+		}
+		var in struct {
+			Line   store.PlotLineInput    `json:"line"`
+			Events []store.PlotEventInput `json:"events"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		x, e := s.store.CreatePlotWithEvents(r.Context(), sid, uid, in.Line, in.Events)
+		if e != nil {
+			respond(w, nil, e)
+		} else {
+			write(w, http.StatusCreated, x)
+		}
+		return
+	}
 	if len(p) == 1 && p[0] == "chapter-order" {
 		if r.Method != http.MethodPost {
 			method(w)
@@ -207,6 +227,25 @@ func (s *Server) plots(w http.ResponseWriter, r *http.Request, uid, sid string, 
 	s.plotEvents(w, r, uid, sid, line, p[2:])
 }
 func (s *Server) plotEvents(w http.ResponseWriter, r *http.Request, uid, sid, line string, p []string) {
+	if len(p) == 1 && p[0] == "batch" {
+		if r.Method != http.MethodPost {
+			method(w)
+			return
+		}
+		var in struct {
+			Events []store.PlotEventInput `json:"events"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		x, e := s.store.CreateEvents(r.Context(), sid, line, uid, in.Events)
+		if e != nil {
+			respond(w, nil, e)
+		} else {
+			write(w, http.StatusCreated, x)
+		}
+		return
+	}
 	if len(p) == 1 && p[0] == "reorder" && r.Method == http.MethodPost {
 		rev, ok := revision(w, r)
 		if !ok {

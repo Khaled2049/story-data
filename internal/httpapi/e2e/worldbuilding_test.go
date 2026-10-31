@@ -41,6 +41,55 @@ func newEvent(t *testing.T, uid, storyID, lineID, name string) map[string]any {
 		map[string]any{"name": name, "content": "c"}).expect(http.StatusCreated).json()
 }
 
+func TestPlotTemplateBatchIsAtomicAndAppends(t *testing.T) {
+	reset(t)
+	story := newStory(t, alice, "Template batch")
+	storyID := story["id"].(string)
+	base := worldPath(storyID, "plots")
+	line := newPlotLine(t, alice, storyID, "Existing")
+	lineID := line["id"].(string)
+	first := newEvent(t, alice, storyID, lineID, "Already here")
+	path := base + "/" + lineID + "/events/batch"
+	before := outboxCount(t, storyID, "plot_event")
+	call(t, "POST", path, alice, map[string]any{"events": []any{
+		map[string]any{"name": "Would insert"}, map[string]any{"name": ""},
+	}}).expect(http.StatusUnprocessableEntity)
+	if got := get(t, base+"/"+lineID, alice).expect(http.StatusOK).json()["events"].([]any); len(got) != 1 {
+		t.Fatalf("partial batch left events: %v", got)
+	}
+	if got := outboxCount(t, storyID, "plot_event"); got != before {
+		t.Fatalf("outbox count %d, want %d", got, before)
+	}
+	created := call(t, "POST", path, alice, map[string]any{"events": []any{
+		map[string]any{"name": "Second"}, map[string]any{"name": "Third"},
+	}}).expect(http.StatusCreated).list()
+	if len(created) != 2 || created[0]["orderIndex"] != float64(1) || created[1]["orderIndex"] != float64(2) {
+		t.Fatalf("batch did not append in order: %v", created)
+	}
+	if first["orderIndex"] != float64(0) {
+		t.Fatal("existing event moved")
+	}
+	tooMany := make([]any, 51)
+	for i := range tooMany {
+		tooMany[i] = map[string]any{"name": "Overflow"}
+	}
+	call(t, "POST", path, alice, map[string]any{"events": tooMany}).expect(http.StatusUnprocessableEntity)
+	call(t, "POST", base+"/with-events", alice, map[string]any{
+		"line":   map[string]any{"name": "Partial line"},
+		"events": []any{map[string]any{"name": "Valid"}, map[string]any{"name": ""}},
+	}).expect(http.StatusUnprocessableEntity)
+	if got := get(t, base, alice).expect(http.StatusOK).list(); len(got) != 1 {
+		t.Fatalf("partial line left behind: %v", got)
+	}
+	withEvents := call(t, "POST", base+"/with-events", alice, map[string]any{
+		"line":   map[string]any{"name": "New template"},
+		"events": []any{map[string]any{"name": "Setup"}},
+	}).expect(http.StatusCreated).json()
+	if len(withEvents["events"].([]any)) != 1 {
+		t.Fatalf("new line has wrong events: %v", withEvents)
+	}
+}
+
 // outboxCount counts pending index events for one aggregate type in a story.
 func outboxCount(t *testing.T, storyID, aggregate string) int {
 	t.Helper()
