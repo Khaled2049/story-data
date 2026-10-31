@@ -535,3 +535,69 @@ func TestWorldbuildingSingleEntityGetIsOwnerOnly(t *testing.T) {
 	call(t, "GET", worldPath(sid, "characters")+"/11111111-1111-1111-1111-111111111111", alice, nil).
 		expect(http.StatusNotFound)
 }
+
+// An event links to a chapter by id, so reordering chapters keeps the plan
+// attached, and deleting the chapter leaves the event unassigned.
+func TestPlotEventChapterLinkAndStatus(t *testing.T) {
+	reset(t)
+	story := newStory(t, alice, "Linked")
+	id := story["id"].(string)
+	lineID := newPlotLine(t, alice, id, "Main")["id"].(string)
+	events := worldPath(id, "plots") + "/" + lineID + "/events"
+	chapters := "/v1/stories/" + id + "/chapters"
+	ch2 := call(t, "POST", chapters, alice, map[string]any{
+		"title": "The Ford", "content": "", "position": 1,
+	}).expect(http.StatusCreated).json()
+	ch2ID := ch2["id"].(string)
+
+	// New events are unassigned and planned.
+	plain := newEvent(t, alice, id, lineID, "Unplaced")
+	if plain["chapterId"] != nil || plain["status"] != "planned" {
+		t.Errorf("defaults: chapterId=%v status=%v", plain["chapterId"], plain["status"])
+	}
+
+	linked := call(t, "POST", events, alice, map[string]any{
+		"name": "Crossing", "content": "c", "chapterId": ch2ID, "status": "in_progress",
+	}).expect(http.StatusCreated).json()
+	if linked["chapterId"] != ch2ID || linked["status"] != "in_progress" {
+		t.Fatalf("linked event = %v", linked)
+	}
+
+	// Moving the chapter to the front does not touch the link.
+	call(t, "PATCH", chapters+"/"+ch2ID, alice, map[string]any{
+		"title": "The Ford", "content": "", "position": -1,
+	}, ifMatch(rev(t, ch2))).expect(http.StatusOK)
+	got := get(t, worldPath(id, "plots"), alice).expect(http.StatusOK).list()[0]["events"].([]any)[1].(map[string]any)
+	if got["chapterId"] != ch2ID {
+		t.Errorf("chapterId after reorder = %v, want %v", got["chapterId"], ch2ID)
+	}
+
+	// A chapter from another story, a malformed id and an unknown status are bad input.
+	other := newStory(t, bob, "Bob's")
+	foreign := get(t, "/v1/stories/"+other["id"].(string)+"/chapters", bob).expect(http.StatusOK).list()[0]["id"]
+	for _, body := range []map[string]any{
+		{"name": "x", "content": "c", "chapterId": foreign},
+		{"name": "x", "content": "c", "chapterId": "not-a-uuid"},
+		{"name": "x", "content": "c", "status": "done"},
+	} {
+		call(t, "POST", events, alice, body).expect(http.StatusUnprocessableEntity)
+	}
+
+	// Deleting the chapter unassigns the event and bumps its revision, so the
+	// old token can no longer write the deleted chapter back.
+	chNow := get(t, chapters+"/"+ch2ID, alice).expect(http.StatusOK).json()
+	call(t, "DELETE", chapters+"/"+ch2ID, alice, nil, ifMatch(rev(t, chNow))).expect(http.StatusNoContent)
+	after := get(t, worldPath(id, "plots"), alice).expect(http.StatusOK).list()[0]["events"].([]any)[1].(map[string]any)
+	if after["chapterId"] != nil {
+		t.Errorf("chapterId after chapter delete = %v, want null", after["chapterId"])
+	}
+	if rev(t, after) != rev(t, linked)+1 {
+		t.Errorf("revision after chapter delete = %d, want %d", rev(t, after), rev(t, linked)+1)
+	}
+	call(t, "PATCH", events+"/"+linked["id"].(string), alice, map[string]any{
+		"name": "Crossing", "content": "c", "chapterId": ch2ID,
+	}, ifMatch(rev(t, linked))).expect(http.StatusConflict)
+	if after["status"] != "in_progress" {
+		t.Errorf("status lost on chapter delete: %v", after["status"])
+	}
+}

@@ -99,6 +99,14 @@ Migration groups correspond to product domains:
 | `000029` | Versioned writer agreement records |
 | `000030` | Per-story paragraph style |
 | `000031`–`000032` | Story completion status and reader update; per-chapter publication and `public_updated_at` |
+| `000033`–`000037` | Admin story and competition listings, admin audit log, user bans |
+| `000038` | Plot events link to a chapter by `chapter_id`, and carry a writer-set `status` |
+
+**Plot events and chapters.** An event's `chapterId` is a chapter of the same
+story or null (unassigned); the store checks this before writing. Deleting a
+chapter unassigns its events and bumps their revision, so a client still
+holding the old `chapterId` gets a 409. `status` is `planned`, `in_progress` or
+`written`, set only by the writer.
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an
