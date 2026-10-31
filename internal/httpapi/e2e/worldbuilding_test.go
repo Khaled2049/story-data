@@ -637,3 +637,207 @@ func TestPlotEventOrderChangesKeepEventRevisions(t *testing.T) {
 		"name": "A, edited", "content": "c",
 	}, ifMatch(rev(t, a))).expect(http.StatusOK)
 }
+
+// eventsByID flattens a plots response into event id -> event.
+func eventsByID(t *testing.T, plots []map[string]any) map[string]map[string]any {
+	t.Helper()
+	out := map[string]map[string]any{}
+	for _, line := range plots {
+		for _, raw := range line["events"].([]any) {
+			e := raw.(map[string]any)
+			e["lineId"] = line["id"]
+			out[e["id"].(string)] = e
+		}
+	}
+	return out
+}
+
+// Events in one chapter have their own order across plot lines, separate from
+// each line's order. Moving an event into a chapter changes its chapterId, so
+// that bumps its revision; reordering inside a chapter does not.
+func TestPlotChapterOrder(t *testing.T) {
+	reset(t)
+	story := newStory(t, alice, "Chapter order")
+	id := story["id"].(string)
+	chapters := "/v1/stories/" + id + "/chapters"
+	ch1 := get(t, chapters, alice).expect(http.StatusOK).list()[0]["id"].(string)
+	ch2 := call(t, "POST", chapters, alice, map[string]any{
+		"title": "Two", "content": "", "position": 1,
+	}).expect(http.StatusCreated).json()["id"].(string)
+	main := newPlotLine(t, alice, id, "Main")["id"].(string)
+	sub := newPlotLine(t, alice, id, "Sub")["id"].(string)
+	create := func(line, name string, chapter any) map[string]any {
+		return call(t, "POST", worldPath(id, "plots")+"/"+line+"/events", alice,
+			map[string]any{"name": name, "content": "c", "chapterId": chapter}).
+			expect(http.StatusCreated).json()
+	}
+	a := create(main, "A", ch1)
+	b := create(main, "B", ch1)
+	c := create(sub, "C", ch1)
+	d := create(sub, "D", ch2)
+	u := create(main, "U", nil)
+
+	// New events append to their chapter; unassigned ones have no position.
+	for i, e := range []map[string]any{a, b, c} {
+		if e["chapterPosition"].(float64) != float64(i) {
+			t.Errorf("%v chapterPosition = %v, want %d", e["name"], e["chapterPosition"], i)
+		}
+	}
+	if u["chapterPosition"] != nil {
+		t.Errorf("unassigned chapterPosition = %v", u["chapterPosition"])
+	}
+
+	order := worldPath(id, "plots") + "/chapter-order"
+	ids := func(es ...map[string]any) []string {
+		out := []string{}
+		for _, e := range es {
+			out = append(out, e["id"].(string))
+		}
+		return out
+	}
+
+	// A pure reorder moves positions and leaves revisions alone.
+	got := eventsByID(t, call(t, "POST", order, alice, map[string]any{
+		"chapterId": ch1, "orderedIds": ids(c, a, b),
+	}).expect(http.StatusOK).list())
+	for i, e := range []map[string]any{c, a, b} {
+		now := got[e["id"].(string)]
+		if now["chapterPosition"].(float64) != float64(i) || rev(t, now) != rev(t, e) {
+			t.Errorf("%v after reorder: position %v revision %d", e["name"], now["chapterPosition"], rev(t, now))
+		}
+	}
+
+	// Leaving out an event already in the chapter means a stale view.
+	call(t, "POST", order, alice, map[string]any{
+		"chapterId": ch1, "orderedIds": ids(c, a),
+	}).expect(http.StatusConflict)
+
+	// Events from another chapter and from Unassigned move in at their place,
+	// in one call, with a revision bump since their chapterId changed.
+	got = eventsByID(t, call(t, "POST", order, alice, map[string]any{
+		"chapterId": ch1, "orderedIds": ids(c, d, a, u, b),
+	}).expect(http.StatusOK).list())
+	for i, e := range []map[string]any{c, d, a, u, b} {
+		now := got[e["id"].(string)]
+		if now["chapterId"] != ch1 || now["chapterPosition"].(float64) != float64(i) {
+			t.Errorf("%v: chapter %v position %v", e["name"], now["chapterId"], now["chapterPosition"])
+		}
+	}
+	if rev(t, got[d["id"].(string)]) != rev(t, d)+1 || rev(t, got[u["id"].(string)]) != rev(t, u)+1 {
+		t.Errorf("moved-in events should bump their revision once")
+	}
+	if rev(t, got[a["id"].(string)]) != rev(t, a) {
+		t.Errorf("an event already in the chapter should keep its revision")
+	}
+
+	// Bad input: duplicates, a foreign event, a foreign chapter.
+	other := newStory(t, bob, "Bob's")
+	otherID := other["id"].(string)
+	bobLine := newPlotLine(t, bob, otherID, "Theirs")["id"].(string)
+	foreign := newEvent(t, bob, otherID, bobLine, "Not yours")
+	bobChapter := get(t, "/v1/stories/"+otherID+"/chapters", bob).expect(http.StatusOK).list()[0]["id"]
+	all := ids(c, d, a, u, b)
+	for _, body := range []map[string]any{
+		{"chapterId": ch1, "orderedIds": append(all, a["id"].(string))},
+		{"chapterId": ch1, "orderedIds": append(all, foreign["id"].(string))},
+		{"chapterId": bobChapter, "orderedIds": []string{}},
+	} {
+		call(t, "POST", order, alice, body).expect(http.StatusUnprocessableEntity)
+	}
+
+	// Assigning a chapter through PATCH appends; unassigning clears the position.
+	aNow := got[a["id"].(string)]
+	moved := call(t, "PATCH", worldPath(id, "plots")+"/"+main+"/events/"+a["id"].(string), alice,
+		map[string]any{"name": "A", "content": "c", "chapterId": ch2}, ifMatch(rev(t, aNow))).
+		expect(http.StatusOK).json()
+	if moved["chapterPosition"].(float64) != 0 {
+		t.Errorf("A in an empty chapter: position %v, want 0", moved["chapterPosition"])
+	}
+	cleared := call(t, "PATCH", worldPath(id, "plots")+"/"+main+"/events/"+a["id"].(string), alice,
+		map[string]any{"name": "A", "content": "c", "chapterId": nil}, ifMatch(rev(t, moved))).
+		expect(http.StatusOK).json()
+	if cleared["chapterPosition"] != nil {
+		t.Errorf("unassigned A kept position %v", cleared["chapterPosition"])
+	}
+
+	// Deleting a chapter clears both the link and the position.
+	chNow := get(t, chapters+"/"+ch1, alice).expect(http.StatusOK).json()
+	call(t, "DELETE", chapters+"/"+ch1, alice, nil, ifMatch(rev(t, chNow))).expect(http.StatusNoContent)
+	after := eventsByID(t, get(t, worldPath(id, "plots"), alice).expect(http.StatusOK).list())
+	if e := after[c["id"].(string)]; e["chapterId"] != nil || e["chapterPosition"] != nil {
+		t.Errorf("after chapter delete: chapter %v position %v", e["chapterId"], e["chapterPosition"])
+	}
+}
+
+// Moving an event between plot lines renumbers both and leaves the event's
+// fields, links and revision alone.
+func TestPlotEventMoveBetweenLines(t *testing.T) {
+	reset(t)
+	story := newStory(t, alice, "Moves")
+	id := story["id"].(string)
+	main := newPlotLine(t, alice, id, "Main")["id"].(string)
+	sub := newPlotLine(t, alice, id, "Sub")["id"].(string)
+	a := newEvent(t, alice, id, main, "A")
+	b := newEvent(t, alice, id, main, "B")
+	c := newEvent(t, alice, id, main, "C")
+	newEvent(t, alice, id, sub, "X")
+	y := call(t, "POST", worldPath(id, "plots")+"/"+sub+"/events", alice, map[string]any{
+		"name": "Y", "content": "c",
+		"dependencies": []map[string]any{{"eventId": b["id"], "plotLineId": main, "relationshipType": "requires"}},
+	}).expect(http.StatusCreated).json()
+	move := func(from string, e map[string]any) string {
+		return worldPath(id, "plots") + "/" + from + "/events/" + e["id"].(string) + "/move"
+	}
+
+	plots := call(t, "POST", move(main, b), alice, map[string]any{
+		"toPlotLineId": sub, "toIndex": 1,
+	}, ifMatch(rev(t, b))).expect(http.StatusOK).list()
+	names := func(lineID string) []string {
+		out := []string{}
+		for _, line := range plots {
+			if line["id"] != lineID {
+				continue
+			}
+			for i, raw := range line["events"].([]any) {
+				e := raw.(map[string]any)
+				if int(e["orderIndex"].(float64)) != i {
+					t.Errorf("%v not renumbered: orderIndex %v at %d", e["name"], e["orderIndex"], i)
+				}
+				out = append(out, e["name"].(string))
+			}
+		}
+		return out
+	}
+	if got := names(main); fmt.Sprint(got) != "[A C]" {
+		t.Errorf("main = %v, want [A C]", got)
+	}
+	if got := names(sub); fmt.Sprint(got) != "[X B Y]" {
+		t.Errorf("sub = %v, want [X B Y]", got)
+	}
+	byID := eventsByID(t, plots)
+	if rev(t, byID[b["id"].(string)]) != rev(t, b) {
+		t.Errorf("moving should not bump the event's revision")
+	}
+	dep := byID[y["id"].(string)]["dependencies"].([]any)[0].(map[string]any)
+	if dep["eventId"] != b["id"] || dep["plotLineId"] != sub {
+		t.Errorf("dependency after move = %v, want B in Sub", dep)
+	}
+
+	// The event is no longer in Main, and a stale revision is a conflict.
+	call(t, "POST", move(main, b), alice, map[string]any{"toPlotLineId": sub, "toIndex": 0},
+		ifMatch(rev(t, b))).expect(http.StatusNotFound)
+	call(t, "POST", move(main, a), alice, map[string]any{"toPlotLineId": sub, "toIndex": 0},
+		ifMatch(rev(t, a)+1)).expect(http.StatusConflict)
+
+	// An index past the end lands last; a foreign target line is refused.
+	plots = call(t, "POST", move(main, c), alice, map[string]any{
+		"toPlotLineId": sub, "toIndex": 99,
+	}, ifMatch(rev(t, c))).expect(http.StatusOK).list()
+	if got := names(sub); fmt.Sprint(got) != "[X B Y C]" {
+		t.Errorf("sub = %v, want [X B Y C]", got)
+	}
+	other := newStory(t, bob, "Bob's")
+	theirs := newPlotLine(t, bob, other["id"].(string), "Theirs")["id"].(string)
+	call(t, "POST", move(main, a), alice, map[string]any{"toPlotLineId": theirs, "toIndex": 0},
+		ifMatch(rev(t, a))).expect(http.StatusUnprocessableEntity)
+}

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/kh1011/novelsync-story-data/internal/store"
 )
 
@@ -152,6 +153,23 @@ func (s *Server) plots(w http.ResponseWriter, r *http.Request, uid, sid string, 
 		}
 		return
 	}
+	// Ahead of uuidPath: "chapter-order" is a word, not a plot line id.
+	if len(p) == 1 && p[0] == "chapter-order" {
+		if r.Method != http.MethodPost {
+			method(w)
+			return
+		}
+		var in struct {
+			ChapterID  string   `json:"chapterId"`
+			OrderedIDs []string `json:"orderedIds"`
+		}
+		if !decode(w, r, &in) || !required(w, "chapterId", in.ChapterID) {
+			return
+		}
+		x, e := s.store.ReorderChapterEvents(r.Context(), sid, uid, in.ChapterID, in.OrderedIDs)
+		respond(w, x, e)
+		return
+	}
 	line := p[0]
 	if !uuidPath(w, line) {
 		return
@@ -201,6 +219,29 @@ func (s *Server) plotEvents(w http.ResponseWriter, r *http.Request, uid, sid, li
 			return
 		}
 		x, e := s.store.ReorderEvents(r.Context(), sid, line, uid, rev, in.OrderedIDs)
+		respond(w, x, e)
+		return
+	}
+	if len(p) == 2 && p[1] == "move" && r.Method == http.MethodPost {
+		if !uuidPath(w, p[0]) {
+			return
+		}
+		rev, ok := revision(w, r)
+		if !ok {
+			return
+		}
+		var in struct {
+			ToPlotLineID string `json:"toPlotLineId"`
+			ToIndex      int    `json:"toIndex"`
+		}
+		if !decode(w, r, &in) || !required(w, "toPlotLineId", in.ToPlotLineID) {
+			return
+		}
+		if _, e := uuid.Parse(in.ToPlotLineID); e != nil {
+			writeError(w, http.StatusUnprocessableEntity, "toPlotLineId must be a plot line id")
+			return
+		}
+		x, e := s.store.MoveEvent(r.Context(), sid, line, p[0], uid, rev, in.ToPlotLineID, in.ToIndex)
 		respond(w, x, e)
 		return
 	}

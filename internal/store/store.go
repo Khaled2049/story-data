@@ -617,7 +617,7 @@ func (s *Store) DeleteChapter(ctx context.Context, storyID, id, owner string, re
 	}
 	// Planned events become unassigned. The revision bump means a client still
 	// holding the old chapterId gets a 409 instead of re-sending it.
-	if _, err = tx.Exec(ctx, `UPDATE plot_events SET chapter_id=NULL,revision=revision+1,updated_at=now() WHERE chapter_id=$1 AND plot_line_id IN (SELECT id FROM plot_lines WHERE story_id=$2)`, id, storyID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE plot_events SET chapter_id=NULL,chapter_position=NULL,revision=revision+1,updated_at=now() WHERE chapter_id=$1 AND plot_line_id IN (SELECT id FROM plot_lines WHERE story_id=$2)`, id, storyID); err != nil {
 		return err
 	}
 	row := tx.QueryRow(ctx, `DELETE FROM chapters c USING stories s WHERE c.id=$1 AND c.story_id=$2 AND c.story_id=s.id AND s.owner_id=$3 AND c.revision=$4 RETURNING c.id, c.published_at`, id, storyID, owner, rev)

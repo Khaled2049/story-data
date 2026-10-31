@@ -87,6 +87,7 @@ type PlotEvent struct {
 	TimeConstraint json.RawMessage `json:"timeConstraint,omitempty"`
 	OrderIndex     int             `json:"orderIndex"`
 	ChapterID      *string         `json:"chapterId"`
+	ChapterPos     *float64        `json:"chapterPosition"`
 	Status         string          `json:"status"`
 	Notes          string          `json:"notes,omitempty"`
 	Revision       int64           `json:"revision"`
@@ -442,7 +443,7 @@ func (s *Store) ListPlots(ctx context.Context, storyID, uid string) ([]PlotLine,
 	return out, rows.Err()
 }
 func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent, error) {
-	rows, e := s.db.Query(ctx, `SELECT e.id,e.name,e.content,e.location_id,e.tension_level,e.pacing,e.story_beat,COALESCE(e.emotional_tone,''),e.time_constraint,e.position,e.chapter_id,e.status,COALESCE(e.notes,''),e.revision FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.plot_line_id=$1 AND l.story_id=$2 ORDER BY e.position`, lineID, storyID)
+	rows, e := s.db.Query(ctx, `SELECT e.id,e.name,e.content,e.location_id,e.tension_level,e.pacing,e.story_beat,COALESCE(e.emotional_tone,''),e.time_constraint,e.position,e.chapter_id,e.chapter_position,e.status,COALESCE(e.notes,''),e.revision FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.plot_line_id=$1 AND l.story_id=$2 ORDER BY e.position`, lineID, storyID)
 	if e != nil {
 		return nil, e
 	}
@@ -453,7 +454,7 @@ func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent
 		var lid, cid *uuid.UUID
 		var tc []byte
 		var pos float64
-		if e = rows.Scan(&x.ID, &x.Name, &x.Content, &lid, &x.TensionLevel, &x.Pacing, &x.StoryBeat, &x.EmotionalTone, &tc, &pos, &cid, &x.Status, &x.Notes, &x.Revision); e != nil {
+		if e = rows.Scan(&x.ID, &x.Name, &x.Content, &lid, &x.TensionLevel, &x.Pacing, &x.StoryBeat, &x.EmotionalTone, &tc, &pos, &cid, &x.ChapterPos, &x.Status, &x.Notes, &x.Revision); e != nil {
 			return nil, e
 		}
 		if lid != nil {
@@ -706,8 +707,12 @@ func (s *Store) CreateEvent(ctx context.Context, storyID, lineID, uid string, in
 	if n >= maxEntitiesPerStory {
 		return PlotEvent{}, ErrLimit
 	}
+	chapterPos, e := appendToChapter(ctx, tx, in.ChapterID)
+	if e != nil {
+		return PlotEvent{}, e
+	}
 	id := uuid.New()
-	_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,tension_level,pacing,story_beat,emotional_tone,time_constraint,position,chapter_id,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, id, lineID, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), n, in.ChapterID, in.Status, emptyToNull(in.Notes))
+	_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,tension_level,pacing,story_beat,emotional_tone,time_constraint,position,chapter_id,chapter_position,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, id, lineID, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), n, in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes))
 	if e != nil {
 		return PlotEvent{}, e
 	}
@@ -755,7 +760,9 @@ func (s *Store) UpdateEvent(ctx context.Context, storyID, lineID, id, uid string
 	// Revision first: a stale write naming a since-deleted chapter is a
 	// conflict, not bad input.
 	var current int64
-	if e = tx.QueryRow(ctx, `SELECT revision FROM plot_events WHERE id=$1 AND plot_line_id=$2 FOR UPDATE`, id, lineID).Scan(&current); errors.Is(e, pgx.ErrNoRows) {
+	var wasChapter *uuid.UUID
+	var wasPos *float64
+	if e = tx.QueryRow(ctx, `SELECT revision,chapter_id,chapter_position FROM plot_events WHERE id=$1 AND plot_line_id=$2 FOR UPDATE`, id, lineID).Scan(&current, &wasChapter, &wasPos); errors.Is(e, pgx.ErrNoRows) {
 		return PlotEvent{}, s.classifyEventWrite(ctx, storyID, lineID, id, uid)
 	} else if e != nil {
 		return PlotEvent{}, e
@@ -766,7 +773,14 @@ func (s *Store) UpdateEvent(ctx context.Context, storyID, lineID, id, uid string
 	if e = eventChapter(ctx, tx, storyID, in.ChapterID); e != nil {
 		return PlotEvent{}, e
 	}
-	cmd, e := tx.Exec(ctx, `UPDATE plot_events SET name=$1,content=$2,location_id=$3,tension_level=$4,pacing=$5,story_beat=$6,emotional_tone=$7,time_constraint=$8,chapter_id=$9,status=$10,notes=$11,revision=revision+1,updated_at=now() WHERE id=$12 AND plot_line_id=$13 AND revision=$14`, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), in.ChapterID, in.Status, emptyToNull(in.Notes), id, lineID, rev)
+	// A new chapter puts the event at its end; the same chapter keeps its place.
+	chapterPos := wasPos
+	if !sameChapter(wasChapter, in.ChapterID) {
+		if chapterPos, e = appendToChapter(ctx, tx, in.ChapterID); e != nil {
+			return PlotEvent{}, e
+		}
+	}
+	cmd, e := tx.Exec(ctx, `UPDATE plot_events SET name=$1,content=$2,location_id=$3,tension_level=$4,pacing=$5,story_beat=$6,emotional_tone=$7,time_constraint=$8,chapter_id=$9,chapter_position=$10,status=$11,notes=$12,revision=revision+1,updated_at=now() WHERE id=$13 AND plot_line_id=$14 AND revision=$15`, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes), id, lineID, rev)
 	if e != nil {
 		return PlotEvent{}, e
 	}
