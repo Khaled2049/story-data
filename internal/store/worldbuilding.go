@@ -66,11 +66,15 @@ type PlaceInput struct {
 	Significance string `json:"significance"`
 	Notes        string `json:"notes"`
 }
+
+// Dependency is one "requires" link. On an event's Dependencies it names a
+// prerequisite; on Dependents, an event that requires this one.
 type Dependency struct {
 	EventID          string `json:"eventId"`
 	PlotLineID       string `json:"plotLineId"`
 	RelationshipType string `json:"relationshipType"`
 	Description      string `json:"description,omitempty"`
+	OutOfOrderOK     bool   `json:"outOfOrderOk"`
 }
 type PlotEvent struct {
 	ID             string          `json:"id"`
@@ -447,14 +451,16 @@ func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent
 	if e != nil {
 		return nil, e
 	}
-	defer rows.Close()
 	out := []PlotEvent{}
+	ids := []string{}
+	at := map[string]int{}
 	for rows.Next() {
 		var x PlotEvent
 		var lid, cid *uuid.UUID
 		var tc []byte
 		var pos float64
 		if e = rows.Scan(&x.ID, &x.Name, &x.Content, &lid, &x.TensionLevel, &x.Pacing, &x.StoryBeat, &x.EmotionalTone, &tc, &pos, &cid, &x.ChapterPos, &x.Status, &x.Notes, &x.Revision); e != nil {
+			rows.Close()
 			return nil, e
 		}
 		if lid != nil {
@@ -470,35 +476,59 @@ func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent
 		x.CharacterIDs = []string{}
 		x.Dependencies = []Dependency{}
 		x.Dependents = []Dependency{}
-		cr, e := s.db.Query(ctx, `SELECT character_id FROM plot_event_characters WHERE plot_event_id=$1`, x.ID)
-		if e != nil {
-			return nil, e
-		}
-		for cr.Next() {
-			var v uuid.UUID
-			if e = cr.Scan(&v); e != nil {
-				cr.Close()
-				return nil, e
-			}
-			x.CharacterIDs = append(x.CharacterIDs, v.String())
-		}
-		cr.Close()
-		dr, e := s.db.Query(ctx, `SELECT d.depends_on_event_id,l.id,d.relationship_type,COALESCE(d.description,'') FROM plot_event_dependencies d JOIN plot_events e ON e.id=d.depends_on_event_id JOIN plot_lines l ON l.id=e.plot_line_id WHERE d.plot_event_id=$1`, x.ID)
-		if e != nil {
-			return nil, e
-		}
-		for dr.Next() {
-			var d Dependency
-			if e = dr.Scan(&d.EventID, &d.PlotLineID, &d.RelationshipType, &d.Description); e != nil {
-				dr.Close()
-				return nil, e
-			}
-			x.Dependencies = append(x.Dependencies, d)
-		}
-		dr.Close()
+		at[x.ID] = len(out)
+		ids = append(ids, x.ID)
 		out = append(out, x)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if e = rows.Err(); e != nil || len(ids) == 0 {
+		return out, e
+	}
+
+	// Three queries per plot line rather than several per event.
+	cr, e := s.db.Query(ctx, `SELECT plot_event_id,character_id FROM plot_event_characters WHERE plot_event_id=ANY($1::uuid[])`, ids)
+	if e != nil {
+		return nil, e
+	}
+	for cr.Next() {
+		var eventID, characterID uuid.UUID
+		if e = cr.Scan(&eventID, &characterID); e != nil {
+			cr.Close()
+			return nil, e
+		}
+		x := &out[at[eventID.String()]]
+		x.CharacterIDs = append(x.CharacterIDs, characterID.String())
+	}
+	cr.Close()
+	if e = cr.Err(); e != nil {
+		return nil, e
+	}
+
+	links := func(query string, attach func(x *PlotEvent, d Dependency)) error {
+		lr, e := s.db.Query(ctx, query, ids)
+		if e != nil {
+			return e
+		}
+		defer lr.Close()
+		for lr.Next() {
+			var owner uuid.UUID
+			var d Dependency
+			if e = lr.Scan(&owner, &d.EventID, &d.PlotLineID, &d.RelationshipType, &d.Description, &d.OutOfOrderOK); e != nil {
+				return e
+			}
+			attach(&out[at[owner.String()]], d)
+		}
+		return lr.Err()
+	}
+	if e = links(`SELECT d.plot_event_id,d.depends_on_event_id,l.id,d.relationship_type,COALESCE(d.description,''),d.out_of_order_ok FROM plot_event_dependencies d JOIN plot_events e ON e.id=d.depends_on_event_id JOIN plot_lines l ON l.id=e.plot_line_id WHERE d.plot_event_id=ANY($1::uuid[]) ORDER BY l.created_at,e.position`,
+		func(x *PlotEvent, d Dependency) { x.Dependencies = append(x.Dependencies, d) }); e != nil {
+		return nil, e
+	}
+	if e = links(`SELECT d.depends_on_event_id,d.plot_event_id,l.id,d.relationship_type,COALESCE(d.description,''),d.out_of_order_ok FROM plot_event_dependencies d JOIN plot_events e ON e.id=d.plot_event_id JOIN plot_lines l ON l.id=e.plot_line_id WHERE d.depends_on_event_id=ANY($1::uuid[]) ORDER BY l.created_at,e.position`,
+		func(x *PlotEvent, d Dependency) { x.Dependents = append(x.Dependents, d) }); e != nil {
+		return nil, e
+	}
+	return out, nil
 }
 func (s *Store) CreatePlot(ctx context.Context, storyID, uid string, in PlotLineInput) (PlotLine, error) {
 	if !validPlotLineInput(in) {
@@ -666,19 +696,50 @@ func (s *Store) writeEventRefs(ctx context.Context, tx pgx.Tx, storyID, eventID 
 			return e
 		}
 	}
+	if len(in.Dependencies) > 0 {
+		// Serializes requirement writes per story: two saves that each look
+		// loop-free could otherwise commit a loop between them.
+		if _, e := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('plot-deps:' || $1, 0))`, storyID); e != nil {
+			return e
+		}
+	}
 	if _, e := tx.Exec(ctx, `DELETE FROM plot_event_dependencies WHERE plot_event_id=$1`, eventID); e != nil {
 		return e
 	}
+	seen := map[string]bool{}
 	for _, d := range in.Dependencies {
 		if d.EventID == eventID {
 			return fmt.Errorf("%w: event cannot depend on itself", ErrValidation)
+		}
+		if seen[d.EventID] {
+			return fmt.Errorf("%w: an event is listed as a requirement twice", ErrValidation)
+		}
+		seen[d.EventID] = true
+		if d.RelationshipType == "" {
+			d.RelationshipType = "requires"
+		}
+		if d.RelationshipType != "requires" {
+			return fmt.Errorf("%w: relationshipType must be requires", ErrValidation)
 		}
 		var ok bool
 		if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.id=$1 AND l.story_id=$2)`, d.EventID, storyID).Scan(&ok); e != nil || !ok {
 			return fmt.Errorf("%w: dependency event is not in this story", ErrValidation)
 		}
-		if _, e := tx.Exec(ctx, `INSERT INTO plot_event_dependencies(plot_event_id,depends_on_event_id,relationship_type,description) VALUES($1,$2,$3,$4)`, eventID, d.EventID, d.RelationshipType, emptyToNull(d.Description)); e != nil {
+		if _, e := tx.Exec(ctx, `INSERT INTO plot_event_dependencies(plot_event_id,depends_on_event_id,relationship_type,description,out_of_order_ok) VALUES($1,$2,$3,$4,$5)`, eventID, d.EventID, d.RelationshipType, emptyToNull(d.Description), d.OutOfOrderOK); e != nil {
 			return e
+		}
+	}
+	if len(in.Dependencies) > 0 {
+		var loop bool
+		if e := tx.QueryRow(ctx, `WITH RECURSIVE reach(id) AS (
+			SELECT depends_on_event_id FROM plot_event_dependencies WHERE plot_event_id=$1
+			UNION
+			SELECT d.depends_on_event_id FROM plot_event_dependencies d JOIN reach r ON d.plot_event_id=r.id
+		) SELECT EXISTS(SELECT 1 FROM reach WHERE id=$1)`, eventID).Scan(&loop); e != nil {
+			return e
+		}
+		if loop {
+			return fmt.Errorf("%w: that would make a loop of requirements, where an event ends up requiring itself", ErrValidation)
 		}
 	}
 	return nil
