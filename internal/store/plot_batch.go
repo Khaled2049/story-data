@@ -109,7 +109,7 @@ func (s *Store) insertEventBatch(ctx context.Context, tx pgx.Tx, storyID, lineID
 		}
 		id := uuid.New().String()
 		ids = append(ids, id)
-		_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,tension_level,pacing,story_beat,emotional_tone,time_constraint,position,chapter_id,chapter_position,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, id, lineID, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), count+i, in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes))
+		_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,pacing,story_beat,emotional_tone,position,chapter_id,chapter_position,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, lineID, in.Name, in.Content, in.LocationID, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), count+i, in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes))
 		if e != nil {
 			return nil, e
 		}

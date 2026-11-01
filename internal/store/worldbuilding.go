@@ -67,50 +67,34 @@ type PlaceInput struct {
 	Notes        string `json:"notes"`
 }
 
-// Dependency is one "requires" link. On an event's Dependencies it names a
-// prerequisite; on Dependents, an event that requires this one.
-type Dependency struct {
-	EventID          string `json:"eventId"`
-	PlotLineID       string `json:"plotLineId"`
-	RelationshipType string `json:"relationshipType"`
-	Description      string `json:"description,omitempty"`
-	OutOfOrderOK     bool   `json:"outOfOrderOk"`
-}
 type PlotEvent struct {
-	ID             string          `json:"id"`
-	Name           string          `json:"name"`
-	Content        string          `json:"content"`
-	CharacterIDs   []string        `json:"characterIds"`
-	LocationID     *string         `json:"locationId"`
-	Dependencies   []Dependency    `json:"dependencies"`
-	Dependents     []Dependency    `json:"dependents"`
-	TensionLevel   int             `json:"tensionLevel"`
-	Pacing         string          `json:"pacing"`
-	StoryBeat      string          `json:"storyBeat"`
-	EmotionalTone  string          `json:"emotionalTone,omitempty"`
-	TimeConstraint json.RawMessage `json:"timeConstraint,omitempty"`
-	OrderIndex     int             `json:"orderIndex"`
-	ChapterID      *string         `json:"chapterId"`
-	ChapterPos     *float64        `json:"chapterPosition"`
-	Status         string          `json:"status"`
-	Notes          string          `json:"notes,omitempty"`
-	Revision       int64           `json:"revision"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Content       string   `json:"content"`
+	CharacterIDs  []string `json:"characterIds"`
+	LocationID    *string  `json:"locationId"`
+	Pacing        string   `json:"pacing"`
+	StoryBeat     string   `json:"storyBeat"`
+	EmotionalTone string   `json:"emotionalTone,omitempty"`
+	OrderIndex    int      `json:"orderIndex"`
+	ChapterID     *string  `json:"chapterId"`
+	ChapterPos    *float64 `json:"chapterPosition"`
+	Status        string   `json:"status"`
+	Notes         string   `json:"notes,omitempty"`
+	Revision      int64    `json:"revision"`
 }
 type PlotEventInput struct {
-	Name           string          `json:"name"`
-	Content        string          `json:"content"`
-	CharacterIDs   []string        `json:"characterIds"`
-	LocationID     *string         `json:"locationId"`
-	Dependencies   []Dependency    `json:"dependencies"`
-	TensionLevel   int             `json:"tensionLevel"`
-	Pacing         string          `json:"pacing"`
-	StoryBeat      string          `json:"storyBeat"`
-	EmotionalTone  string          `json:"emotionalTone"`
-	TimeConstraint json.RawMessage `json:"timeConstraint"`
-	OrderIndex     int             `json:"orderIndex"`
-	ChapterID      *string         `json:"chapterId"`
-	Status         string          `json:"status"`
-	Notes          string          `json:"notes"`
+	Name          string   `json:"name"`
+	Content       string   `json:"content"`
+	CharacterIDs  []string `json:"characterIds"`
+	LocationID    *string  `json:"locationId"`
+	Pacing        string   `json:"pacing"`
+	StoryBeat     string   `json:"storyBeat"`
+	EmotionalTone string   `json:"emotionalTone"`
+	OrderIndex    int      `json:"orderIndex"`
+	ChapterID     *string  `json:"chapterId"`
+	Status        string   `json:"status"`
+	Notes         string   `json:"notes"`
 }
 type PlotLine struct {
 	ID          string      `json:"id"`
@@ -447,7 +431,7 @@ func (s *Store) ListPlots(ctx context.Context, storyID, uid string) ([]PlotLine,
 	return out, rows.Err()
 }
 func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent, error) {
-	rows, e := s.db.Query(ctx, `SELECT e.id,e.name,e.content,e.location_id,e.tension_level,e.pacing,e.story_beat,COALESCE(e.emotional_tone,''),e.time_constraint,e.position,e.chapter_id,e.chapter_position,e.status,COALESCE(e.notes,''),e.revision FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.plot_line_id=$1 AND l.story_id=$2 ORDER BY e.position`, lineID, storyID)
+	rows, e := s.db.Query(ctx, `SELECT e.id,e.name,e.content,e.location_id,e.pacing,e.story_beat,COALESCE(e.emotional_tone,''),e.position,e.chapter_id,e.chapter_position,e.status,COALESCE(e.notes,''),e.revision FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.plot_line_id=$1 AND l.story_id=$2 ORDER BY e.position`, lineID, storyID)
 	if e != nil {
 		return nil, e
 	}
@@ -457,9 +441,8 @@ func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent
 	for rows.Next() {
 		var x PlotEvent
 		var lid, cid *uuid.UUID
-		var tc []byte
 		var pos float64
-		if e = rows.Scan(&x.ID, &x.Name, &x.Content, &lid, &x.TensionLevel, &x.Pacing, &x.StoryBeat, &x.EmotionalTone, &tc, &pos, &cid, &x.ChapterPos, &x.Status, &x.Notes, &x.Revision); e != nil {
+		if e = rows.Scan(&x.ID, &x.Name, &x.Content, &lid, &x.Pacing, &x.StoryBeat, &x.EmotionalTone, &pos, &cid, &x.ChapterPos, &x.Status, &x.Notes, &x.Revision); e != nil {
 			rows.Close()
 			return nil, e
 		}
@@ -471,11 +454,8 @@ func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent
 			v := cid.String()
 			x.ChapterID = &v
 		}
-		x.TimeConstraint = tc
 		x.OrderIndex = int(pos)
 		x.CharacterIDs = []string{}
-		x.Dependencies = []Dependency{}
-		x.Dependents = []Dependency{}
 		at[x.ID] = len(out)
 		ids = append(ids, x.ID)
 		out = append(out, x)
@@ -485,7 +465,7 @@ func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent
 		return out, e
 	}
 
-	// Three queries per plot line rather than several per event.
+	// One query per plot line rather than one per event.
 	cr, e := s.db.Query(ctx, `SELECT plot_event_id,character_id FROM plot_event_characters WHERE plot_event_id=ANY($1::uuid[])`, ids)
 	if e != nil {
 		return nil, e
@@ -504,30 +484,6 @@ func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent
 		return nil, e
 	}
 
-	links := func(query string, attach func(x *PlotEvent, d Dependency)) error {
-		lr, e := s.db.Query(ctx, query, ids)
-		if e != nil {
-			return e
-		}
-		defer lr.Close()
-		for lr.Next() {
-			var owner uuid.UUID
-			var d Dependency
-			if e = lr.Scan(&owner, &d.EventID, &d.PlotLineID, &d.RelationshipType, &d.Description, &d.OutOfOrderOK); e != nil {
-				return e
-			}
-			attach(&out[at[owner.String()]], d)
-		}
-		return lr.Err()
-	}
-	if e = links(`SELECT d.plot_event_id,d.depends_on_event_id,l.id,d.relationship_type,COALESCE(d.description,''),d.out_of_order_ok FROM plot_event_dependencies d JOIN plot_events e ON e.id=d.depends_on_event_id JOIN plot_lines l ON l.id=e.plot_line_id WHERE d.plot_event_id=ANY($1::uuid[]) ORDER BY l.created_at,e.position`,
-		func(x *PlotEvent, d Dependency) { x.Dependencies = append(x.Dependencies, d) }); e != nil {
-		return nil, e
-	}
-	if e = links(`SELECT d.depends_on_event_id,d.plot_event_id,l.id,d.relationship_type,COALESCE(d.description,''),d.out_of_order_ok FROM plot_event_dependencies d JOIN plot_events e ON e.id=d.plot_event_id JOIN plot_lines l ON l.id=e.plot_line_id WHERE d.depends_on_event_id=ANY($1::uuid[]) ORDER BY l.created_at,e.position`,
-		func(x *PlotEvent, d Dependency) { x.Dependents = append(x.Dependents, d) }); e != nil {
-		return nil, e
-	}
 	return out, nil
 }
 func (s *Store) CreatePlot(ctx context.Context, storyID, uid string, in PlotLineInput) (PlotLine, error) {
@@ -627,12 +583,6 @@ func validEvent(in *PlotEventInput) error {
 	if !validPlotEventInput(*in) {
 		return ErrValidation
 	}
-	if in.TensionLevel == 0 {
-		in.TensionLevel = 5
-	}
-	if in.TensionLevel < 1 || in.TensionLevel > 10 {
-		return fmt.Errorf("%w: tensionLevel must be between 1 and 10", ErrValidation)
-	}
 	if in.Pacing == "" {
 		in.Pacing = "moderate"
 	}
@@ -696,52 +646,6 @@ func (s *Store) writeEventRefs(ctx context.Context, tx pgx.Tx, storyID, eventID 
 			return e
 		}
 	}
-	if len(in.Dependencies) > 0 {
-		// Serializes requirement writes per story: two saves that each look
-		// loop-free could otherwise commit a loop between them.
-		if _, e := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('plot-deps:' || $1, 0))`, storyID); e != nil {
-			return e
-		}
-	}
-	if _, e := tx.Exec(ctx, `DELETE FROM plot_event_dependencies WHERE plot_event_id=$1`, eventID); e != nil {
-		return e
-	}
-	seen := map[string]bool{}
-	for _, d := range in.Dependencies {
-		if d.EventID == eventID {
-			return fmt.Errorf("%w: event cannot depend on itself", ErrValidation)
-		}
-		if seen[d.EventID] {
-			return fmt.Errorf("%w: an event is listed as a requirement twice", ErrValidation)
-		}
-		seen[d.EventID] = true
-		if d.RelationshipType == "" {
-			d.RelationshipType = "requires"
-		}
-		if d.RelationshipType != "requires" {
-			return fmt.Errorf("%w: relationshipType must be requires", ErrValidation)
-		}
-		var ok bool
-		if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.id=$1 AND l.story_id=$2)`, d.EventID, storyID).Scan(&ok); e != nil || !ok {
-			return fmt.Errorf("%w: dependency event is not in this story", ErrValidation)
-		}
-		if _, e := tx.Exec(ctx, `INSERT INTO plot_event_dependencies(plot_event_id,depends_on_event_id,relationship_type,description,out_of_order_ok) VALUES($1,$2,$3,$4,$5)`, eventID, d.EventID, d.RelationshipType, emptyToNull(d.Description), d.OutOfOrderOK); e != nil {
-			return e
-		}
-	}
-	if len(in.Dependencies) > 0 {
-		var loop bool
-		if e := tx.QueryRow(ctx, `WITH RECURSIVE reach(id) AS (
-			SELECT depends_on_event_id FROM plot_event_dependencies WHERE plot_event_id=$1
-			UNION
-			SELECT d.depends_on_event_id FROM plot_event_dependencies d JOIN reach r ON d.plot_event_id=r.id
-		) SELECT EXISTS(SELECT 1 FROM reach WHERE id=$1)`, eventID).Scan(&loop); e != nil {
-			return e
-		}
-		if loop {
-			return fmt.Errorf("%w: that would make a loop of requirements, where an event ends up requiring itself", ErrValidation)
-		}
-	}
 	return nil
 }
 func (s *Store) CreateEvent(ctx context.Context, storyID, lineID, uid string, in PlotEventInput) (PlotEvent, error) {
@@ -773,7 +677,7 @@ func (s *Store) CreateEvent(ctx context.Context, storyID, lineID, uid string, in
 		return PlotEvent{}, e
 	}
 	id := uuid.New()
-	_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,tension_level,pacing,story_beat,emotional_tone,time_constraint,position,chapter_id,chapter_position,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, id, lineID, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), n, in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes))
+	_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,pacing,story_beat,emotional_tone,position,chapter_id,chapter_position,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, lineID, in.Name, in.Content, in.LocationID, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), n, in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes))
 	if e != nil {
 		return PlotEvent{}, e
 	}
@@ -841,7 +745,7 @@ func (s *Store) UpdateEvent(ctx context.Context, storyID, lineID, id, uid string
 			return PlotEvent{}, e
 		}
 	}
-	cmd, e := tx.Exec(ctx, `UPDATE plot_events SET name=$1,content=$2,location_id=$3,tension_level=$4,pacing=$5,story_beat=$6,emotional_tone=$7,time_constraint=$8,chapter_id=$9,chapter_position=$10,status=$11,notes=$12,revision=revision+1,updated_at=now() WHERE id=$13 AND plot_line_id=$14 AND revision=$15`, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes), id, lineID, rev)
+	cmd, e := tx.Exec(ctx, `UPDATE plot_events SET name=$1,content=$2,location_id=$3,pacing=$4,story_beat=$5,emotional_tone=$6,chapter_id=$7,chapter_position=$8,status=$9,notes=$10,revision=revision+1,updated_at=now() WHERE id=$11 AND plot_line_id=$12 AND revision=$13`, in.Name, in.Content, in.LocationID, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes), id, lineID, rev)
 	if e != nil {
 		return PlotEvent{}, e
 	}

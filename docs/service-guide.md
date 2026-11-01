@@ -103,6 +103,7 @@ Migration groups correspond to product domains:
 | `000038` | Plot events link to a chapter by `chapter_id`, and carry a writer-set `status` |
 | `000039` | `chapter_position`: an event's place among its chapter's planned events |
 | `000040` | Plot event dependencies are `requires` only, with `out_of_order_ok` |
+| `000041`–`000042` | Plot events lose `tension_level`, `time_constraint` and dependencies (`plot_event_dependencies`) |
 
 **Plot events and chapters.** An event's `chapterId` is a chapter of the same
 story or null (unassigned); the store checks this before writing. Deleting a
@@ -134,16 +135,6 @@ with `{events: [...]}` to append 1–50 events, or
 `POST /v1/stories/{id}/plots/with-events` with `{line, events}` to create a
 line and up to 50 events. Each request writes its events and indexing outbox
 entries in one transaction. A failed event leaves no part of the batch behind.
-
-**Requirements.** An event's `dependencies` are the events it requires, each
-`{eventId, relationshipType: "requires", outOfOrderOk}`; `dependents` (the
-events it enables) is derived on read, across plot lines. A save is refused
-with 422 for a self-link, a duplicate, any other relationship type, or a
-requirement that would close a loop; the loop check runs under a per-story
-advisory lock so two concurrent saves can't commit a loop between them.
-`outOfOrderOk` records that the writer accepted a prerequisite appearing later
-in the manuscript. Reading a plot line's events takes four queries however
-many events it has.
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an

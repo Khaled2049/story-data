@@ -358,9 +358,11 @@ func TestPlotEventCRUDAndOrdering(t *testing.T) {
 	third := newEvent(t, alice, id, lineID, "The reckoning")
 
 	// Defaults are applied rather than rejected.
-	if first["tensionLevel"].(float64) != 5 || first["pacing"] != "moderate" ||
-		first["storyBeat"] != "rising_action" {
+	if first["pacing"] != "moderate" || first["storyBeat"] != "rising_action" {
 		t.Errorf("unexpected event defaults: %v", first)
+	}
+	if _, ok := first["tensionLevel"]; ok {
+		t.Errorf("events no longer carry a tension level: %v", first)
 	}
 	if first["orderIndex"].(float64) != 0 || third["orderIndex"].(float64) != 2 {
 		t.Errorf("events not appended in order: %v, %v",
@@ -437,29 +439,17 @@ func TestPlotEventReferencesAreScopedToTheStory(t *testing.T) {
 		"characterIds": []string{outsider["id"].(string)},
 	}).expect(http.StatusUnprocessableEntity)
 
-	// Out-of-range tension is bad input too.
-	call(t, "POST", events, alice, map[string]any{
-		"name": "Too tense", "content": "c", "tensionLevel": 99,
-	}).expect(http.StatusUnprocessableEntity)
-
-	// A dependency on an event outside the story is refused.
-	call(t, "POST", events, alice, map[string]any{
-		"name": "Bad dependency", "content": "c",
-		"dependencies": []map[string]any{
-			{"eventId": "11111111-1111-1111-1111-111111111111",
-				"plotLineId": lineID, "relationshipType": "requires"},
-		},
-	}).expect(http.StatusUnprocessableEntity)
-
-	// A real dependency inside the story is accepted and read back.
-	dependent := call(t, "POST", events, alice, map[string]any{
-		"name": "Depends", "content": "c",
-		"dependencies": []map[string]any{
-			{"eventId": ok["id"], "plotLineId": lineID, "relationshipType": "requires"},
-		},
-	}).expect(http.StatusCreated).json()
-	if len(dependent["dependencies"].([]any)) != 1 {
-		t.Errorf("dependencies = %v", dependent["dependencies"])
+	// Removed fields are unknown fields now.
+	for _, removed := range []map[string]any{
+		{"tensionLevel": 5},
+		{"dependencies": []any{}},
+		{"timeConstraint": map[string]any{"timeGap": "later"}},
+	} {
+		body := map[string]any{"name": "Gone", "content": "c"}
+		for k, v := range removed {
+			body[k] = v
+		}
+		call(t, "POST", events, alice, body).expect(http.StatusBadRequest)
 	}
 }
 
@@ -819,7 +809,7 @@ func TestPlotChapterOrder(t *testing.T) {
 }
 
 // Moving an event between plot lines renumbers both and leaves the event's
-// fields, links and revision alone.
+// fields and revision alone.
 func TestPlotEventMoveBetweenLines(t *testing.T) {
 	reset(t)
 	story := newStory(t, alice, "Moves")
@@ -830,10 +820,7 @@ func TestPlotEventMoveBetweenLines(t *testing.T) {
 	b := newEvent(t, alice, id, main, "B")
 	c := newEvent(t, alice, id, main, "C")
 	newEvent(t, alice, id, sub, "X")
-	y := call(t, "POST", worldPath(id, "plots")+"/"+sub+"/events", alice, map[string]any{
-		"name": "Y", "content": "c",
-		"dependencies": []map[string]any{{"eventId": b["id"], "plotLineId": main, "relationshipType": "requires"}},
-	}).expect(http.StatusCreated).json()
+	newEvent(t, alice, id, sub, "Y")
 	move := func(from string, e map[string]any) string {
 		return worldPath(id, "plots") + "/" + from + "/events/" + e["id"].(string) + "/move"
 	}
@@ -867,10 +854,6 @@ func TestPlotEventMoveBetweenLines(t *testing.T) {
 	if rev(t, byID[b["id"].(string)]) != rev(t, b) {
 		t.Errorf("moving should not bump the event's revision")
 	}
-	dep := byID[y["id"].(string)]["dependencies"].([]any)[0].(map[string]any)
-	if dep["eventId"] != b["id"] || dep["plotLineId"] != sub {
-		t.Errorf("dependency after move = %v, want B in Sub", dep)
-	}
 
 	// The event is no longer in Main, and a stale revision is a conflict.
 	call(t, "POST", move(main, b), alice, map[string]any{"toPlotLineId": sub, "toIndex": 0},
@@ -889,80 +872,4 @@ func TestPlotEventMoveBetweenLines(t *testing.T) {
 	theirs := newPlotLine(t, bob, other["id"].(string), "Theirs")["id"].(string)
 	call(t, "POST", move(main, a), alice, map[string]any{"toPlotLineId": theirs, "toIndex": 0},
 		ifMatch(rev(t, a))).expect(http.StatusUnprocessableEntity)
-}
-
-// Requirements point one way ("requires"); "enables" is derived on read, across
-// plot lines. A requirement can't close a loop, and deleting an event drops
-// its links from both sides.
-func TestPlotEventRequirements(t *testing.T) {
-	reset(t)
-	story := newStory(t, alice, "Requirements")
-	id := story["id"].(string)
-	main := newPlotLine(t, alice, id, "Main")["id"].(string)
-	sub := newPlotLine(t, alice, id, "Sub")["id"].(string)
-	events := func(line string) string { return worldPath(id, "plots") + "/" + line + "/events" }
-	requires := func(ids ...any) []map[string]any {
-		out := []map[string]any{}
-		for _, x := range ids {
-			out = append(out, map[string]any{"eventId": x, "relationshipType": "requires"})
-		}
-		return out
-	}
-	a := newEvent(t, alice, id, main, "Discovers the letter")
-	b := call(t, "POST", events(main), alice, map[string]any{
-		"name": "Confronts the captain", "content": "c", "dependencies": requires(a["id"]),
-	}).expect(http.StatusCreated).json()
-	c := call(t, "POST", events(main), alice, map[string]any{
-		"name": "Mutiny", "content": "c", "dependencies": requires(b["id"]),
-	}).expect(http.StatusCreated).json()
-	d := call(t, "POST", events(sub), alice, map[string]any{
-		"name": "Rumour spreads", "content": "c",
-		"dependencies": []map[string]any{{"eventId": a["id"], "outOfOrderOk": true}},
-	}).expect(http.StatusCreated).json()
-
-	all := eventsByID(t, get(t, worldPath(id, "plots"), alice).expect(http.StatusOK).list())
-	enables := all[a["id"].(string)]["dependents"].([]any)
-	if len(enables) != 2 {
-		t.Fatalf("A enables %v, want B and D", enables)
-	}
-	byEvent := map[string]map[string]any{}
-	for _, raw := range enables {
-		x := raw.(map[string]any)
-		byEvent[x["eventId"].(string)] = x
-	}
-	if byEvent[d["id"].(string)]["plotLineId"] != sub || byEvent[b["id"].(string)]["plotLineId"] != main {
-		t.Errorf("dependents carry the wrong plot lines: %v", enables)
-	}
-	dep := all[d["id"].(string)]["dependencies"].([]any)[0].(map[string]any)
-	if dep["outOfOrderOk"] != true || dep["relationshipType"] != "requires" {
-		t.Errorf("D's requirement = %v, want requires with outOfOrderOk", dep)
-	}
-
-	// A requires C would close A → C → B → A.
-	aNow := all[a["id"].(string)]
-	call(t, "PATCH", events(main)+"/"+a["id"].(string), alice, map[string]any{
-		"name": "Discovers the letter", "content": "c", "dependencies": requires(c["id"]),
-	}, ifMatch(rev(t, aNow))).expect(http.StatusUnprocessableEntity)
-
-	// Self, duplicate and any other relationship type are bad input.
-	for _, deps := range [][]map[string]any{
-		requires(a["id"]),
-		requires(b["id"], b["id"]),
-		{{"eventId": b["id"], "relationshipType": "blocks"}},
-	} {
-		call(t, "PATCH", events(main)+"/"+a["id"].(string), alice, map[string]any{
-			"name": "Discovers the letter", "content": "c", "dependencies": deps,
-		}, ifMatch(rev(t, aNow))).expect(http.StatusUnprocessableEntity)
-	}
-
-	// Deleting B drops its links from both sides.
-	bNow := all[b["id"].(string)]
-	call(t, "DELETE", events(main)+"/"+b["id"].(string), alice, nil, ifMatch(rev(t, bNow))).expect(http.StatusOK)
-	all = eventsByID(t, get(t, worldPath(id, "plots"), alice).expect(http.StatusOK).list())
-	if n := len(all[c["id"].(string)]["dependencies"].([]any)); n != 0 {
-		t.Errorf("C still requires %d events after B was deleted", n)
-	}
-	if n := len(all[a["id"].(string)]["dependents"].([]any)); n != 1 {
-		t.Errorf("A enables %d events after B was deleted, want 1", n)
-	}
 }
