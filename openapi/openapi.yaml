@@ -498,6 +498,35 @@ paths:
     post:
       security: [{ firebaseBearer: [] }]
       responses: { '201': { description: Created plot line } }
+  /v1/stories/{storyId}/plots/with-events:
+    post:
+      summary: Create a plot line and up to 50 events atomically
+      security: [{ firebaseBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [line, events]
+              properties:
+                line: { type: object, required: [name], properties: { name: { type: string }, description: { type: string } } }
+                events: { type: array, maxItems: 50, items: { type: object } }
+      responses: { '201': { description: Created plot line with events }, '422': { description: Invalid event or batch } }
+  /v1/stories/{storyId}/plots/{plotId}/events/batch:
+    post:
+      summary: Append 1 to 50 events atomically
+      security: [{ firebaseBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events: { type: array, minItems: 1, maxItems: 50, items: { type: object } }
+      responses: { '201': { description: Created events in order }, '422': { description: Invalid event or batch } }
   /v1/stories/{storyId}/plots/{plotId}/events/reorder:
     post:
       security: [{ firebaseBearer: [] }]

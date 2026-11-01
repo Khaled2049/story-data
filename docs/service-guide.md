@@ -99,6 +99,42 @@ Migration groups correspond to product domains:
 | `000029` | Versioned writer agreement records |
 | `000030` | Per-story paragraph style |
 | `000031`–`000032` | Story completion status and reader update; per-chapter publication and `public_updated_at` |
+| `000033`–`000037` | Admin story and competition listings, admin audit log, user bans |
+| `000038` | Plot events link to a chapter by `chapter_id`, and carry a writer-set `status` |
+| `000039` | `chapter_position`: an event's place among its chapter's planned events |
+| `000040` | Plot event dependencies are `requires` only, with `out_of_order_ok` |
+| `000041`–`000042` | Plot events lose `tension_level`, `time_constraint` and dependencies (`plot_event_dependencies`) |
+
+**Plot events and chapters.** An event's `chapterId` is a chapter of the same
+story or null (unassigned); the store checks this before writing. Deleting a
+chapter unassigns its events and bumps their revision, so a client still
+holding the old `chapterId` gets a 409. `status` is `planned`, `in_progress` or
+`written`, set only by the writer. Reordering or deleting events moves
+positions without bumping event revisions: order is guarded by the plot line's
+revision, and a bump would refuse content saves already in flight.
+
+Events have two separate orders: `position` within their plot line and
+`chapter_position` among their chapter's events across plot lines (null when
+unassigned). Assigning a chapter through `PATCH` appends to it. Two endpoints
+change order:
+
+- `POST /v1/stories/{id}/plots/chapter-order` `{chapterId, orderedIds}` sets a
+  chapter's order. `orderedIds` must include every event already in the chapter
+  (otherwise 409, the caller's view is stale) and may include events from other
+  chapters or none, which move in in the same transaction. A moved-in event's
+  `chapterId` changed, so its revision is bumped; a pure reorder bumps nothing.
+- `POST /v1/stories/{id}/plots/{lineId}/events/{eventId}/move`
+  `{toPlotLineId, toIndex}` with the event's revision as `If-Match` moves it to
+  another plot line, renumbering both lines and bumping both lines' revisions.
+  The event's own revision is untouched: its plot line is not part of its content.
+
+Both return every plot line.
+
+Template creation uses `POST /v1/stories/{id}/plots/{lineId}/events/batch`
+with `{events: [...]}` to append 1–50 events, or
+`POST /v1/stories/{id}/plots/with-events` with `{line, events}` to create a
+line and up to 50 events. Each request writes its events and indexing outbox
+entries in one transaction. A failed event leaves no part of the batch behind.
 
 When adding a feature, create a new migration rather than editing an existing
 file. Schema writes that need fresh AI context must enqueue an
