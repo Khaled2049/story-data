@@ -125,3 +125,24 @@ func TestAdminReturnsUIDWithClaimAndNeverTrustsServicePath(t *testing.T) {
 		t.Fatalf("dev path got %q, %v, %v; want dev-user with admin", uid, admin, err)
 	}
 }
+
+func TestIsServiceAgreesWithIdentity(t *testing.T) {
+	v := New("dev", "proj", token)
+	cases := map[string]bool{
+		"":          false,
+		" ":         false,
+		" ":         false, // net/http keeps it; TrimSpace removes it
+		"wrong":     false,
+		token:       true,
+		" " + token: true,
+	}
+	for presented, want := range cases {
+		r := request(map[string]string{"X-Service-Token": presented, "X-User-ID": "user-42"})
+		if got := v.IsService(r); got != want {
+			t.Errorf("IsService(%q) = %v, want %v", presented, got, want)
+		}
+	}
+	if New("dev", "proj", "").IsService(request(map[string]string{"X-Service-Token": "anything"})) {
+		t.Fatal("an unconfigured service token must never match")
+	}
+}

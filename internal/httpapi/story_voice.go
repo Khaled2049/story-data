@@ -17,7 +17,7 @@ func (s *Server) storyVoice(w http.ResponseWriter, r *http.Request, uid, storyID
 		}
 		// The verified service token, plus the asserted user and story ownership
 		// gate in the store, is required for this unapproved write path.
-		if r.Header.Get("X-Service-Token") == "" {
+		if !s.auth.IsService(r) {
 			writeError(w, http.StatusForbidden, "service identity required")
 			return
 		}

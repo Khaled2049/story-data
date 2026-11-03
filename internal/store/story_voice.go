@@ -295,7 +295,7 @@ func (s *Store) PutStoryVoice(ctx context.Context, storyID, owner string, revisi
 	if err != nil {
 		return StoryVoiceProfile{}, err
 	}
-	if err = validateVoiceReferences(ctx, tx, storyID, in.References); err != nil {
+	if err = validateVoiceReferences(ctx, tx, storyID, changedVoiceReferences(before.References, in.References)); err != nil {
 		return StoryVoiceProfile{}, err
 	}
 	after, err := saveStoryVoice(ctx, tx, before, in)
@@ -306,6 +306,22 @@ func (s *Store) PutStoryVoice(ctx context.Context, storyID, owner string, revisi
 		return StoryVoiceProfile{}, err
 	}
 	return after, tx.Commit(ctx)
+}
+
+// A stored reference kept unchanged may have gone stale since it was picked;
+// prose tools skip stale ones, so only new or edited references are checked.
+func changedVoiceReferences(stored, next []StoryVoiceReference) []StoryVoiceReference {
+	kept := make(map[StoryVoiceReference]bool, len(stored))
+	for _, ref := range stored {
+		kept[ref] = true
+	}
+	changed := []StoryVoiceReference{}
+	for _, ref := range next {
+		if !kept[ref] {
+			changed = append(changed, ref)
+		}
+	}
+	return changed
 }
 
 func validateVoiceReferences(ctx context.Context, tx pgx.Tx, storyID string, refs []StoryVoiceReference) error {

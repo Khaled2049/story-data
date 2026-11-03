@@ -50,6 +50,22 @@ func (v *Verifier) Admin(ctx context.Context, r *http.Request) (string, bool, er
 	return uid, admin, nil
 }
 
+// IsService reports whether the request carries the configured service token.
+// Handlers must use this, not the raw header, so they agree with identity().
+func (v *Verifier) IsService(r *http.Request) bool {
+	presented := presentedServiceToken(r)
+	return presented != "" && v.validServiceToken(presented)
+}
+
+func presentedServiceToken(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-Service-Token"))
+}
+
+func (v *Verifier) validServiceToken(presented string) bool {
+	return v.serviceToken != "" &&
+		subtle.ConstantTimeCompare([]byte(presented), []byte(v.serviceToken)) == 1
+}
+
 func (v *Verifier) identity(ctx context.Context, r *http.Request, checkRevoked bool) (string, map[string]any, error) {
 	// A trusted backend (the MCP server) holds the caller's uid but not their
 	// Firebase token, so it presents a shared secret and asserts the uid. Checked
@@ -57,9 +73,8 @@ func (v *Verifier) identity(ctx context.Context, r *http.Request, checkRevoked b
 	//
 	// Deliberately never grants admin: a service that can name any user must not
 	// also be able to claim privilege for them, so X-Admin is ignored here.
-	if presented := strings.TrimSpace(r.Header.Get("X-Service-Token")); presented != "" {
-		if v.serviceToken == "" ||
-			subtle.ConstantTimeCompare([]byte(presented), []byte(v.serviceToken)) != 1 {
+	if presented := presentedServiceToken(r); presented != "" {
+		if !v.validServiceToken(presented) {
 			// Fails closed rather than falling through to the Firebase path: a
 			// wrong secret is a misconfigured caller, and reporting it as a
 			// missing bearer token would send them chasing the wrong bug.

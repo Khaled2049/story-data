@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/pressly/goose/v3"
@@ -105,6 +104,10 @@ func TestStoryVoiceReferencesAndScopedAgentUpdates(t *testing.T) {
 	}
 	op := map[string]any{"operation": "add", "text": "Let tension emerge through dialogue.", "reason": "The writer gave a durable story-wide instruction.", "source": "explicit", "evidence": []any{}, "idempotencyKey": "8c95fd1c-7d5c-468c-aec4-5a8a9fca1784"}
 	call(t, "POST", path+"/agent-note", alice, op, ifMatch(1)).expect(http.StatusForbidden)
+	// A whitespace-only token is ignored by auth, so it must not open this route either.
+	blank := ifMatch(1)
+	blank["X-Service-Token"] = "\u00a0"
+	call(t, "POST", path+"/agent-note", alice, op, blank).expect(http.StatusForbidden)
 	service := serviceHeaders(testServiceToken, alice)
 	service["If-Match"] = "1"
 	added := call(t, "POST", path+"/agent-note", "", op, service).expect(http.StatusOK).json()
@@ -134,23 +137,46 @@ func TestStoryVoiceReferencesAndScopedAgentUpdates(t *testing.T) {
 	}
 }
 
-func TestStoryVoiceLearningJobFollowsSuccessfulChapterSave(t *testing.T) {
+func TestStoryVoiceSaveKeepsStaleReference(t *testing.T) {
 	reset(t)
-	storyID := newStory(t, alice, "Learning queue")["id"].(string)
-	chapter := newChapter(t, alice, storyID, "Saved prose", 2)
+	storyID := newStory(t, alice, "Stale reference")["id"].(string)
+	chapter := newChapter(t, alice, storyID, "Sample", 2)
 	chapterID := chapter["id"].(string)
-	base := "/v1/stories/" + storyID + "/chapters/" + chapterID
-	rev := int64(chapter["revision"].(float64))
-	content := "<p>" + strings.Repeat("A long quiet passage. ", 20) + "</p>"
-	saved := call(t, "PATCH", base, alice, map[string]any{"title": "Saved prose", "content": content, "position": 2}, ifMatch(rev)).expect(http.StatusOK).json()
-	call(t, "PATCH", base, alice, map[string]any{"title": "Nope", "content": content, "position": 2}, ifMatch(rev)).expect(http.StatusConflict)
-	var jobs int
-	var sourceRevision int64
-	if err := testPool.QueryRow(context.Background(), `SELECT count(*),max(source_revision) FROM story_voice_learning_jobs WHERE chapter_id=$1`, chapterID).Scan(&jobs, &sourceRevision); err != nil {
+	path := "/v1/stories/" + storyID + "/voice-profile"
+	ref := map[string]any{"chapterId": chapterID, "sourceRevision": chapter["revision"], "start": 0, "end": 7}
+	input := map[string]any{"pointOfView": "first", "tense": "past", "notes": []any{}, "references": []any{ref}}
+	call(t, "PUT", path, alice, input, ifMatch(0)).expect(http.StatusOK)
+
+	// The writer keeps editing the reference chapter, so the stored reference goes stale.
+	edited := call(t, "PATCH", "/v1/stories/"+storyID+"/chapters/"+chapterID, alice,
+		map[string]any{"title": "Sample", "content": "<p>Rewritten sample prose.</p>", "position": 2},
+		ifMatch(int64(chapter["revision"].(float64)))).expect(http.StatusOK).json()
+
+	input["tense"] = "present"
+	saved := call(t, "PUT", path, alice, input, ifMatch(1)).expect(http.StatusOK).json()
+	if saved["tense"] != "present" || len(saved["references"].([]any)) != 1 {
+		t.Fatalf("save with an unchanged stale reference lost fields: %v", saved)
+	}
+
+	// A newly picked range must still match the chapter's current revision.
+	input["references"] = []any{map[string]any{"chapterId": chapterID, "sourceRevision": chapter["revision"], "start": 0, "end": 5}}
+	call(t, "PUT", path, alice, input, ifMatch(2)).expect(http.StatusConflict)
+	input["references"] = []any{map[string]any{"chapterId": chapterID, "sourceRevision": edited["revision"], "start": 0, "end": 5}}
+	call(t, "PUT", path, alice, input, ifMatch(2)).expect(http.StatusOK)
+}
+
+func TestChapterSaveQueuesNoLearningJob(t *testing.T) {
+	reset(t)
+	// Learning runs only through the Function path; the chapter trigger and its
+	// queue were removed in 000047, so a save does no extra work.
+	var queue, trigger *string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT to_regclass('story_voice_learning_jobs')::text,
+		        (SELECT tgname::text FROM pg_trigger WHERE tgname='chapters_voice_learning')`).Scan(&queue, &trigger); err != nil {
 		t.Fatal(err)
 	}
-	if jobs != 1 || sourceRevision != int64(saved["revision"].(float64)) {
-		t.Fatalf("learning jobs=%d revision=%d saved=%v", jobs, sourceRevision, saved)
+	if queue != nil || trigger != nil {
+		t.Fatalf("learning queue still present: table=%v trigger=%v", queue, trigger)
 	}
 }
 
