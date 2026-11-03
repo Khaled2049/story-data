@@ -201,7 +201,7 @@ func TestStoryVoiceMigrationPreservesLegacyNote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := goose.UpToContext(ctx, db, dir, 40); err != nil {
+	if err := goose.UpToContext(ctx, db, dir, 43); err != nil {
 		t.Fatal(err)
 	}
 	storyID := "b0a30c41-52d4-4fa0-9187-8c0480ab8585"

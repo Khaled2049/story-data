@@ -104,6 +104,7 @@ Migration groups correspond to product domains:
 | `000039` | `chapter_position`: an event's place among its chapter's planned events |
 | `000040` | Plot event dependencies are `requires` only, with `out_of_order_ok` |
 | `000041`–`000042` | Plot events lose `tension_level`, `time_constraint` and dependencies (`plot_event_dependencies`) |
+| `000043`–`000046` | Story voice profiles, note history, passive learning, and local learning jobs |
 
 **Plot events and chapters.** An event's `chapterId` is a chapter of the same
 story or null (unassigned); the store checks this before writing. Deleting a
@@ -692,7 +693,7 @@ tense, the passive-learning switch, up to three chapter reference ranges, and
 at most 12 structured notes with `If-Match: 0` for creation or the
 latest revision for an update. Notes carry stable UUIDs, text, origin and pin
 state. New notes are writer-authored; an existing note's origin cannot change.
-Migration `000041` preserves the first slice's free-text note as a writer note.
+Migration `000044` preserves the first slice's free-text note as a writer note.
 Each reference identifies a chapter, its revision, and a range of at most 1600
 characters. The API validates story ownership, revision and range at save;
 prose tools ignore the reference if its source later changes or disappears.
@@ -716,7 +717,7 @@ Functions gateway can start a bounded learning pass through the agents service,
 forwarding the writer's Firebase identity and BYOK choice to creditProxy. A
 preflight checks chapter revisions, the learning switch, evidence availability
 and the rate cap before consuming AI quota. The service enforces 30-minute
-spacing and three analyses per story per UTC day. Migration `000043` also
+spacing and three analyses per story per UTC day. Migration `000046` also
 records delayed chapter-save jobs for an optional local recovery worker; that
 worker is off by default and should not be enabled where Firebase identity and
 BYOK choice are required for creditProxy. Malformed, weak or stale proposals
