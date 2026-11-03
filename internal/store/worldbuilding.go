@@ -66,44 +66,35 @@ type PlaceInput struct {
 	Significance string `json:"significance"`
 	Notes        string `json:"notes"`
 }
-type Dependency struct {
-	EventID          string `json:"eventId"`
-	PlotLineID       string `json:"plotLineId"`
-	RelationshipType string `json:"relationshipType"`
-	Description      string `json:"description,omitempty"`
-}
+
 type PlotEvent struct {
-	ID             string          `json:"id"`
-	Name           string          `json:"name"`
-	Content        string          `json:"content"`
-	CharacterIDs   []string        `json:"characterIds"`
-	LocationID     *string         `json:"locationId"`
-	Dependencies   []Dependency    `json:"dependencies"`
-	Dependents     []Dependency    `json:"dependents"`
-	TensionLevel   int             `json:"tensionLevel"`
-	Pacing         string          `json:"pacing"`
-	StoryBeat      string          `json:"storyBeat"`
-	EmotionalTone  string          `json:"emotionalTone,omitempty"`
-	TimeConstraint json.RawMessage `json:"timeConstraint,omitempty"`
-	OrderIndex     int             `json:"orderIndex"`
-	ChapterNumber  *int            `json:"chapterNumber,omitempty"`
-	Notes          string          `json:"notes,omitempty"`
-	Revision       int64           `json:"revision"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Content       string   `json:"content"`
+	CharacterIDs  []string `json:"characterIds"`
+	LocationID    *string  `json:"locationId"`
+	Pacing        string   `json:"pacing"`
+	StoryBeat     string   `json:"storyBeat"`
+	EmotionalTone string   `json:"emotionalTone,omitempty"`
+	OrderIndex    int      `json:"orderIndex"`
+	ChapterID     *string  `json:"chapterId"`
+	ChapterPos    *float64 `json:"chapterPosition"`
+	Status        string   `json:"status"`
+	Notes         string   `json:"notes,omitempty"`
+	Revision      int64    `json:"revision"`
 }
 type PlotEventInput struct {
-	Name           string          `json:"name"`
-	Content        string          `json:"content"`
-	CharacterIDs   []string        `json:"characterIds"`
-	LocationID     *string         `json:"locationId"`
-	Dependencies   []Dependency    `json:"dependencies"`
-	TensionLevel   int             `json:"tensionLevel"`
-	Pacing         string          `json:"pacing"`
-	StoryBeat      string          `json:"storyBeat"`
-	EmotionalTone  string          `json:"emotionalTone"`
-	TimeConstraint json.RawMessage `json:"timeConstraint"`
-	OrderIndex     int             `json:"orderIndex"`
-	ChapterNumber  *int            `json:"chapterNumber"`
-	Notes          string          `json:"notes"`
+	Name          string   `json:"name"`
+	Content       string   `json:"content"`
+	CharacterIDs  []string `json:"characterIds"`
+	LocationID    *string  `json:"locationId"`
+	Pacing        string   `json:"pacing"`
+	StoryBeat     string   `json:"storyBeat"`
+	EmotionalTone string   `json:"emotionalTone"`
+	OrderIndex    int      `json:"orderIndex"`
+	ChapterID     *string  `json:"chapterId"`
+	Status        string   `json:"status"`
+	Notes         string   `json:"notes"`
 }
 type PlotLine struct {
 	ID          string      `json:"id"`
@@ -440,58 +431,60 @@ func (s *Store) ListPlots(ctx context.Context, storyID, uid string) ([]PlotLine,
 	return out, rows.Err()
 }
 func (s *Store) events(ctx context.Context, storyID, lineID string) ([]PlotEvent, error) {
-	rows, e := s.db.Query(ctx, `SELECT e.id,e.name,e.content,e.location_id,e.tension_level,e.pacing,e.story_beat,COALESCE(e.emotional_tone,''),e.time_constraint,e.position,e.chapter_number,COALESCE(e.notes,''),e.revision FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.plot_line_id=$1 AND l.story_id=$2 ORDER BY e.position`, lineID, storyID)
+	rows, e := s.db.Query(ctx, `SELECT e.id,e.name,e.content,e.location_id,e.pacing,e.story_beat,COALESCE(e.emotional_tone,''),e.position,e.chapter_id,e.chapter_position,e.status,COALESCE(e.notes,''),e.revision FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.plot_line_id=$1 AND l.story_id=$2 ORDER BY e.position`, lineID, storyID)
 	if e != nil {
 		return nil, e
 	}
-	defer rows.Close()
 	out := []PlotEvent{}
+	ids := []string{}
+	at := map[string]int{}
 	for rows.Next() {
 		var x PlotEvent
-		var lid *uuid.UUID
-		var tc []byte
+		var lid, cid *uuid.UUID
 		var pos float64
-		if e = rows.Scan(&x.ID, &x.Name, &x.Content, &lid, &x.TensionLevel, &x.Pacing, &x.StoryBeat, &x.EmotionalTone, &tc, &pos, &x.ChapterNumber, &x.Notes, &x.Revision); e != nil {
+		if e = rows.Scan(&x.ID, &x.Name, &x.Content, &lid, &x.Pacing, &x.StoryBeat, &x.EmotionalTone, &pos, &cid, &x.ChapterPos, &x.Status, &x.Notes, &x.Revision); e != nil {
+			rows.Close()
 			return nil, e
 		}
 		if lid != nil {
 			v := lid.String()
 			x.LocationID = &v
 		}
-		x.TimeConstraint = tc
+		if cid != nil {
+			v := cid.String()
+			x.ChapterID = &v
+		}
 		x.OrderIndex = int(pos)
 		x.CharacterIDs = []string{}
-		x.Dependencies = []Dependency{}
-		x.Dependents = []Dependency{}
-		cr, e := s.db.Query(ctx, `SELECT character_id FROM plot_event_characters WHERE plot_event_id=$1`, x.ID)
-		if e != nil {
-			return nil, e
-		}
-		for cr.Next() {
-			var v uuid.UUID
-			if e = cr.Scan(&v); e != nil {
-				cr.Close()
-				return nil, e
-			}
-			x.CharacterIDs = append(x.CharacterIDs, v.String())
-		}
-		cr.Close()
-		dr, e := s.db.Query(ctx, `SELECT d.depends_on_event_id,l.id,d.relationship_type,COALESCE(d.description,'') FROM plot_event_dependencies d JOIN plot_events e ON e.id=d.depends_on_event_id JOIN plot_lines l ON l.id=e.plot_line_id WHERE d.plot_event_id=$1`, x.ID)
-		if e != nil {
-			return nil, e
-		}
-		for dr.Next() {
-			var d Dependency
-			if e = dr.Scan(&d.EventID, &d.PlotLineID, &d.RelationshipType, &d.Description); e != nil {
-				dr.Close()
-				return nil, e
-			}
-			x.Dependencies = append(x.Dependencies, d)
-		}
-		dr.Close()
+		at[x.ID] = len(out)
+		ids = append(ids, x.ID)
 		out = append(out, x)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if e = rows.Err(); e != nil || len(ids) == 0 {
+		return out, e
+	}
+
+	// One query per plot line rather than one per event.
+	cr, e := s.db.Query(ctx, `SELECT plot_event_id,character_id FROM plot_event_characters WHERE plot_event_id=ANY($1::uuid[])`, ids)
+	if e != nil {
+		return nil, e
+	}
+	for cr.Next() {
+		var eventID, characterID uuid.UUID
+		if e = cr.Scan(&eventID, &characterID); e != nil {
+			cr.Close()
+			return nil, e
+		}
+		x := &out[at[eventID.String()]]
+		x.CharacterIDs = append(x.CharacterIDs, characterID.String())
+	}
+	cr.Close()
+	if e = cr.Err(); e != nil {
+		return nil, e
+	}
+
+	return out, nil
 }
 func (s *Store) CreatePlot(ctx context.Context, storyID, uid string, in PlotLineInput) (PlotLine, error) {
 	if !validPlotLineInput(in) {
@@ -590,17 +583,39 @@ func validEvent(in *PlotEventInput) error {
 	if !validPlotEventInput(*in) {
 		return ErrValidation
 	}
-	if in.TensionLevel == 0 {
-		in.TensionLevel = 5
-	}
-	if in.TensionLevel < 1 || in.TensionLevel > 10 {
-		return fmt.Errorf("%w: tensionLevel must be between 1 and 10", ErrValidation)
-	}
 	if in.Pacing == "" {
 		in.Pacing = "moderate"
 	}
 	if in.StoryBeat == "" {
 		in.StoryBeat = "rising_action"
+	}
+	if in.Status == "" {
+		in.Status = "planned"
+	}
+	if !validEventStatus(in.Status) {
+		return fmt.Errorf("%w: status must be planned, in_progress or written", ErrValidation)
+	}
+	return nil
+}
+func validEventStatus(v string) bool {
+	return v == "planned" || v == "in_progress" || v == "written"
+}
+
+// eventChapter checks that an event's chapter belongs to its story. It runs
+// before the write, so a foreign chapter is bad input rather than an FK error.
+func eventChapter(ctx context.Context, tx pgx.Tx, storyID string, chapterID *string) error {
+	if chapterID == nil {
+		return nil
+	}
+	if _, e := uuid.Parse(*chapterID); e != nil {
+		return fmt.Errorf("%w: event chapter is not in this story", ErrValidation)
+	}
+	var ok bool
+	if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM chapters WHERE id=$1 AND story_id=$2)`, *chapterID, storyID).Scan(&ok); e != nil {
+		return e
+	}
+	if !ok {
+		return fmt.Errorf("%w: event chapter is not in this story", ErrValidation)
 	}
 	return nil
 }
@@ -631,21 +646,6 @@ func (s *Store) writeEventRefs(ctx context.Context, tx pgx.Tx, storyID, eventID 
 			return e
 		}
 	}
-	if _, e := tx.Exec(ctx, `DELETE FROM plot_event_dependencies WHERE plot_event_id=$1`, eventID); e != nil {
-		return e
-	}
-	for _, d := range in.Dependencies {
-		if d.EventID == eventID {
-			return fmt.Errorf("%w: event cannot depend on itself", ErrValidation)
-		}
-		var ok bool
-		if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM plot_events e JOIN plot_lines l ON l.id=e.plot_line_id WHERE e.id=$1 AND l.story_id=$2)`, d.EventID, storyID).Scan(&ok); e != nil || !ok {
-			return fmt.Errorf("%w: dependency event is not in this story", ErrValidation)
-		}
-		if _, e := tx.Exec(ctx, `INSERT INTO plot_event_dependencies(plot_event_id,depends_on_event_id,relationship_type,description) VALUES($1,$2,$3,$4)`, eventID, d.EventID, d.RelationshipType, emptyToNull(d.Description)); e != nil {
-			return e
-		}
-	}
 	return nil
 }
 func (s *Store) CreateEvent(ctx context.Context, storyID, lineID, uid string, in PlotEventInput) (PlotEvent, error) {
@@ -660,6 +660,9 @@ func (s *Store) CreateEvent(ctx context.Context, storyID, lineID, uid string, in
 		return PlotEvent{}, e
 	}
 	defer tx.Rollback(ctx)
+	if e = eventChapter(ctx, tx, storyID, in.ChapterID); e != nil {
+		return PlotEvent{}, e
+	}
 	var n int
 	if e = tx.QueryRow(ctx, `SELECT count(*) FROM plot_events WHERE plot_line_id=$1`, lineID).Scan(&n); e != nil {
 		return PlotEvent{}, e
@@ -669,8 +672,12 @@ func (s *Store) CreateEvent(ctx context.Context, storyID, lineID, uid string, in
 	if n >= maxEntitiesPerStory {
 		return PlotEvent{}, ErrLimit
 	}
+	chapterPos, e := appendToChapter(ctx, tx, in.ChapterID)
+	if e != nil {
+		return PlotEvent{}, e
+	}
 	id := uuid.New()
-	_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,tension_level,pacing,story_beat,emotional_tone,time_constraint,position,chapter_number,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, lineID, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), n, in.ChapterNumber, emptyToNull(in.Notes))
+	_, e = tx.Exec(ctx, `INSERT INTO plot_events(id,plot_line_id,name,content,location_id,pacing,story_beat,emotional_tone,position,chapter_id,chapter_position,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, lineID, in.Name, in.Content, in.LocationID, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), n, in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes))
 	if e != nil {
 		return PlotEvent{}, e
 	}
@@ -715,7 +722,30 @@ func (s *Store) UpdateEvent(ctx context.Context, storyID, lineID, id, uid string
 		return PlotEvent{}, e
 	}
 	defer tx.Rollback(ctx)
-	cmd, e := tx.Exec(ctx, `UPDATE plot_events SET name=$1,content=$2,location_id=$3,tension_level=$4,pacing=$5,story_beat=$6,emotional_tone=$7,time_constraint=$8,chapter_number=$9,notes=$10,revision=revision+1,updated_at=now() WHERE id=$11 AND plot_line_id=$12 AND revision=$13`, in.Name, in.Content, in.LocationID, in.TensionLevel, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), nullJSON(in.TimeConstraint), in.ChapterNumber, emptyToNull(in.Notes), id, lineID, rev)
+	// Revision first: a stale write naming a since-deleted chapter is a
+	// conflict, not bad input.
+	var current int64
+	var wasChapter *uuid.UUID
+	var wasPos *float64
+	if e = tx.QueryRow(ctx, `SELECT revision,chapter_id,chapter_position FROM plot_events WHERE id=$1 AND plot_line_id=$2 FOR UPDATE`, id, lineID).Scan(&current, &wasChapter, &wasPos); errors.Is(e, pgx.ErrNoRows) {
+		return PlotEvent{}, s.classifyEventWrite(ctx, storyID, lineID, id, uid)
+	} else if e != nil {
+		return PlotEvent{}, e
+	}
+	if current != rev {
+		return PlotEvent{}, ErrConflict
+	}
+	if e = eventChapter(ctx, tx, storyID, in.ChapterID); e != nil {
+		return PlotEvent{}, e
+	}
+	// A new chapter puts the event at its end; the same chapter keeps its place.
+	chapterPos := wasPos
+	if !sameChapter(wasChapter, in.ChapterID) {
+		if chapterPos, e = appendToChapter(ctx, tx, in.ChapterID); e != nil {
+			return PlotEvent{}, e
+		}
+	}
+	cmd, e := tx.Exec(ctx, `UPDATE plot_events SET name=$1,content=$2,location_id=$3,pacing=$4,story_beat=$5,emotional_tone=$6,chapter_id=$7,chapter_position=$8,status=$9,notes=$10,revision=revision+1,updated_at=now() WHERE id=$11 AND plot_line_id=$12 AND revision=$13`, in.Name, in.Content, in.LocationID, in.Pacing, in.StoryBeat, emptyToNull(in.EmotionalTone), in.ChapterID, chapterPos, in.Status, emptyToNull(in.Notes), id, lineID, rev)
 	if e != nil {
 		return PlotEvent{}, e
 	}
@@ -804,8 +834,10 @@ func (s *Store) renumberEvents(ctx context.Context, tx pgx.Tx, lineID string, fi
 			next = append(next, id)
 		}
 	}
+	// Position only, no revision bump: order is guarded by the plot line's
+	// revision, and bumping events would 409 their in-flight content saves.
 	for i, id := range next {
-		if _, e = tx.Exec(ctx, `UPDATE plot_events SET position=$1,revision=revision+1,updated_at=now() WHERE id=$2`, i+1000000, id); e != nil {
+		if _, e = tx.Exec(ctx, `UPDATE plot_events SET position=$1 WHERE id=$2`, i+1000000, id); e != nil {
 			return e
 		}
 	}

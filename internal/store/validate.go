@@ -154,15 +154,7 @@ func validPlotEventInput(in PlotEventInput) bool {
 			return false
 		}
 	}
-	if len(in.CharacterIDs) > maxEntitiesPerStory || len(in.Dependencies) > maxEntitiesPerStory {
-		return false
-	}
-	for _, d := range in.Dependencies {
-		if !validText(d.RelationshipType, maxShortFieldChars) || !validText(d.Description, maxProseChars) {
-			return false
-		}
-	}
-	return validJSONSize(in.TimeConstraint)
+	return len(in.CharacterIDs) <= maxEntitiesPerStory
 }
 
 func validCompetitionInput(in CompetitionInput) bool {
