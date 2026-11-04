@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/pressly/goose/v3"
@@ -134,6 +135,46 @@ func TestStoryVoiceReferencesAndScopedAgentUpdates(t *testing.T) {
 	undone := call(t, "POST", path+"/history/"+added["changeId"].(string)+"/undo", alice, nil, ifMatch(2)).expect(http.StatusOK).json()
 	if len(undone["notes"].([]any)) != 0 {
 		t.Fatalf("undo did not remove agent note: %v", undone)
+	}
+}
+
+func TestAgentVoiceNoteUndoPreservesPreviousNotes(t *testing.T) {
+	for _, operation := range []string{"revise", "retire"} {
+		t.Run(operation, func(t *testing.T) {
+			reset(t)
+			storyID := newStory(t, alice, "Agent undo "+operation)["id"].(string)
+			path := "/v1/stories/" + storyID + "/voice-profile"
+			service := serviceHeaders(testServiceToken, alice)
+			post := func(revision int64, op map[string]any) map[string]any {
+				t.Helper()
+				service["If-Match"] = fmt.Sprint(revision)
+				return call(t, "POST", path+"/agent-note", "", op, service).expect(http.StatusOK).json()
+			}
+			firstText := "Keep dialogue understated."
+			for i, note := range []string{firstText, "Use short transitions."} {
+				post(int64(i), map[string]any{
+					"operation": "add", "text": note, "reason": "Explicit story-wide preference.",
+					"source": "explicit", "evidence": []any{},
+					"idempotencyKey": fmt.Sprintf("a4fd3075-7822-45cf-9770-68e67387110%d", i),
+				})
+			}
+			before := get(t, path, alice).expect(http.StatusOK).json()
+			firstID := before["notes"].([]any)[0].(map[string]any)["id"].(string)
+			result := post(2, map[string]any{
+				"operation": operation, "noteId": firstID, "text": "Use sharper dialogue.",
+				"reason": "Explicit story-wide preference.", "source": "explicit", "evidence": []any{},
+				"idempotencyKey": "a4fd3075-7822-45cf-9770-68e673871112",
+			})
+			latest := get(t, path+"/history", alice).expect(http.StatusOK).list()[0]
+			priorNotes := latest["before"].(map[string]any)["notes"].([]any)
+			if len(priorNotes) != 2 || priorNotes[0].(map[string]any)["text"] != firstText {
+				t.Fatalf("agent change lost its previous notes: %v", priorNotes)
+			}
+			undone := call(t, "POST", path+"/history/"+result["changeId"].(string)+"/undo", alice, nil, ifMatch(3)).expect(http.StatusOK).json()
+			if got := undone["notes"]; !reflect.DeepEqual(got, before["notes"]) {
+				t.Fatalf("undo restored %v, want %v", got, before["notes"])
+			}
+		})
 	}
 }
 

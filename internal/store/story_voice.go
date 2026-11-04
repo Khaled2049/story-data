@@ -489,6 +489,8 @@ func (s *Store) AgentVoiceNote(ctx context.Context, storyID, owner string, revis
 		return AgentVoiceResult{}, err
 	}
 	in := voiceInput(before)
+	// Revising or retiring a note must not change the snapshot recorded below.
+	in.Notes = append([]StoryVoiceNote(nil), before.Notes...)
 	switch op.Operation {
 	case "add":
 		if op.NoteID != "" {
