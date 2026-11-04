@@ -446,7 +446,7 @@ paths:
                 references:
                   type: array
                   maxItems: 3
-                  description: 'Owner-selected chapter ranges. A changed or deleted source is ignored by prose tools.'
+                  description: 'Owner-selected chapter ranges. The server copies each passage as plain text when it is added, so later chapter edits or deletion do not invalidate it.'
                   items:
                     type: object
                     additionalProperties: false
@@ -456,6 +456,7 @@ paths:
                       sourceRevision: { type: integer, minimum: 1 }
                       start: { type: integer, minimum: 0 }
                       end: { type: integer, minimum: 1, description: 'At most 1600 characters after start.' }
+                      text: { type: string, readOnly: true, description: 'The passage as plain text, copied by the server when the reference was added. Ignored on input.' }
                 notes:
                   type: array
                   maxItems: 12

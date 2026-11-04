@@ -137,15 +137,29 @@ func TestStoryVoiceReferencesAndScopedAgentUpdates(t *testing.T) {
 	}
 }
 
+func refText(t *testing.T, profile map[string]any) string {
+	t.Helper()
+	refs := profile["references"].([]any)
+	if len(refs) != 1 {
+		t.Fatalf("want one reference, got %v", refs)
+	}
+	text, _ := refs[0].(map[string]any)["text"].(string)
+	return text
+}
+
 func TestStoryVoiceSaveKeepsStaleReference(t *testing.T) {
 	reset(t)
 	storyID := newStory(t, alice, "Stale reference")["id"].(string)
 	chapter := newChapter(t, alice, storyID, "Sample", 2)
 	chapterID := chapter["id"].(string)
 	path := "/v1/stories/" + storyID + "/voice-profile"
-	ref := map[string]any{"chapterId": chapterID, "sourceRevision": chapter["revision"], "start": 0, "end": 7}
+	// The client's text is ignored; the server copies the passage itself.
+	ref := map[string]any{"chapterId": chapterID, "sourceRevision": chapter["revision"], "start": 0, "end": 7, "text": "forged"}
 	input := map[string]any{"pointOfView": "first", "tense": "past", "notes": []any{}, "references": []any{ref}}
-	call(t, "PUT", path, alice, input, ifMatch(0)).expect(http.StatusOK)
+	created := call(t, "PUT", path, alice, input, ifMatch(0)).expect(http.StatusOK).json()
+	if got := refText(t, created); got != "body" {
+		t.Fatalf("reference text = %q, want the chapter's own %q", got, "body")
+	}
 
 	// The writer keeps editing the reference chapter, so the stored reference goes stale.
 	edited := call(t, "PATCH", "/v1/stories/"+storyID+"/chapters/"+chapterID, alice,
@@ -154,15 +168,25 @@ func TestStoryVoiceSaveKeepsStaleReference(t *testing.T) {
 
 	input["tense"] = "present"
 	saved := call(t, "PUT", path, alice, input, ifMatch(1)).expect(http.StatusOK).json()
-	if saved["tense"] != "present" || len(saved["references"].([]any)) != 1 {
+	if saved["tense"] != "present" || refText(t, saved) != "body" {
 		t.Fatalf("save with an unchanged stale reference lost fields: %v", saved)
 	}
 
 	// A newly picked range must still match the chapter's current revision.
 	input["references"] = []any{map[string]any{"chapterId": chapterID, "sourceRevision": chapter["revision"], "start": 0, "end": 5}}
 	call(t, "PUT", path, alice, input, ifMatch(2)).expect(http.StatusConflict)
-	input["references"] = []any{map[string]any{"chapterId": chapterID, "sourceRevision": edited["revision"], "start": 0, "end": 5}}
-	call(t, "PUT", path, alice, input, ifMatch(2)).expect(http.StatusOK)
+	input["references"] = []any{map[string]any{"chapterId": chapterID, "sourceRevision": edited["revision"], "start": 0, "end": 12}}
+	replaced := call(t, "PUT", path, alice, input, ifMatch(2)).expect(http.StatusOK).json()
+	if got := refText(t, replaced); got != "Rewritten" {
+		t.Fatalf("new reference text = %q", got)
+	}
+
+	// Undo restores the earlier passage from its snapshot, though its chapter has changed.
+	latest := get(t, path+"/history", alice).expect(http.StatusOK).list()[0]
+	undone := call(t, "POST", path+"/history/"+latest["id"].(string)+"/undo", alice, nil, ifMatch(3)).expect(http.StatusOK).json()
+	if got := refText(t, undone); got != "body" {
+		t.Fatalf("undo restored reference text %q", got)
+	}
 }
 
 func TestChapterSaveQueuesNoLearningJob(t *testing.T) {

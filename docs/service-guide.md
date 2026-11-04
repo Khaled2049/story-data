@@ -695,10 +695,12 @@ latest revision for an update. Notes carry stable UUIDs, text, origin and pin
 state. New notes are writer-authored; an existing note's origin cannot change.
 Migration `000044` preserves the first slice's free-text note as a writer note.
 Each reference identifies a chapter, its revision, and a range of at most 1600
-characters. The API validates story ownership, revision and range when a
-reference is added or changed. A save that keeps a stored reference unchanged
-accepts it even if its chapter has moved on since; prose tools ignore the
-reference if its source later changes or disappears.
+characters of the chapter's HTML. When a reference is added or changed, the API
+checks ownership, revision and range, then copies the passage as plain `text`
+into the reference; text sent by the client is ignored. A save that repeats a
+stored reference keeps its copied text, and undo restores it from the snapshot,
+so editing or deleting the chapter later does not invalidate it. Prose tools
+use the copied text and never re-read the chapter.
 
 `GET /v1/stories/{id}/voice-profile/history` lists the latest 20 changes with
 before/after snapshots; the table retains the latest 50. `POST` to

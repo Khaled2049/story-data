@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/net/html"
 )
 
 const (
@@ -40,6 +41,9 @@ type StoryVoiceReference struct {
 	SourceRevision int64  `json:"sourceRevision"`
 	Start          int    `json:"start"`
 	End            int    `json:"end"`
+	// Text is the passage as plain text, copied by the server when the
+	// reference is picked, so later chapter edits do not invalidate it.
+	Text string `json:"text,omitempty"`
 }
 
 // Revision zero means no profile has been saved. The first save uses If-Match: 0.
@@ -295,7 +299,7 @@ func (s *Store) PutStoryVoice(ctx context.Context, storyID, owner string, revisi
 	if err != nil {
 		return StoryVoiceProfile{}, err
 	}
-	if err = validateVoiceReferences(ctx, tx, storyID, changedVoiceReferences(before.References, in.References)); err != nil {
+	if in.References, err = resolveVoiceReferences(ctx, tx, storyID, before.References, in.References); err != nil {
 		return StoryVoiceProfile{}, err
 	}
 	after, err := saveStoryVoice(ctx, tx, before, in)
@@ -308,38 +312,85 @@ func (s *Store) PutStoryVoice(ctx context.Context, storyID, owner string, revisi
 	return after, tx.Commit(ctx)
 }
 
-// A stored reference kept unchanged may have gone stale since it was picked;
-// prose tools skip stale ones, so only new or edited references are checked.
-func changedVoiceReferences(stored, next []StoryVoiceReference) []StoryVoiceReference {
-	kept := make(map[StoryVoiceReference]bool, len(stored))
+// resolveVoiceReferences keeps a stored reference (and its copied text) when
+// the save repeats it, and checks and copies the text of new or edited ones.
+// Text sent by the client is never trusted.
+func resolveVoiceReferences(ctx context.Context, tx pgx.Tx, storyID string, stored, next []StoryVoiceReference) ([]StoryVoiceReference, error) {
+	kept := make(map[StoryVoiceReference]string, len(stored))
 	for _, ref := range stored {
-		kept[ref] = true
+		text := ref.Text
+		ref.Text = ""
+		kept[ref] = text
 	}
-	changed := []StoryVoiceReference{}
+	resolved := make([]StoryVoiceReference, 0, len(next))
 	for _, ref := range next {
-		if !kept[ref] {
-			changed = append(changed, ref)
+		ref.Text = ""
+		if text, ok := kept[ref]; ok && text != "" {
+			ref.Text = text
+		} else {
+			text, err := voiceReferenceText(ctx, tx, storyID, ref)
+			if err != nil {
+				return nil, err
+			}
+			if text == "" {
+				return nil, sentinelErrf(ErrValidation, "voice reference has no prose")
+			}
+			ref.Text = text
+		}
+		resolved = append(resolved, ref)
+	}
+	return resolved, nil
+}
+
+// voiceReferenceText checks a reference against its chapter's current
+// revision and returns the passage as plain text.
+func voiceReferenceText(ctx context.Context, tx pgx.Tx, storyID string, ref StoryVoiceReference) (string, error) {
+	var revision int64
+	var content string
+	err := tx.QueryRow(ctx, `SELECT revision,content FROM chapters WHERE story_id=$1 AND id=$2`, storyID, ref.ChapterID).Scan(&revision, &content)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if revision != ref.SourceRevision {
+		return "", ErrConflict
+	}
+	runes := []rune(content)
+	if ref.End > len(runes) {
+		return "", sentinelErrf(ErrValidation, "voice reference is outside its chapter")
+	}
+	return passageText(string(runes[ref.Start:ref.End])), nil
+}
+
+// passageText turns an HTML slice into collapsed plain text. A slice that
+// starts inside a tag drops that partial tag rather than reading it as prose.
+func passageText(fragment string) string {
+	if gt, lt := strings.IndexByte(fragment, '>'), strings.IndexByte(fragment, '<'); gt >= 0 && (lt < 0 || gt < lt) {
+		fragment = fragment[gt+1:]
+	}
+	if lt := strings.LastIndexByte(fragment, '<'); lt >= 0 && !strings.Contains(fragment[lt:], ">") {
+		fragment = fragment[:lt]
+	}
+	var b strings.Builder
+	z := html.NewTokenizer(strings.NewReader(fragment))
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
+			return strings.Join(strings.Fields(b.String()), " ")
+		case html.TextToken:
+			b.Write(z.Text())
+		case html.StartTagToken, html.EndTagToken, html.SelfClosingTagToken:
+			b.WriteByte(' ')
 		}
 	}
-	return changed
 }
 
 func validateVoiceReferences(ctx context.Context, tx pgx.Tx, storyID string, refs []StoryVoiceReference) error {
 	for _, ref := range refs {
-		var revision int64
-		var content string
-		err := tx.QueryRow(ctx, `SELECT revision,content FROM chapters WHERE story_id=$1 AND id=$2`, storyID, ref.ChapterID).Scan(&revision, &content)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
+		if _, err := voiceReferenceText(ctx, tx, storyID, ref); err != nil {
 			return err
-		}
-		if revision != ref.SourceRevision {
-			return ErrConflict
-		}
-		if ref.End > len([]rune(content)) {
-			return sentinelErrf(ErrValidation, "voice reference is outside its chapter")
 		}
 	}
 	return nil
@@ -377,6 +428,7 @@ func (s *Store) AgentVoiceNote(ctx context.Context, storyID, owner string, revis
 			return AgentVoiceResult{}, sentinelErrf(ErrValidation, "invalid evidence range")
 		}
 		ref.ChapterID = id.String()
+		ref.Text = ""
 		for j := 0; j < i; j++ {
 			prior := op.Evidence[j]
 			if prior.ChapterID == ref.ChapterID && prior.Start < ref.End && ref.Start < prior.End {
@@ -583,15 +635,8 @@ func (s *Store) UndoStoryVoiceChange(ctx context.Context, storyID, owner, change
 	if err != nil {
 		return StoryVoiceProfile{}, err
 	}
-	// A stale or removed chapter may invalidate an old reference. Undo should
-	// restore the other preferences without reviving that stale style sample.
-	validRefs := []StoryVoiceReference{}
-	for _, ref := range in.References {
-		if validateVoiceReferences(ctx, tx, storyID, []StoryVoiceReference{ref}) == nil {
-			validRefs = append(validRefs, ref)
-		}
-	}
-	in.References = validRefs
+	// Snapshot references carry their copied text, so they restore as saved
+	// even if the chapter has changed or been deleted since.
 	after, err := saveStoryVoice(ctx, tx, before, in)
 	if err != nil {
 		return StoryVoiceProfile{}, err
