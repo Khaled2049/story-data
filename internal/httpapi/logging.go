@@ -32,6 +32,8 @@ type recorder struct {
 	// uid is filled in by the authentication helper, so the access log names
 	// the caller without paying for a second token verification here.
 	uid string
+	// auth is how that uid was proven: firebase, service or dev.
+	auth string
 }
 
 func (r *recorder) WriteHeader(status int) {
@@ -58,10 +60,11 @@ func logError(w http.ResponseWriter, e error) {
 	}
 }
 
-// logUser records who the request authenticated as.
-func logUser(w http.ResponseWriter, uid string) {
+// logUser records who the request authenticated as, and by what credential.
+func logUser(w http.ResponseWriter, uid, class string) {
 	if r, ok := w.(*recorder); ok {
 		r.uid = uid
+		r.auth = class
 	}
 }
 
@@ -92,6 +95,9 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 		if rec.status == 0 {
 			rec.status = http.StatusOK
 		}
+		if rec.auth == "" {
+			rec.auth = "anonymous"
+		}
 		attrs := []any{
 			"requestId", id,
 			"method", r.Method,
@@ -101,6 +107,8 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 			// The caller, not the credential: never the token itself. Empty
 			// on the anonymous routes, which never resolve one.
 			"uid", rec.uid,
+			// Separates a service asserting a uid from that user's own token.
+			"auth", rec.auth,
 			"ip", clientIP(r),
 		}
 		switch {

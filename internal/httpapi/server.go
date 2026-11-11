@@ -431,7 +431,10 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) (string, bool) {
 		writeError(w, http.StatusUnauthorized, e.Error())
 		return "", false
 	}
-	logUser(w, uid)
+	logUser(w, uid, s.auth.Class(r))
+	if !s.underUserLimit(w, r, uid) {
+		return "", false
+	}
 	// A banned member's ID token stays valid for up to an hour; this refuses it now.
 	banned, e := s.store.IsBanned(r.Context(), uid)
 	if e != nil {
@@ -453,7 +456,10 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) (string, bool) {
 		writeError(w, http.StatusUnauthorized, e.Error())
 		return "", false
 	}
-	logUser(w, uid)
+	logUser(w, uid, s.auth.Class(r))
+	if !s.underUserLimit(w, r, uid) {
+		return "", false
+	}
 	if !admin {
 		writeError(w, http.StatusForbidden, "admin only")
 		return "", false

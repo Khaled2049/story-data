@@ -9,6 +9,7 @@ package e2e
 // switched off.
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -141,5 +142,79 @@ func TestRateLimitExemptsHealth(t *testing.T) {
 		if res := hit(t, srv, "GET", "/health", probe); res.StatusCode != http.StatusOK {
 			t.Fatalf("health check %d = %d", i+1, res.StatusCode)
 		}
+	}
+}
+
+// Header text the caller chooses must not buy a fresh bucket. Requests that
+// present a credential share one larger per-address bucket (4x the base rate).
+func TestRateLimitForgedHeadersShareOneCeiling(t *testing.T) {
+	reset(t)
+	srv := limitedServer(t, httpapi.RateLimit{ReadsPerMinute: 2})
+
+	for name, header := range map[string]string{
+		"Authorization": "198.51.100.40",
+		"X-User-ID":     "198.51.100.41",
+	} {
+		for i := 0; i < 8; i++ {
+			res := hit(t, srv, "GET", "/v1/public/stories", map[string]string{
+				"X-Forwarded-For": header, name: fmt.Sprintf("forged-%d", i)})
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("%s request %d = %d, want 200", name, i+1, res.StatusCode)
+			}
+		}
+		res := hit(t, srv, "GET", "/v1/public/stories", map[string]string{
+			"X-Forwarded-For": header, name: "forged-new"})
+		if res.StatusCode != http.StatusTooManyRequests {
+			t.Errorf("varying %s bought a fresh bucket: %d", name, res.StatusCode)
+		}
+	}
+}
+
+// Once a uid is verified its budget follows it, whatever address it uses.
+func TestRateLimitFollowsAUserAcrossAddresses(t *testing.T) {
+	reset(t)
+	srv := limitedServer(t, httpapi.RateLimit{ReadsPerMinute: 3})
+	from := func(i int, uid string) map[string]string {
+		return map[string]string{
+			"X-Forwarded-For": fmt.Sprintf("198.51.100.%d", 50+i), "X-User-ID": uid}
+	}
+
+	for i := 0; i < 3; i++ {
+		if res := hit(t, srv, "GET", "/v1/stories", from(i, alice)); res.StatusCode != http.StatusOK {
+			t.Fatalf("read %d = %d, want 200", i+1, res.StatusCode)
+		}
+	}
+	res := hit(t, srv, "GET", "/v1/stories", from(3, alice))
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("a new address bought the same user a new budget: %d", res.StatusCode)
+	}
+	if res.Header.Get("Retry-After") == "" {
+		t.Error("a per-user 429 must tell the caller when to come back")
+	}
+	if res := hit(t, srv, "GET", "/v1/stories", from(0, bob)); res.StatusCode != http.StatusOK {
+		t.Errorf("another user was throttled by alice's flood: %d", res.StatusCode)
+	}
+}
+
+// Service calls arrive from one set of addresses for every user, so they are
+// held to the asserted user's budget rather than to an address.
+func TestRateLimitHoldsServiceCallsToTheAssertedUser(t *testing.T) {
+	reset(t)
+	srv := limitedServer(t, httpapi.RateLimit{ReadsPerMinute: 2})
+	as := func(uid string) map[string]string {
+		return map[string]string{"X-Forwarded-For": "198.51.100.60",
+			"X-Service-Token": testServiceToken, "X-User-ID": uid}
+	}
+
+	for i := 0; i < 2; i++ {
+		if res := hit(t, srv, "GET", "/v1/stories", as(alice)); res.StatusCode != http.StatusOK {
+			t.Fatalf("service read %d = %d, want 200", i+1, res.StatusCode)
+		}
+	}
+	if res := hit(t, srv, "GET", "/v1/stories", as(alice)); res.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("service read 3 for one user = %d, want 429", res.StatusCode)
+	}
+	if res := hit(t, srv, "GET", "/v1/stories", as(bob)); res.StatusCode != http.StatusOK {
+		t.Errorf("a second user through the same service = %d, want 200", res.StatusCode)
 	}
 }

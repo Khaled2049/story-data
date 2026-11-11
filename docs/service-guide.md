@@ -340,9 +340,11 @@ bodies stay generic — the detail goes to the log.
 
 **Request logging** (`internal/httpapi/logging.go`) is the outermost
 middleware, so throttled and CORS-rejected requests are logged too. One JSON
-line per request: request id, method, path, status, duration, uid, client
-address, and the underlying error when the response was a 500. `/health` is
-skipped. Every response carries `X-Request-ID`; an inbound `X-Request-ID` or
+line per request: request id, method, path, status, duration, uid, `auth`,
+client address, and the underlying error when the response was a 500. `auth`
+says which credential proved the uid — `firebase`, `service` (a backend
+asserting the uid with the service token) or `dev` — and is `anonymous` when
+none did. `/health` is skipped. Every response carries `X-Request-ID`; an inbound `X-Request-ID` or
 `X-Cloud-Trace-Context` is preserved so a trace survives across services.
 `cmd/api` installs `slog`'s JSON handler on stderr, which is what Cloud Run
 parses into structured entries.
@@ -388,16 +390,32 @@ The service is invokable by anyone — Cloud Run grants `roles/run.invoker` to
 `allUsers` and `/v1/public/*` needs no credential — so throttling is part of
 the contract, at two layers.
 
-**Per-caller request budget** (`internal/httpapi/ratelimit.go`). Middleware
-keyed on the authenticated caller where there is one and the client address
-otherwise, defaulting to 300 reads and 60 writes per minute. Override with
-`RATE_LIMIT_READS_PER_MINUTE` / `RATE_LIMIT_WRITES_PER_MINUTE`; `0` disables
-that half, which is what the local stack does. Over budget is `429` with
-`Retry-After`. `GET /health` is exempt so a flood cannot fail the liveness
-probe. Buckets are per instance and in memory: this bounds a burst, it is not
-a platform-wide quota. `clientIP` reads the **last** `X-Forwarded-For` entry,
-the one Google's front end appends — putting a load balancer in front of the
-service invalidates that assumption.
+**Per-caller request budget** (`internal/httpapi/ratelimit.go`), defaulting
+to 300 reads and 60 writes per minute, in two steps:
+
+- *Before authentication*, middleware keys on the client address only. An
+  anonymous request spends from that address's bucket. A request presenting any
+  credential header spends from a second per-address bucket four times the
+  size, so several signed-in people behind one address are not held to one
+  visitor's budget. Header text is never part of a key: varying an unverified
+  `Authorization` or `X-User-ID` buys nothing, and the bucket map cannot be
+  grown with invented values. An IPv6 address counts as its `/64`.
+- *After authentication*, `Server.user` and `Server.admin` spend from the
+  verified uid's own bucket, which follows the user across addresses. Routes
+  that only resolve an optional viewer are held to the address buckets alone.
+
+A request with a valid service token skips the address buckets, because every
+service call arrives from the caller's shared egress addresses. It spends from
+one bucket shared by all service calls (twenty times the base rate) and then
+from the asserted uid's bucket.
+
+Override the base rate with `RATE_LIMIT_READS_PER_MINUTE` /
+`RATE_LIMIT_WRITES_PER_MINUTE`; `0` disables that half, which is what the
+local stack does. Over budget is `429` with `Retry-After`. `GET /health` is
+exempt so a flood cannot fail the liveness probe. Buckets are per instance and
+in memory: this bounds a burst, it is not a platform-wide quota. `clientIP`
+reads the **last** `X-Forwarded-For` entry, the one Google's front end appends
+— putting a load balancer in front of the service invalidates that assumption.
 
 **Durable daily budgets** (`internal/store/quota.go`, table
 `user_daily_usage`). Per user, per action, in UTC days, spent in the same

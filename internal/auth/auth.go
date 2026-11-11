@@ -57,6 +57,19 @@ func (v *Verifier) IsService(r *http.Request) bool {
 	return presented != "" && v.validServiceToken(presented)
 }
 
+// Class names the credential identity() accepts for this request, for the
+// access log. Meaningful only after identity() has succeeded.
+func (v *Verifier) Class(r *http.Request) string {
+	switch {
+	case v.IsService(r):
+		return "service"
+	case v.mode == "dev":
+		return "dev"
+	default:
+		return "firebase"
+	}
+}
+
 func presentedServiceToken(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-Service-Token"))
 }
