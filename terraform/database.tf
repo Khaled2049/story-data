@@ -62,6 +62,10 @@ resource "postgresql_role" "login" {
   login               = true
   password_wo         = ephemeral.random_password.db_login[each.key].result
   password_wo_version = var.db_password_version
+  # Membership belongs to postgresql_grant_role; without this the next apply revokes it.
+  lifecycle {
+    ignore_changes = [roles]
+  }
 }
 
 # The groups exist once the migrate job has applied 000048, which the deploy
