@@ -211,6 +211,17 @@ Either way the request is then held to the same rules
 
 The access log records `auth=service` and the verified account in `caller`.
 
+**What this does not stop:** a compromised agents runtime can still assert any
+uid on the allowlisted routes. That risk is accepted rather than designed out,
+because the same runtime's `agents_service` database login already reads every
+story's content for indexing. Detection stands in for prevention:
+`terraform/alerts.tf` builds log metrics from those fields and alerts when
+service calls span more than `alert_service_uids_per_hour` distinct uids, or
+are refused more than `alert_service_denials_per_10m` times. Alerts email the
+`ALERT_EMAIL` GitHub secret's address, and only show in the console when it is
+unset. Raise the thresholds as real traffic arrives; a legitimate burst of
+assistant users looks the same as an attack to the first alert.
+
 ### Story moderation
 
 `/v1/admin/*` requires a verified Firebase `admin: true` claim on every

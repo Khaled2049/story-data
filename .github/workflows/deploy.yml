@@ -125,6 +125,8 @@ jobs:
 
         env:
           INPUT_GITHUB_SHA: ${{ github.sha }}
+          # Where the security alerts go; unset leaves them console-only.
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
       - name: Verify the new revision serves traffic
         run: |
           url="$(gcloud run services describe "$SERVICE" --region="$REGION" \
