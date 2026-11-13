@@ -124,7 +124,9 @@ func main() {
 	if cfg.RateLimitWrites != nil {
 		rl.WritesPerMinute = *cfg.RateLimitWrites
 	}
-	h := httpapi.New(st, auth.New(cfg.AuthMode, cfg.FirebaseProjectID, cfg.ServiceToken), cfg.CORSOrigins, rl)
+	verifier := auth.New(cfg.AuthMode, cfg.FirebaseProjectID, cfg.ServiceToken).
+		WithServiceAccounts(cfg.ServiceAudiences, cfg.ServiceAccounts, nil)
+	h := httpapi.New(st, verifier, cfg.CORSOrigins, rl)
 	if err = serve(newServer(cfg.Addr, h)); err != nil {
 		log.Fatal(err)
 	}

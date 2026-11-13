@@ -77,12 +77,14 @@ func New(s *store.Store, a *auth.Verifier, origins []string, rl RateLimit) http.
 	m.HandleFunc("/v1/profiles/", x.profileAction)
 	m.HandleFunc("/v1/stories", x.stories)
 	m.HandleFunc("/v1/stories/", x.story)
+	// withServiceScope sits before the limiter so the limiter can trust its
+	// verdict on a service credential, and refuses a service before routing.
 	// Logging is outermost after compression so that a request rejected by the
 	// rate limiter is logged too — during an attack those rejections are the
 	// signal. Rate limiting then sits inside CORS, so a throttled caller still
 	// gets the headers their browser needs to read the 429, and outside
 	// everything else, so a throttled request costs no database work.
-	return x.withGzip(x.withLogging(x.withCORS(x.withRateLimit(x.withJSON(m)))))
+	return x.withGzip(x.withLogging(x.withServiceScope(x.withCORS(x.withRateLimit(x.withJSON(m))))))
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
@@ -431,7 +433,8 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) (string, bool) {
 		writeError(w, http.StatusUnauthorized, e.Error())
 		return "", false
 	}
-	logUser(w, uid, s.auth.Class(r))
+	class, caller := s.auth.Caller(r)
+	logUser(w, uid, class, caller)
 	if !s.underUserLimit(w, r, uid) {
 		return "", false
 	}
@@ -445,6 +448,19 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) (string, bool) {
 		writeError(w, http.StatusForbidden, "account suspended")
 		return "", false
 	}
+	// A service may act only on the asserted user's own stories. Without this
+	// the read paths would hand it any published story, drafts excluded.
+	if s.auth.IsService(r) {
+		if id, ok := serviceStoryID(r.URL.Path); ok {
+			if !uuidPath(w, id) {
+				return "", false
+			}
+			if e := s.store.RequireStoryOwner(r.Context(), id, uid); e != nil {
+				respond(w, nil, e)
+				return "", false
+			}
+		}
+	}
 	return uid, true
 }
 
@@ -456,7 +472,8 @@ func (s *Server) admin(w http.ResponseWriter, r *http.Request) (string, bool) {
 		writeError(w, http.StatusUnauthorized, e.Error())
 		return "", false
 	}
-	logUser(w, uid, s.auth.Class(r))
+	class, caller := s.auth.Caller(r)
+	logUser(w, uid, class, caller)
 	if !s.underUserLimit(w, r, uid) {
 		return "", false
 	}

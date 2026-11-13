@@ -34,6 +34,8 @@ type recorder struct {
 	uid string
 	// auth is how that uid was proven: firebase, service or dev.
 	auth string
+	// caller names the verified service when auth is "service".
+	caller string
 }
 
 func (r *recorder) WriteHeader(status int) {
@@ -60,11 +62,13 @@ func logError(w http.ResponseWriter, e error) {
 	}
 }
 
-// logUser records who the request authenticated as, and by what credential.
-func logUser(w http.ResponseWriter, uid, class string) {
+// logUser records who the request authenticated as, by what credential and,
+// for a service, which one.
+func logUser(w http.ResponseWriter, uid, class, caller string) {
 	if r, ok := w.(*recorder); ok {
 		r.uid = uid
 		r.auth = class
+		r.caller = caller
 	}
 }
 
@@ -109,6 +113,7 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 			"uid", rec.uid,
 			// Separates a service asserting a uid from that user's own token.
 			"auth", rec.auth,
+			"caller", rec.caller,
 			"ip", clientIP(r),
 		}
 		switch {

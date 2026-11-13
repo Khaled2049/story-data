@@ -14,7 +14,7 @@ import (
 )
 
 func limitedTestServer(rl RateLimit) *Server {
-	return &Server{auth: auth.New("production", "", "service-secret"), limiter: newLimiter(rl)}
+	return &Server{auth: auth.New("dev", "", "service-secret"), limiter: newLimiter(rl)}
 }
 
 func okHandler(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
@@ -104,7 +104,8 @@ func TestAccessLogNamesTheCredential(t *testing.T) {
 
 	s := limitedTestServer(RateLimit{})
 	authed := s.withLogging(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logUser(w, "user-1", s.auth.Class(r))
+		class, caller := s.auth.Caller(r)
+		logUser(w, "user-1", class, caller)
 	}))
 	anonymous := s.withLogging(http.HandlerFunc(okHandler))
 
@@ -114,7 +115,7 @@ func TestAccessLogNamesTheCredential(t *testing.T) {
 	authed.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/stories", nil))
 	anonymous.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/public/stories", nil))
 
-	want := []string{"service", "firebase", "anonymous"}
+	want := []string{"service", "dev", "anonymous"}
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
 	if len(lines) != len(want) {
 		t.Fatalf("got %d log lines, want %d: %s", len(lines), len(want), buf.String())
@@ -127,8 +128,58 @@ func TestAccessLogNamesTheCredential(t *testing.T) {
 		if entry["auth"] != want[i] {
 			t.Errorf("log line %d auth = %v, want %q", i, entry["auth"], want[i])
 		}
+		if i == 0 && entry["caller"] != "service-token" {
+			t.Errorf("service log line caller = %v, want service-token", entry["caller"])
+		}
 		if strings.Contains(line, "service-secret") {
 			t.Errorf("log line %d contains the service token", i)
+		}
+	}
+}
+
+func TestServiceRouteAllowlist(t *testing.T) {
+	const story = "/v1/stories/0b5f0a3e-7c1d-4b8e-9a51-2c6f1e0d9b44"
+	allowed := map[string]string{
+		"GET /v1/profiles/me":                             "",
+		"GET /v1/stories":                                 "",
+		"POST /v1/stories":                                "",
+		"GET /v1/stories/":                                "trailing slash",
+		"GET " + story:                                    "",
+		"GET " + story + "/chapters":                      "",
+		"POST " + story + "/chapters":                     "",
+		"PATCH " + story + "/chapters/c1":                 "",
+		"GET " + story + "/plots/p1":                      "",
+		"POST " + story + "/voice-profile/agent-note":     "",
+		"GET " + story + "/assistant-threads/t1/messages": "",
+	}
+	refused := []string{
+		"DELETE " + story,
+		"PUT " + story,
+		"DELETE " + story + "/chapters/c1",
+		"PUT " + story + "/chapters/c1/publication",
+		"POST " + story + "/comments",
+		"POST " + story + "/assistant-threads",
+		"GET " + story + "/context",
+		"GET " + story + "/voice-profile/extra",
+		"GET /v1/stories//chapters",
+		"POST /v1/me/writer-agreement",
+		"GET /v1/me/reading-history",
+		"POST /v1/admin/token-grants",
+		"GET /v1/public/stories",
+		"PUT /v1/profiles/me",
+	}
+	split := func(route string) (string, string) {
+		m, p, _ := strings.Cut(route, " ")
+		return m, p
+	}
+	for route := range allowed {
+		if !serviceRouteAllowed(split(route)) {
+			t.Errorf("%s was refused", route)
+		}
+	}
+	for _, route := range refused {
+		if serviceRouteAllowed(split(route)) {
+			t.Errorf("%s was allowed", route)
 		}
 	}
 }

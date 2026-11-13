@@ -21,3 +21,19 @@ variable "cors_origins" {
     "tauri://localhost",
   ]
 }
+
+# Backends that may assert X-User-ID (MCP and the Story Assistant).
+variable "service_accounts" {
+  type    = list(string)
+  default = ["novelsync-agents-run@story-6f89f.iam.gserviceaccount.com"]
+}
+
+# Audiences a service ID token may name: this service's own URLs, which can't
+# be read from the resource being defined. Cloud Run serves both forms.
+variable "service_audiences" {
+  type = list(string)
+  default = [
+    "https://novelsync-story-data-ukvrbnaddq-uc.a.run.app",
+    "https://novelsync-story-data-793308156964.us-central1.run.app",
+  ]
+}

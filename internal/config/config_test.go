@@ -84,3 +84,24 @@ func TestRateLimitSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestProductionRefusesTheSharedServiceToken(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://example")
+	t.Setenv("AUTH_MODE", "production")
+	t.Setenv("FIREBASE_PROJECT_ID", "proj")
+	t.Setenv("SERVICE_TOKEN", "s3cret")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted SERVICE_TOKEN in production")
+	}
+	t.Setenv("SERVICE_TOKEN", "")
+	t.Setenv("SERVICE_ACCOUNTS", "agents@proj.iam.gserviceaccount.com")
+	t.Setenv("SERVICE_AUDIENCES", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted SERVICE_ACCOUNTS without SERVICE_AUDIENCES")
+	}
+	t.Setenv("SERVICE_AUDIENCES", "https://a.run.app, https://b.run.app")
+	c, err := Load()
+	if err != nil || len(c.ServiceAccounts) != 1 || len(c.ServiceAudiences) != 2 {
+		t.Fatalf("Load() = %v / %v, %v", c.ServiceAccounts, c.ServiceAudiences, err)
+	}
+}

@@ -159,6 +159,38 @@ permissions. Never trust client-supplied owner IDs.
 `X-Admin: true` so scripts can exercise protected routes without external
 token verification.
 
+### Service callers
+
+A backend that holds a user's uid but not their Firebase token (the MCP server
+and the Story Assistant in taleTribe-agents) asserts the uid in `X-User-ID`
+and proves its own identity separately:
+
+- **Production**: `X-Service-Authorization: Bearer <Google ID token>`, fetched
+  from the Cloud Run metadata server. `internal/auth` checks the signature
+  against Google's keys, the expiry, an issuer of `accounts.google.com`, an
+  audience in `SERVICE_AUDIENCES` (this service's URLs) and a verified email in
+  `SERVICE_ACCOUNTS`. Either list empty disables the path. `SERVICE_TOKEN` is
+  refused: startup fails with it set, and a request carrying `X-Service-Token`
+  gets `401`.
+- **Dev**: `X-Service-Token` matching `SERVICE_TOKEN`, since there is no
+  metadata server locally. Empty disables it.
+
+Either way the request is then held to the same rules
+(`internal/httpapi/service_scope.go`):
+
+- **Route allowlist.** `serviceRoutes` lists the method and path pairs those
+  two callers use. Anything else is `403` before routing, public routes
+  included. Add a route there only when a caller needs it.
+- **Owner only.** On any `/v1/stories/{id}/...` path, `Server.user` requires
+  the asserted uid to own the story (`Store.RequireStoryOwner`), so a service
+  does not get the public reader's access to other people's published
+  stories. A story the uid does not own is `404`.
+- **Never admin**, whatever `X-Admin` says, and bans apply as for any user.
+- A present but invalid credential is `401` and never falls through to the
+  user paths.
+
+The access log records `auth=service` and the verified account in `caller`.
+
 ### Story moderation
 
 `/v1/admin/*` requires a verified Firebase `admin: true` claim on every
@@ -170,7 +202,7 @@ from every author, including drafts, with cursor pagination, `q` search and
 `status=draft|ongoing|completed` filtering. The detail and chapter routes below
 it let an admin review private content; ordinary story and public reader routes
 keep their existing visibility rules. Moderation reads return `Cache-Control:
-no-store`. Service-token callers cannot claim admin access.
+no-store`. Service callers cannot claim admin access.
 
 `DELETE /v1/admin/stories/{id}` requires the current story `If-Match` revision
 and reuses owner deletion, including the active competition entry restriction
@@ -205,7 +237,7 @@ The admin AI usage page combines it with creditProxy's ledger.
 `DELETE` on the same path ban a member and lift the ban (`user_bans`). Every
 route that resolves the caller through `Server.user` checks the table, one
 primary-key lookup, and answers `403 account suspended`, including the MCP
-server's service-token path. Public reads stay open, and the member's published
+server's and the assistant's service path. Public reads stay open, and the member's published
 stories stay up. An admin cannot ban themselves (`422`). The frontend's
 `setUserBan` Function also disables the Firebase account and revokes its
 sessions; this table is what refuses the ID token they already hold, which
@@ -343,7 +375,7 @@ middleware, so throttled and CORS-rejected requests are logged too. One JSON
 line per request: request id, method, path, status, duration, uid, `auth`,
 client address, and the underlying error when the response was a 500. `auth`
 says which credential proved the uid — `firebase`, `service` (a backend
-asserting the uid with the service token) or `dev` — and is `anonymous` when
+asserting the uid, with the verified account in `caller`) or `dev` — and is `anonymous` when
 none did. `/health` is skipped. Every response carries `X-Request-ID`; an inbound `X-Request-ID` or
 `X-Cloud-Trace-Context` is preserved so a trace survives across services.
 `cmd/api` installs `slog`'s JSON handler on stderr, which is what Cloud Run
@@ -404,7 +436,7 @@ to 300 reads and 60 writes per minute, in two steps:
   verified uid's own bucket, which follows the user across addresses. Routes
   that only resolve an optional viewer are held to the address buckets alone.
 
-A request with a valid service token skips the address buckets, because every
+A request with a verified service credential skips the address buckets, because every
 service call arrives from the caller's shared egress addresses. It spends from
 one bucket shared by all service calls (twenty times the base rate) and then
 from the asserted uid's bucket.
@@ -683,7 +715,10 @@ Before handing off a change:
 ## Production notes
 
 Production uses Neon/PostgreSQL and Firebase token verification. Configure
-secrets through the deployment environment, not source control. Terraform
+secrets through the deployment environment, not source control. Terraform sets
+`SERVICE_ACCOUNTS` to the agents runtime account and `SERVICE_AUDIENCES` to
+this service's two `run.app` URLs; agents uses its `STORY_DATA_URL` as the
+token audience, so that URL must be one of them. Terraform
 configuration lives in `terraform/`; inspect it before changing deployment
 resources. Apply migrations through the normal application startup/deployment
 path so the advisory lock protects concurrent instances.
@@ -726,7 +761,7 @@ before/after snapshots; the table retains the latest 50. `POST` to
 recent change, as a new revision. This prevents an old undo from erasing later
 writer edits. History and profile are story-scoped, owner-only, use
 `Cache-Control: no-store`, and cascade on story deletion. An agent may call
-`POST /v1/stories/{id}/voice-profile/agent-note` with a verified service token,
+`POST /v1/stories/{id}/voice-profile/agent-note` with a verified service credential,
 asserted owner, current If-Match revision and story-scoped UUID idempotency
 key. It can add, revise or retire only an agent-authored note, never change
 writer notes, pin state, references, narration settings or the learning switch.
