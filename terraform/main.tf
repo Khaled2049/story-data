@@ -13,13 +13,33 @@ data "google_service_account" "runtime" {
   project    = var.project_id
 }
 
+# Runs migrations, and is the only identity that can read the owner URL.
+# Pre-created; see docs/database-roles.md.
+data "google_service_account" "migrate" {
+  account_id = "novelsync-story-data-migrate"
+  project    = var.project_id
+}
+
+# Schema owner (neondb_owner). Read only by the migrate job.
 data "google_secret_manager_secret" "database_url" {
   secret_id = "story-data-neon-database-url"
   project   = var.project_id
 }
 
+# story_data_api: rows only, no DDL. The API and sync-recs.
+data "google_secret_manager_secret" "database_url_app" {
+  secret_id = "story-data-database-url-app"
+  project   = var.project_id
+}
+
 resource "google_secret_manager_secret_iam_member" "database_url" {
   secret_id = data.google_secret_manager_secret.database_url.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${data.google_service_account.migrate.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "database_url_app" {
+  secret_id = data.google_secret_manager_secret.database_url_app.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${data.google_service_account.runtime.email}"
 }
@@ -67,10 +87,16 @@ resource "google_cloud_run_v2_service" "api" {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = data.google_secret_manager_secret.database_url.secret_id
+            secret  = data.google_secret_manager_secret.database_url_app.secret_id
             version = "latest"
           }
         }
+      }
+      # This role cannot run DDL; the migrate job ran first. Startup only
+      # checks the schema is current.
+      env {
+        name  = "MIGRATE_ON_START"
+        value = "false"
       }
       # A backend asserting X-User-ID must present a Google ID token from one
       # of these accounts, for one of these audiences. No shared secret.
@@ -87,7 +113,7 @@ resource "google_cloud_run_v2_service" "api" {
 
   depends_on = [
     google_project_service.run,
-    google_secret_manager_secret_iam_member.database_url,
+    google_secret_manager_secret_iam_member.database_url_app,
   ]
 }
 
@@ -130,6 +156,51 @@ resource "google_cloud_run_v2_job" "sync_recs" {
           name = "DATABASE_URL"
           value_source {
             secret_key_ref {
+              secret  = data.google_secret_manager_secret.database_url_app.secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.run,
+    google_secret_manager_secret_iam_member.database_url_app,
+  ]
+}
+
+# Applies migrations as the schema owner, then exits. The deploy workflow
+# updates and runs it before the API revision, which cannot run DDL.
+resource "google_cloud_run_v2_job" "migrate" {
+  name     = "novelsync-story-data-migrate"
+  location = var.region
+
+  template {
+    task_count  = 1
+    parallelism = 1
+
+    template {
+      service_account = data.google_service_account.migrate.email
+      max_retries     = 0
+      timeout         = "600s"
+
+      containers {
+        image = var.image
+        args  = ["migrate"]
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "512Mi"
+          }
+        }
+
+        env {
+          name = "DATABASE_URL"
+          value_source {
+            secret_key_ref {
               secret  = data.google_secret_manager_secret.database_url.secret_id
               version = "latest"
             }
@@ -146,6 +217,10 @@ resource "google_cloud_run_v2_job" "sync_recs" {
 }
 
 output "service_url" { value = google_cloud_run_v2_service.api.uri }
+
+output "migrate_job_name" {
+  value = google_cloud_run_v2_job.migrate.name
+}
 
 output "sync_recs_job_name" {
   value = google_cloud_run_v2_job.sync_recs.name

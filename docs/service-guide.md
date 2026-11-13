@@ -72,13 +72,30 @@ dev one.
 
 ## Data model and migrations
 
-Migrations are ordered and immutable. The API runs outstanding migrations on
-startup under PostgreSQL advisory lock `82104231`; this makes concurrent
-deployments safe. To run only migrations:
+Migrations are ordered and immutable. They run under PostgreSQL advisory lock
+`82104231`, which makes concurrent runs safe. To run only migrations:
 
 ```sh
 go run ./cmd/api migrate
 ```
+
+Locally the API also migrates on startup (`MIGRATE_ON_START`, default true).
+Production sets it false: the API logs in as `story_data_api`, which cannot
+run DDL, and the deploy runs the `novelsync-story-data-migrate` job as the
+schema owner first. The API then only checks that the database has reached
+its newest migration, and refuses to start if it has not.
+
+### Database roles
+
+Every direct database user has its own login in a group created by migration
+`000048`: `story_data_app` (the API and `sync-recs`), `story_data_agents`
+(taleTribe-agents) and `story_data_recs` (taleTribe-recs). Only the migrate
+job holds the owner credential. `story_data_agents` is granted named tables,
+so a migration that adds a table agents must query also grants it there;
+`story_data_app` picks up new tables through default privileges.
+`e2e/service_roles_test.go` pins all three. Logins and their secrets are
+created by hand, with SQL rather than the Neon console, which would add them
+to `neon_superuser`: see [database-roles.md](database-roles.md).
 
 Migration groups correspond to product domains:
 
@@ -595,7 +612,13 @@ and the completion rule (last released chapter, scrolled past 0.9).
 so drift fails a test rather than silently re-ranking the catalog.
 
 Everything downstream of `interactions` belongs to recs and never leaves the
-schema. Migration `000020` grants a `recs_service` role usage on
+schema. recs logs in as `recs_app`, a member of the `story_data_recs` group
+from migration `000048`, which carries the grants described below. The older
+`recs_service` grants in `000020`/`000021` remain for history; that role was
+created in the Neon console and so also inherited `neon_superuser`'s read and
+write on every table, which is why it is being replaced.
+
+Migration `000020` grants a `recs_service` role usage on
 `recommendations` only — and on `public` solely so it can resolve the `vector`
 type, with no table grant. The grant is a no-op where that role does not exist,
 which is every local and test database.

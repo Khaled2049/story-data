@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -74,10 +75,18 @@ func main() {
 	}
 	migrateCtx, cancelMigrate := context.WithTimeout(context.Background(), migrateTimeout)
 	defer cancelMigrate()
-	if err = migrate(migrateCtx, cfg.DatabaseURL); err != nil {
+	migrateOnly := len(os.Args) > 1 && os.Args[1] == "migrate"
+	if migrateOnly || cfg.MigrateOnStart {
+		err = migrate(migrateCtx, cfg.DatabaseURL)
+	} else {
+		// Production: the migrate job ran with the owner role before this
+		// deploy. Serving against an older schema would fail per request.
+		err = requireMigrated(migrateCtx, db)
+	}
+	if err != nil {
 		log.Fatal(err)
 	}
-	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+	if migrateOnly {
 		return
 	}
 	st := store.New(db)
@@ -197,6 +206,30 @@ func waitForDatabase(ctx context.Context, db *pgxpool.Pool) error {
 	}
 	return err
 }
+
+// requireMigrated refuses to start when the database is behind the newest
+// migration this binary carries.
+func requireMigrated(ctx context.Context, db *pgxpool.Pool) error {
+	files, err := goose.CollectMigrations("migrations", 0, goose.MaxVersion)
+	if err != nil {
+		return err
+	}
+	latest, err := files.Last()
+	if err != nil {
+		return err
+	}
+	var applied int64
+	err = db.QueryRow(ctx,
+		`SELECT COALESCE(max(version_id), 0) FROM goose_db_version WHERE is_applied`).Scan(&applied)
+	if err != nil {
+		return fmt.Errorf("reading the migration version: %w", err)
+	}
+	if applied < latest.Version {
+		return fmt.Errorf("database is at migration %d, this build needs %d: run the migrate job first", applied, latest.Version)
+	}
+	return nil
+}
+
 func migrate(ctx context.Context, dsn string) error {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {

@@ -23,6 +23,9 @@ type Config struct {
 	ServiceAccounts  []string
 	ServiceAudiences []string
 	CORSOrigins      []string
+	// MigrateOnStart runs migrations before serving. Production sets it false:
+	// the API's role cannot run DDL, so a migrate job runs them first.
+	MigrateOnStart bool
 	// VoterMinProfileAge is how long a public profile must exist before its
 	// owner may cast a competition ballot. nil means the variable was unset
 	// and the store's own default applies — local stacks set it to 0 so a
@@ -50,6 +53,13 @@ func Load() (Config, error) {
 		return Config{}, e
 	}
 	c.VoterMinProfileAge = age
+	switch strings.ToLower(value("MIGRATE_ON_START", "true")) {
+	case "true":
+		c.MigrateOnStart = true
+	case "false":
+	default:
+		return Config{}, fmt.Errorf("MIGRATE_ON_START must be true or false")
+	}
 	if c.RateLimitReads, e = optionalCount("RATE_LIMIT_READS_PER_MINUTE"); e != nil {
 		return Config{}, e
 	}

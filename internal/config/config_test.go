@@ -105,3 +105,18 @@ func TestProductionRefusesTheSharedServiceToken(t *testing.T) {
 		t.Fatalf("Load() = %v / %v, %v", c.ServiceAccounts, c.ServiceAudiences, err)
 	}
 }
+
+func TestMigrateOnStart(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://example")
+	t.Setenv("AUTH_MODE", "dev")
+	for raw, want := range map[string]bool{"": true, "true": true, "FALSE": false} {
+		t.Setenv("MIGRATE_ON_START", raw)
+		if c, err := Load(); err != nil || c.MigrateOnStart != want {
+			t.Fatalf("MIGRATE_ON_START=%q = %v, %v; want %v", raw, c.MigrateOnStart, err, want)
+		}
+	}
+	t.Setenv("MIGRATE_ON_START", "no")
+	if _, err := Load(); err == nil {
+		t.Fatal(`Load() accepted MIGRATE_ON_START="no"`)
+	}
+}
