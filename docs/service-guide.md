@@ -93,9 +93,12 @@ Every direct database user has its own login in a group created by migration
 job holds the owner credential. `story_data_agents` is granted named tables,
 so a migration that adds a table agents must query also grants it there;
 `story_data_app` picks up new tables through default privileges.
-`e2e/service_roles_test.go` pins all three. Logins and their secrets are
-created by hand, with SQL rather than the Neon console, which would add them
-to `neon_superuser`: see [database-roles.md](database-roles.md).
+`e2e/service_roles_test.go` pins all three. `terraform/database.tf` creates
+the logins with SQL (never Neon's console or API, which would add them to
+`neon_superuser`) and writes their URLs to Secret Manager, keeping passwords
+out of state. In production the API also refuses to start if its own login is
+over-privileged (`store.CheckRuntimeRole`). See
+[database-roles.md](database-roles.md).
 
 Migration groups correspond to product domains:
 

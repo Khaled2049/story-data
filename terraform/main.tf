@@ -26,12 +26,6 @@ data "google_secret_manager_secret" "database_url" {
   project   = var.project_id
 }
 
-# story_data_api: rows only, no DDL. The API and sync-recs.
-data "google_secret_manager_secret" "database_url_app" {
-  secret_id = "story-data-database-url-app"
-  project   = var.project_id
-}
-
 resource "google_secret_manager_secret_iam_member" "database_url" {
   secret_id = data.google_secret_manager_secret.database_url.secret_id
   role      = "roles/secretmanager.secretAccessor"
@@ -39,7 +33,7 @@ resource "google_secret_manager_secret_iam_member" "database_url" {
 }
 
 resource "google_secret_manager_secret_iam_member" "database_url_app" {
-  secret_id = data.google_secret_manager_secret.database_url_app.secret_id
+  secret_id = google_secret_manager_secret.database_url_app.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${data.google_service_account.runtime.email}"
 }
@@ -87,7 +81,7 @@ resource "google_cloud_run_v2_service" "api" {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = data.google_secret_manager_secret.database_url_app.secret_id
+            secret  = google_secret_manager_secret.database_url_app.secret_id
             version = "latest"
           }
         }
@@ -114,6 +108,8 @@ resource "google_cloud_run_v2_service" "api" {
   depends_on = [
     google_project_service.run,
     google_secret_manager_secret_iam_member.database_url_app,
+    google_secret_manager_secret_version.login["api"],
+    postgresql_grant_role.login["api"],
   ]
 }
 
@@ -156,7 +152,7 @@ resource "google_cloud_run_v2_job" "sync_recs" {
           name = "DATABASE_URL"
           value_source {
             secret_key_ref {
-              secret  = data.google_secret_manager_secret.database_url_app.secret_id
+              secret  = google_secret_manager_secret.database_url_app.secret_id
               version = "latest"
             }
           }
@@ -168,6 +164,8 @@ resource "google_cloud_run_v2_job" "sync_recs" {
   depends_on = [
     google_project_service.run,
     google_secret_manager_secret_iam_member.database_url_app,
+    google_secret_manager_secret_version.login["api"],
+    postgresql_grant_role.login["api"],
   ]
 }
 

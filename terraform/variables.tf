@@ -37,3 +37,10 @@ variable "service_audiences" {
     "https://novelsync-story-data-793308156964.us-central1.run.app",
   ]
 }
+
+# Bump to rotate the passwords of every database login in database.tf. Each
+# login and the secrets holding its URL change together in one apply.
+variable "db_password_version" {
+  type    = number
+  default = 1
+}

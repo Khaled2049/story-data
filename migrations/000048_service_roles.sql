@@ -1,9 +1,9 @@
 -- +goose Up
 -- Least-privilege roles for every direct database user except the migrator.
 --
--- Three NOLOGIN groups hold the grants. Logins with passwords are created by
--- hand (repos/story-data/docs/database-roles.md) and join their group below,
--- so no credential lives in this repository:
+-- Three NOLOGIN groups hold the grants. Logins with passwords are made by
+-- terraform/database.tf, which runs after this migration and adds each login
+-- to its group, so no credential lives in this repository:
 --
 --   story_data_app     -> login story_data_api: the API and sync-recs. Row
 --                         reads and writes, no DDL, no TRUNCATE.
@@ -66,8 +66,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA recommendations
   GRANT USAGE, SELECT ON SEQUENCES TO story_data_recs;
 GRANT SELECT ON stories, story_tags, chapters, chapter_summaries TO story_data_recs;
 
--- Join each login to its group if it exists yet. A login created after this
--- migration ran needs the same GRANT by hand (see the runbook).
+-- Join each login to its group if it exists yet. Terraform also grants the
+-- membership, which covers a login created after this migration ran.
 -- +goose StatementBegin
 DO $$
 DECLARE pair text[];

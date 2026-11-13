@@ -80,8 +80,12 @@ func main() {
 		err = migrate(migrateCtx, cfg.DatabaseURL)
 	} else {
 		// Production: the migrate job ran with the owner role before this
-		// deploy. Serving against an older schema would fail per request.
+		// deploy. Serving against an older schema would fail per request, and
+		// serving as an over-privileged role would undo the role split.
 		err = requireMigrated(migrateCtx, db)
+		if err == nil {
+			err = store.CheckRuntimeRole(migrateCtx, db)
+		}
 	}
 	if err != nil {
 		log.Fatal(err)

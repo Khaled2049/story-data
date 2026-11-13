@@ -3,6 +3,8 @@ package e2e
 import (
 	"context"
 	"testing"
+
+	"github.com/kh1011/novelsync-story-data/internal/store"
 )
 
 // Pins migration 000048: what each service group may touch. Production logins
@@ -149,5 +151,24 @@ func TestAgentsRoleRunsItsStatements(t *testing.T) {
 	}
 	if _, err := tx.Exec(ctx, `SELECT 1 FROM reading_progress LIMIT 1`); err == nil {
 		t.Error("story_data_agents read reading_progress")
+	}
+}
+
+// The production API refuses to serve as an over-privileged role.
+func TestCheckRuntimeRole(t *testing.T) {
+	ctx := context.Background()
+	if err := store.CheckRuntimeRole(ctx, testPool); err == nil {
+		t.Error("CheckRuntimeRole accepted the test superuser")
+	}
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE story_data_app`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckRuntimeRole(ctx, tx); err != nil {
+		t.Errorf("CheckRuntimeRole refused story_data_app: %v", err)
 	}
 }
