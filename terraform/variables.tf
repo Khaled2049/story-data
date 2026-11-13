@@ -44,3 +44,22 @@ variable "db_password_version" {
   type    = number
   default = 1
 }
+
+# Empty creates the alerts with no notification; they still show in the console.
+# Set from the ALERT_EMAIL GitHub secret so the address stays out of the repo.
+variable "alert_email" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+
+# Pre-launch thresholds; raise them as real assistant and MCP traffic arrives.
+variable "alert_service_uids_per_hour" {
+  type    = number
+  default = 20
+}
+
+variable "alert_service_denials_per_10m" {
+  type    = number
+  default = 10
+}
