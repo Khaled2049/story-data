@@ -14,10 +14,18 @@ type Config struct {
 	AuthMode          string
 	FirebaseProjectID string
 	// ServiceToken lets a trusted backend assert a caller identity via
-	// X-User-ID without holding that user's Firebase token. Empty disables the
-	// path entirely: an unconfigured deployment must never trust a header.
+	// X-User-ID without holding that user's Firebase token. Dev only: empty
+	// disables it, and production refuses to start with it set.
 	ServiceToken string
-	CORSOrigins  []string
+	// ServiceAccounts and ServiceAudiences admit a production backend by its
+	// Google ID token: issued to one of these service accounts, for one of
+	// these audiences (this service's URLs). Empty disables the path.
+	ServiceAccounts  []string
+	ServiceAudiences []string
+	CORSOrigins      []string
+	// MigrateOnStart runs migrations before serving. Production sets it false:
+	// the API's role cannot run DDL, so a migrate job runs them first.
+	MigrateOnStart bool
 	// VoterMinProfileAge is how long a public profile must exist before its
 	// owner may cast a competition ballot. nil means the variable was unset
 	// and the store's own default applies — local stacks set it to 0 so a
@@ -37,12 +45,21 @@ func Load() (Config, error) {
 		FirebaseProjectID: strings.TrimSpace(os.Getenv("FIREBASE_PROJECT_ID")),
 		ServiceToken:      strings.TrimSpace(os.Getenv("SERVICE_TOKEN")),
 		CORSOrigins:       splitList(os.Getenv("CORS_ORIGINS")),
+		ServiceAccounts:   splitList(os.Getenv("SERVICE_ACCOUNTS")),
+		ServiceAudiences:  splitList(os.Getenv("SERVICE_AUDIENCES")),
 	}
 	age, e := optionalDuration("VOTER_MIN_PROFILE_AGE")
 	if e != nil {
 		return Config{}, e
 	}
 	c.VoterMinProfileAge = age
+	switch strings.ToLower(value("MIGRATE_ON_START", "true")) {
+	case "true":
+		c.MigrateOnStart = true
+	case "false":
+	default:
+		return Config{}, fmt.Errorf("MIGRATE_ON_START must be true or false")
+	}
 	if c.RateLimitReads, e = optionalCount("RATE_LIMIT_READS_PER_MINUTE"); e != nil {
 		return Config{}, e
 	}
@@ -57,6 +74,12 @@ func Load() (Config, error) {
 	}
 	if c.AuthMode == "production" && c.FirebaseProjectID == "" {
 		return Config{}, fmt.Errorf("FIREBASE_PROJECT_ID is required in production")
+	}
+	if c.AuthMode == "production" && c.ServiceToken != "" {
+		return Config{}, fmt.Errorf("SERVICE_TOKEN is dev only; production admits services by SERVICE_ACCOUNTS")
+	}
+	if len(c.ServiceAccounts) > 0 && len(c.ServiceAudiences) == 0 {
+		return Config{}, fmt.Errorf("SERVICE_AUDIENCES is required with SERVICE_ACCOUNTS")
 	}
 	return c, nil
 }

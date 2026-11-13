@@ -103,10 +103,23 @@ jobs:
           terraform_version: 1.14.4
           terraform_wrapper: false
 
-      - name: Terraform apply
+      # The API's role cannot run DDL and refuses to start on an old schema, so
+      # the migrate job moves to the new image and runs before anything else.
+      - name: Migrate the database
         working-directory: terraform
         run: |
           terraform init
+          terraform apply -auto-approve -input=false \
+            -target=google_cloud_run_v2_job.migrate \
+            -var="image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:${INPUT_GITHUB_SHA}"
+          gcloud run jobs execute novelsync-story-data-migrate \
+            --region="$REGION" --project="$PROJECT_ID" --wait
+        env:
+          INPUT_GITHUB_SHA: ${{ github.sha }}
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
           terraform apply -auto-approve -input=false \
             -var="image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:${INPUT_GITHUB_SHA}"
 

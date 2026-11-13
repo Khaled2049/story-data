@@ -13,27 +13,27 @@ data "google_service_account" "runtime" {
   project    = var.project_id
 }
 
-data "google_secret_manager_secret" "database_url" {
-  secret_id = "story-data-neon-database-url"
-  project   = var.project_id
+# Runs migrations, and is the only identity that can read the owner URL.
+# Pre-created; see docs/database-roles.md.
+data "google_service_account" "migrate" {
+  account_id = "novelsync-story-data-migrate"
+  project    = var.project_id
 }
 
-# Shared secret that lets a trusted backend (the MCP server) assert X-User-ID.
-# Same value as STORY_DATA_SERVICE_TOKEN in taleTribe-agents. Must be
-# pre-created in Secret Manager; see setup.md.
-data "google_secret_manager_secret" "service_token" {
-  secret_id = "story-data-service-token"
+# Schema owner (neondb_owner). Read only by the migrate job.
+data "google_secret_manager_secret" "database_url" {
+  secret_id = "story-data-neon-database-url"
   project   = var.project_id
 }
 
 resource "google_secret_manager_secret_iam_member" "database_url" {
   secret_id = data.google_secret_manager_secret.database_url.secret_id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${data.google_service_account.runtime.email}"
+  member    = "serviceAccount:${data.google_service_account.migrate.email}"
 }
 
-resource "google_secret_manager_secret_iam_member" "service_token" {
-  secret_id = data.google_secret_manager_secret.service_token.secret_id
+resource "google_secret_manager_secret_iam_member" "database_url_app" {
+  secret_id = google_secret_manager_secret.database_url_app.secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${data.google_service_account.runtime.email}"
 }
@@ -81,29 +81,35 @@ resource "google_cloud_run_v2_service" "api" {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = data.google_secret_manager_secret.database_url.secret_id
+            secret  = google_secret_manager_secret.database_url_app.secret_id
             version = "latest"
           }
         }
       }
-      # Empty would disable the service-auth path entirely, which is the
-      # fail-safe default in code but would break MCP reads here.
+      # This role cannot run DDL; the migrate job ran first. Startup only
+      # checks the schema is current.
       env {
-        name = "SERVICE_TOKEN"
-        value_source {
-          secret_key_ref {
-            secret  = data.google_secret_manager_secret.service_token.secret_id
-            version = "latest"
-          }
-        }
+        name  = "MIGRATE_ON_START"
+        value = "false"
+      }
+      # A backend asserting X-User-ID must present a Google ID token from one
+      # of these accounts, for one of these audiences. No shared secret.
+      env {
+        name  = "SERVICE_ACCOUNTS"
+        value = join(",", var.service_accounts)
+      }
+      env {
+        name  = "SERVICE_AUDIENCES"
+        value = join(",", var.service_audiences)
       }
     }
   }
 
   depends_on = [
     google_project_service.run,
-    google_secret_manager_secret_iam_member.database_url,
-    google_secret_manager_secret_iam_member.service_token,
+    google_secret_manager_secret_iam_member.database_url_app,
+    google_secret_manager_secret_version.login["api"],
+    postgresql_grant_role.login["api"],
   ]
 }
 
@@ -146,6 +152,53 @@ resource "google_cloud_run_v2_job" "sync_recs" {
           name = "DATABASE_URL"
           value_source {
             secret_key_ref {
+              secret  = google_secret_manager_secret.database_url_app.secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.run,
+    google_secret_manager_secret_iam_member.database_url_app,
+    google_secret_manager_secret_version.login["api"],
+    postgresql_grant_role.login["api"],
+  ]
+}
+
+# Applies migrations as the schema owner, then exits. The deploy workflow
+# updates and runs it before the API revision, which cannot run DDL.
+resource "google_cloud_run_v2_job" "migrate" {
+  name     = "novelsync-story-data-migrate"
+  location = var.region
+
+  template {
+    task_count  = 1
+    parallelism = 1
+
+    template {
+      service_account = data.google_service_account.migrate.email
+      max_retries     = 0
+      timeout         = "600s"
+
+      containers {
+        image = var.image
+        args  = ["migrate"]
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "512Mi"
+          }
+        }
+
+        env {
+          name = "DATABASE_URL"
+          value_source {
+            secret_key_ref {
               secret  = data.google_secret_manager_secret.database_url.secret_id
               version = "latest"
             }
@@ -162,6 +215,10 @@ resource "google_cloud_run_v2_job" "sync_recs" {
 }
 
 output "service_url" { value = google_cloud_run_v2_service.api.uri }
+
+output "migrate_job_name" {
+  value = google_cloud_run_v2_job.migrate.name
+}
 
 output "sync_recs_job_name" {
   value = google_cloud_run_v2_job.sync_recs.name

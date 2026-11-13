@@ -1,8 +1,11 @@
 package httpapi
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,8 +70,9 @@ func (l *limiter) clock() time.Time {
 	return time.Now()
 }
 
-// allow spends one token from the caller's bucket for this kind of request.
-func (l *limiter) allow(key string, write bool) bool {
+// allow spends one token from the bucket named key. factor scales the
+// configured rate for buckets that several callers share.
+func (l *limiter) allow(key string, write bool, factor int) bool {
 	perMinute := l.cfg.ReadsPerMinute
 	if write {
 		perMinute = l.cfg.WritesPerMinute
@@ -81,11 +85,11 @@ func (l *limiter) allow(key string, write bool) bool {
 	l.mu.Lock()
 	b := l.buckets[key]
 	if b == nil {
-		every := rate.Every(time.Minute / time.Duration(max(l.cfg.ReadsPerMinute, 1)))
-		everyWrite := rate.Every(time.Minute / time.Duration(max(l.cfg.WritesPerMinute, 1)))
+		reads := max(l.cfg.ReadsPerMinute, 1) * max(factor, 1)
+		writes := max(l.cfg.WritesPerMinute, 1) * max(factor, 1)
 		b = &bucket{
-			read:  rate.NewLimiter(every, max(l.cfg.ReadsPerMinute, 1)),
-			write: rate.NewLimiter(everyWrite, max(l.cfg.WritesPerMinute, 1)),
+			read:  rate.NewLimiter(rate.Every(time.Minute/time.Duration(reads)), reads),
+			write: rate.NewLimiter(rate.Every(time.Minute/time.Duration(writes)), writes),
 		}
 		l.buckets[key] = b
 		l.sweepLocked(now)
@@ -114,12 +118,18 @@ func (l *limiter) sweepLocked(now time.Time) {
 	}
 }
 
-// withRateLimit keys on the authenticated uid when there is one, so a user
-// behind a shared NAT is not throttled by their neighbours, and on the client
-// IP otherwise, which is all an anonymous caller has. Identifying the caller
-// must not cost a token verification on every request, so this reads the
-// header rather than calling the verifier: an attacker can vary the value, but
-// only to keys they could reach anyway by varying source addresses.
+// A bucket several callers share is sized as a multiple of one caller's rate.
+const (
+	// sharedAddressFactor sizes the bucket for requests that present a
+	// credential, since several signed-in people can sit behind one address.
+	sharedAddressFactor = 4
+	// serviceFactor sizes the one bucket all service-token calls share.
+	serviceFactor = 20
+)
+
+// withRateLimit throttles before authentication, so it keys only on things
+// the caller cannot choose: the source address, or a verified service token.
+// The per-user limit is applied later, in underUserLimit, once a uid is proven.
 func (s *Server) withRateLimit(next http.Handler) http.Handler {
 	if s.limiter == nil {
 		return next
@@ -129,30 +139,78 @@ func (s *Server) withRateLimit(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		write := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
-		if !s.limiter.allow(rateKey(r), write) {
-			w.Header().Set("Retry-After", strconv.Itoa(60))
-			// Set here rather than relying on withJSON, which sits inside this
-			// middleware and never runs for a rejected request.
-			w.Header().Set("Content-Type", "application/json")
-			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		key, factor := s.rateKey(r)
+		if !s.limiter.allow(key, isWrite(r), factor) {
+			tooManyRequests(w)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// rateKey identifies the caller for throttling. A bearer token is hashed to a
-// stable key without being verified — throttling is not authorization, and a
-// forged token buys nothing but its own bucket.
-func rateKey(r *http.Request) string {
-	if t := r.Header.Get("Authorization"); t != "" {
-		return "auth:" + t
+// underUserLimit spends from the verified caller's own bucket, answering 429
+// itself when it returns false. Call it only with a uid the verifier accepted.
+func (s *Server) underUserLimit(w http.ResponseWriter, r *http.Request, uid string) bool {
+	if s.limiter == nil || s.limiter.allow(userKey(uid), isWrite(r), 1) {
+		return true
 	}
-	if u := r.Header.Get("X-User-ID"); u != "" {
-		return "uid:" + u
+	tooManyRequests(w)
+	return false
+}
+
+func isWrite(r *http.Request) bool {
+	return r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+}
+
+func tooManyRequests(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", strconv.Itoa(60))
+	// Set here because withJSON sits inside the limiter and may not have run.
+	w.Header().Set("Content-Type", "application/json")
+	writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+}
+
+// rateKey names the pre-authentication bucket and its size. Header text is
+// never part of a key: a caller who varies it must not get a fresh bucket.
+func (s *Server) rateKey(r *http.Request) (string, int) {
+	// Service calls all arrive from the caller's shared egress addresses.
+	if s.auth.IsService(r) {
+		return "service", serviceFactor
 	}
-	return "ip:" + clientIP(r)
+	if presentsCredential(r) {
+		return "auth-ip:" + addressKey(r), sharedAddressFactor
+	}
+	return "ip:" + addressKey(r), 1
+}
+
+func presentsCredential(r *http.Request) bool {
+	return r.Header.Get("Authorization") != "" || r.Header.Get("X-User-ID") != "" ||
+		r.Header.Get("X-Service-Token") != ""
+}
+
+// userKey bounds the key size: a Firebase uid is short, but a dev or
+// service-asserted one is whatever the caller sent.
+func userKey(uid string) string {
+	if len(uid) > 128 {
+		sum := sha256.Sum256([]byte(uid))
+		return "uid:" + hex.EncodeToString(sum[:])
+	}
+	return "uid:" + uid
+}
+
+// addressKey collapses an IPv6 address to its /64, which is what one
+// subscriber is routinely assigned and can rotate through freely.
+func addressKey(r *http.Request) string {
+	addr, err := netip.ParseAddr(clientIP(r))
+	if err != nil {
+		return "unknown"
+	}
+	addr = addr.Unmap()
+	if addr.Is6() {
+		if p, err := addr.Prefix(64); err == nil {
+			return p.String()
+		}
+	}
+	return addr.String()
 }
 
 // clientIP reads the LAST entry of X-Forwarded-For, not the first. Every
@@ -169,7 +227,10 @@ func rateKey(r *http.Request) string {
 func clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
-		if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
+		last := strings.TrimSpace(parts[len(parts)-1])
+		// Anything that is not an address is ignored, so it can be neither a
+		// limiter key nor a log value of the caller's choosing.
+		if _, err := netip.ParseAddr(last); err == nil {
 			return last
 		}
 	}

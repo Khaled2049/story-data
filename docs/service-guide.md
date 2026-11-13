@@ -72,13 +72,33 @@ dev one.
 
 ## Data model and migrations
 
-Migrations are ordered and immutable. The API runs outstanding migrations on
-startup under PostgreSQL advisory lock `82104231`; this makes concurrent
-deployments safe. To run only migrations:
+Migrations are ordered and immutable. They run under PostgreSQL advisory lock
+`82104231`, which makes concurrent runs safe. To run only migrations:
 
 ```sh
 go run ./cmd/api migrate
 ```
+
+Locally the API also migrates on startup (`MIGRATE_ON_START`, default true).
+Production sets it false: the API logs in as `story_data_api`, which cannot
+run DDL, and the deploy runs the `novelsync-story-data-migrate` job as the
+schema owner first. The API then only checks that the database has reached
+its newest migration, and refuses to start if it has not.
+
+### Database roles
+
+Every direct database user has its own login in a group created by migration
+`000048`: `story_data_app` (the API and `sync-recs`), `story_data_agents`
+(taleTribe-agents) and `story_data_recs` (taleTribe-recs). Only the migrate
+job holds the owner credential. `story_data_agents` is granted named tables,
+so a migration that adds a table agents must query also grants it there;
+`story_data_app` picks up new tables through default privileges.
+`e2e/service_roles_test.go` pins all three. `terraform/database.tf` creates
+the logins with SQL (never Neon's console or API, which would add them to
+`neon_superuser`) and writes their URLs to Secret Manager, keeping passwords
+out of state. In production the API also refuses to start if its own login is
+over-privileged (`store.CheckRuntimeRole`). See
+[database-roles.md](database-roles.md).
 
 Migration groups correspond to product domains:
 
@@ -159,6 +179,38 @@ permissions. Never trust client-supplied owner IDs.
 `X-Admin: true` so scripts can exercise protected routes without external
 token verification.
 
+### Service callers
+
+A backend that holds a user's uid but not their Firebase token (the MCP server
+and the Story Assistant in taleTribe-agents) asserts the uid in `X-User-ID`
+and proves its own identity separately:
+
+- **Production**: `X-Service-Authorization: Bearer <Google ID token>`, fetched
+  from the Cloud Run metadata server. `internal/auth` checks the signature
+  against Google's keys, the expiry, an issuer of `accounts.google.com`, an
+  audience in `SERVICE_AUDIENCES` (this service's URLs) and a verified email in
+  `SERVICE_ACCOUNTS`. Either list empty disables the path. `SERVICE_TOKEN` is
+  refused: startup fails with it set, and a request carrying `X-Service-Token`
+  gets `401`.
+- **Dev**: `X-Service-Token` matching `SERVICE_TOKEN`, since there is no
+  metadata server locally. Empty disables it.
+
+Either way the request is then held to the same rules
+(`internal/httpapi/service_scope.go`):
+
+- **Route allowlist.** `serviceRoutes` lists the method and path pairs those
+  two callers use. Anything else is `403` before routing, public routes
+  included. Add a route there only when a caller needs it.
+- **Owner only.** On any `/v1/stories/{id}/...` path, `Server.user` requires
+  the asserted uid to own the story (`Store.RequireStoryOwner`), so a service
+  does not get the public reader's access to other people's published
+  stories. A story the uid does not own is `404`.
+- **Never admin**, whatever `X-Admin` says, and bans apply as for any user.
+- A present but invalid credential is `401` and never falls through to the
+  user paths.
+
+The access log records `auth=service` and the verified account in `caller`.
+
 ### Story moderation
 
 `/v1/admin/*` requires a verified Firebase `admin: true` claim on every
@@ -170,7 +222,7 @@ from every author, including drafts, with cursor pagination, `q` search and
 `status=draft|ongoing|completed` filtering. The detail and chapter routes below
 it let an admin review private content; ordinary story and public reader routes
 keep their existing visibility rules. Moderation reads return `Cache-Control:
-no-store`. Service-token callers cannot claim admin access.
+no-store`. Service callers cannot claim admin access.
 
 `DELETE /v1/admin/stories/{id}` requires the current story `If-Match` revision
 and reuses owner deletion, including the active competition entry restriction
@@ -205,7 +257,7 @@ The admin AI usage page combines it with creditProxy's ledger.
 `DELETE` on the same path ban a member and lift the ban (`user_bans`). Every
 route that resolves the caller through `Server.user` checks the table, one
 primary-key lookup, and answers `403 account suspended`, including the MCP
-server's service-token path. Public reads stay open, and the member's published
+server's and the assistant's service path. Public reads stay open, and the member's published
 stories stay up. An admin cannot ban themselves (`422`). The frontend's
 `setUserBan` Function also disables the Firebase account and revokes its
 sessions; this table is what refuses the ID token they already hold, which
@@ -340,9 +392,11 @@ bodies stay generic — the detail goes to the log.
 
 **Request logging** (`internal/httpapi/logging.go`) is the outermost
 middleware, so throttled and CORS-rejected requests are logged too. One JSON
-line per request: request id, method, path, status, duration, uid, client
-address, and the underlying error when the response was a 500. `/health` is
-skipped. Every response carries `X-Request-ID`; an inbound `X-Request-ID` or
+line per request: request id, method, path, status, duration, uid, `auth`,
+client address, and the underlying error when the response was a 500. `auth`
+says which credential proved the uid — `firebase`, `service` (a backend
+asserting the uid, with the verified account in `caller`) or `dev` — and is `anonymous` when
+none did. `/health` is skipped. Every response carries `X-Request-ID`; an inbound `X-Request-ID` or
 `X-Cloud-Trace-Context` is preserved so a trace survives across services.
 `cmd/api` installs `slog`'s JSON handler on stderr, which is what Cloud Run
 parses into structured entries.
@@ -388,16 +442,32 @@ The service is invokable by anyone — Cloud Run grants `roles/run.invoker` to
 `allUsers` and `/v1/public/*` needs no credential — so throttling is part of
 the contract, at two layers.
 
-**Per-caller request budget** (`internal/httpapi/ratelimit.go`). Middleware
-keyed on the authenticated caller where there is one and the client address
-otherwise, defaulting to 300 reads and 60 writes per minute. Override with
-`RATE_LIMIT_READS_PER_MINUTE` / `RATE_LIMIT_WRITES_PER_MINUTE`; `0` disables
-that half, which is what the local stack does. Over budget is `429` with
-`Retry-After`. `GET /health` is exempt so a flood cannot fail the liveness
-probe. Buckets are per instance and in memory: this bounds a burst, it is not
-a platform-wide quota. `clientIP` reads the **last** `X-Forwarded-For` entry,
-the one Google's front end appends — putting a load balancer in front of the
-service invalidates that assumption.
+**Per-caller request budget** (`internal/httpapi/ratelimit.go`), defaulting
+to 300 reads and 60 writes per minute, in two steps:
+
+- *Before authentication*, middleware keys on the client address only. An
+  anonymous request spends from that address's bucket. A request presenting any
+  credential header spends from a second per-address bucket four times the
+  size, so several signed-in people behind one address are not held to one
+  visitor's budget. Header text is never part of a key: varying an unverified
+  `Authorization` or `X-User-ID` buys nothing, and the bucket map cannot be
+  grown with invented values. An IPv6 address counts as its `/64`.
+- *After authentication*, `Server.user` and `Server.admin` spend from the
+  verified uid's own bucket, which follows the user across addresses. Routes
+  that only resolve an optional viewer are held to the address buckets alone.
+
+A request with a verified service credential skips the address buckets, because every
+service call arrives from the caller's shared egress addresses. It spends from
+one bucket shared by all service calls (twenty times the base rate) and then
+from the asserted uid's bucket.
+
+Override the base rate with `RATE_LIMIT_READS_PER_MINUTE` /
+`RATE_LIMIT_WRITES_PER_MINUTE`; `0` disables that half, which is what the
+local stack does. Over budget is `429` with `Retry-After`. `GET /health` is
+exempt so a flood cannot fail the liveness probe. Buckets are per instance and
+in memory: this bounds a burst, it is not a platform-wide quota. `clientIP`
+reads the **last** `X-Forwarded-For` entry, the one Google's front end appends
+— putting a load balancer in front of the service invalidates that assumption.
 
 **Durable daily budgets** (`internal/store/quota.go`, table
 `user_daily_usage`). Per user, per action, in UTC days, spent in the same
@@ -545,7 +615,13 @@ and the completion rule (last released chapter, scrolled past 0.9).
 so drift fails a test rather than silently re-ranking the catalog.
 
 Everything downstream of `interactions` belongs to recs and never leaves the
-schema. Migration `000020` grants a `recs_service` role usage on
+schema. recs logs in as `recs_app`, a member of the `story_data_recs` group
+from migration `000048`, which carries the grants described below. The older
+`recs_service` grants in `000020`/`000021` remain for history; that role was
+created in the Neon console and so also inherited `neon_superuser`'s read and
+write on every table, which is why it is being replaced.
+
+Migration `000020` grants a `recs_service` role usage on
 `recommendations` only — and on `public` solely so it can resolve the `vector`
 type, with no table grant. The grant is a no-op where that role does not exist,
 which is every local and test database.
@@ -665,7 +741,10 @@ Before handing off a change:
 ## Production notes
 
 Production uses Neon/PostgreSQL and Firebase token verification. Configure
-secrets through the deployment environment, not source control. Terraform
+secrets through the deployment environment, not source control. Terraform sets
+`SERVICE_ACCOUNTS` to the agents runtime account and `SERVICE_AUDIENCES` to
+this service's two `run.app` URLs; agents uses its `STORY_DATA_URL` as the
+token audience, so that URL must be one of them. Terraform
 configuration lives in `terraform/`; inspect it before changing deployment
 resources. Apply migrations through the normal application startup/deployment
 path so the advisory lock protects concurrent instances.
@@ -708,7 +787,7 @@ before/after snapshots; the table retains the latest 50. `POST` to
 recent change, as a new revision. This prevents an old undo from erasing later
 writer edits. History and profile are story-scoped, owner-only, use
 `Cache-Control: no-store`, and cascade on story deletion. An agent may call
-`POST /v1/stories/{id}/voice-profile/agent-note` with a verified service token,
+`POST /v1/stories/{id}/voice-profile/agent-note` with a verified service credential,
 asserted owner, current If-Match revision and story-scoped UUID idempotency
 key. It can add, revise or retire only an agent-authored note, never change
 writer notes, pin state, references, narration settings or the learning switch.
